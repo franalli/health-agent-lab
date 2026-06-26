@@ -18,7 +18,7 @@ If a change would let the model decide something safety-relevant, it is wrong. S
 - **The deterministic floor is always on.** `safety.py` computes an escalation floor from the analysis; the validator enforces `response.escalation >= floor` on *every* turn, both modes. A softer-toned answer can never sit on a harder floor.
 - **Escalation ≠ out-of-range.** A value merely outside its reference range is at most a `notable` observation. Escalation (`clinician_review` / `urgent`) is reserved for panic thresholds and RCV+FDR-significant adverse trajectories. A managed condition's expected-high marker must not escalate.
 - **Never fabricate.** No reading for a marker → the answer is "not measured", never an invented value. Every claim traces to `findings[].evidence[]`.
-- **One normalization path.** All input enters through `preprocessing/ingest.py` (the firewall): it parses the supplied bundle's five reference-range shapes, folds vitals in as markers, and writes the internal domain model. Nothing downstream re-parses raw input.
+- **One normalization path.** All input enters through `preprocessing/ingest.py` (the firewall): it parses the supplied bundle's five reference-range shapes, folds vitals in as markers, and writes the internal domain model. Nothing downstream re-parses raw input. *Which* bundle it reads is resolved by `preprocessing/datasets.py` from the `DATASET` env var (default `training_data`) — each dataset is its own sub-folder of `backend/data/`, so new bundles ingest incrementally; the derived `health.db` sits at the `data/` root, not inside a bundle.
 - **One DB module.** Only `db.py` touches SQLite. Clinical constants and thresholds live in `config.py` (versioned); `.env` is secrets + runtime only.
 - **Both provider calls behind `llm.py`** — `compose()` and the gate classifier. These are the only network seams.
 - **Two layers, not one.** The SQLite schema (`schema.sql`) and the Pydantic models (`models.py`) are deliberately separate — do not fuse them into ORM-as-model. The row↔model mapping lives in `db.py`.
@@ -29,7 +29,7 @@ If a change would let the model decide something safety-relevant, it is wrong. S
 
 ## Commands
 
-Dependencies and the virtualenv are managed with **uv**.
+Dependencies and the virtualenv are managed with **uv**. All commands run from `backend/` (where `pyproject.toml` lives — there is no root workspace).
 
 ```
 uv sync          # install
@@ -40,12 +40,14 @@ make eval        # run the evaluation harness → report
 make test        # unit tests
 ```
 
+> The `make` targets are the intended interface, but the Makefile is not wired yet. Until it lands, run the underlying step directly — e.g. `cd backend && uv run pytest` for tests.
+
 ## How to work here
 
 - **Build in phase order.** `architecture.md`'s build sequence (Phases 0–8) is dependency-ordered; each phase leaves something runnable. Deterministic-first — the whole non-LLM system and every safety decision are built and tested before the LLM goes on top.
 - **Keep the schema lean.** Do not add a column without data or a behavior that needs it. Phantom fields are cut on sight.
 - **Verify the data contract on touch.** If you change `schema.sql` or `models.py`, re-check the three stay aligned — schema columns ↔ Pydantic fields ↔ the actual data — and that no phantom column crept in. The consistency checks exist for exactly this. After implementing, also reconcile any resulting schema or Pydantic-model drift in `docs/` (e.g. `docs/architecture.md`) so the documented contract matches the code.
-- **Routes stay thin.** Every API route is a thin adapter over the `pipeline` library; logic lives in the library, not the route.
+- **Routes stay thin.** Every API route is a thin adapter over the `health_intelligence` library; logic lives in the library, not the route.
 - **Statistics are classical, not ML** — Mann–Kendall, Theil–Sen, RCV, FDR. Keep the distinction precise; there is no trained model here.
 - **Determinism in the core.** Temperature 0 for the LLM; the deterministic path must be byte-identical across re-runs.
 - **Test the core in isolation** against the known-answer fixtures before wiring anything to it. At n = 3 the honest verdict is "too short to call a trend" — a correct output, not a failure.

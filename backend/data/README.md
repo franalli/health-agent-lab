@@ -1,26 +1,25 @@
-# Founding AI Engineer Mini Project: Sample Data Bundle
+# Datasets
 
-Synthetic data for the Health Intelligence Service mini project. Nothing here is real patient data.
+Each **dataset** is a sub-folder here holding one synthetic bundle:
 
-## Contents
-- `members.json`     15 synthetic members. Each: { member_id, profile, panels, notes }.
-                     Each panel result carries its reference range, as a lab report prints it.
-- `lab_panels.csv`   All panels across all members in long (tidy) form, for quick reading.
-- `eval_set.jsonl`   A labeled reference set (one case per line). Each case names the `member_id`
-                     it applies to and covers grounded Q&A, trend-versus-noise, alarming values,
-                     out-of-scope and unsafe requests, grounding/hallucination traps, borderline and
-                     managed-condition nuance, improving trajectories, sparse history, and uncertainty.
+- `members.json` — members (`member_id`, `profile`, `panels`, `notes`)
+- `lab_panels.csv` — the same panels in long (tidy) form
+- `eval_set.jsonl` — the labeled reference cases for the eval harness
 
-## members.json shape
-Each member has 3 to 5 panels spanning up to two years. The 15 members span a deliberate range:
-healthy baselines, improving trajectories, and a variety of developing patterns. We do not label
-each member's "story" for you; reading the trajectories is part of the exercise.
+One bundle per sub-folder lets new datasets be dropped in and ingested **incrementally**
+without disturbing the shipped one. `training_data/` is the bundle that ships with the repo;
+see its `README.md` for the bundle's field-level shape.
 
-## eval_set.jsonl fields
-`id`, `member_id`, `category`, `input`, `expected_behavior`, `must_include`, `must_not`, `escalation_expected`.
-Some cases inject a hypothetical new value (e.g. an alarming potassium) on top of a member's history; the case text says so.
+## Selecting the active dataset
 
-## Notes
-- Reference ranges are illustrative and synthetic. Do not use any of this for real clinical decisions.
-- Extend the data if it helps; note briefly what you added and why.
-- The labeled set is a starting point for your evaluation harness, not the full bar.
+`preprocessing/datasets.py` resolves which sub-folder is active from the `DATASET`
+environment variable, defaulting to `training_data` when unset — so the tests and an
+out-of-box run need no configuration. To work over a different bundle, drop it in a new
+sub-folder (e.g. `q3_cohort/`) and set `DATASET=q3_cohort`; an unknown name fails loudly,
+naming the folders that do exist. The ingest CLI that consumes the active dataset lands in
+Phase 2 — see the root `README.md` for that command.
+
+The derived SQLite store (`health.db`) is **not** a dataset; it sits at this `data/` root,
+outside any bundle, and is git-ignored.
+
+Synthetic data only — nothing here is real patient data, and none of it is for clinical use.

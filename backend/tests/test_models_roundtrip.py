@@ -15,6 +15,7 @@ import pytest
 from pydantic import ValidationError
 
 from health_intelligence import config
+from preprocessing.datasets import members_path
 from health_intelligence.models import (
     FLOOR_ORDER,
     SEVERITY_ORDER,
@@ -30,7 +31,7 @@ from health_intelligence.models import (
 
 BACKEND = pathlib.Path(__file__).resolve().parent.parent
 SCHEMA = BACKEND / "schema.sql"
-MEMBERS = BACKEND / "data" / "members.json"
+MEMBERS = members_path()  # active dataset's bundle (defaults to data/training_data/)
 
 EXPECTED_TABLES = {
     "escalations", "feedback", "interactions", "lab_results", "members",

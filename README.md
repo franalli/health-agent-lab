@@ -22,6 +22,8 @@ make run                                          # uv-installs, builds + seeds 
 
 Open `http://localhost:8000` — one process serves both the API and the UI; no Node, no second server, no CORS.
 
+> The `make` targets are the intended interface, but the Makefile is not wired yet. All commands run from `backend/`; until the Makefile lands, run the underlying steps directly with `uv` (e.g. `cd backend && uv run pytest`).
+
 ## What it does
 
 Two behaviors, over one deterministic core:
@@ -50,7 +52,7 @@ Escalation is reserved for panic thresholds and significant adverse trajectories
 
 ## Try it on your own data
 
-The demo's operator panel (left rail, kept out of the member experience) drives every endpoint with one click, and **Upload bundle** ingests a held-out member at runtime — no redeploy. The expected format is the bundle shipped in [`backend/data/`](backend/data/); a malformed file returns a clear error, so the upload doubles as the format check. The same ingest is available as a CLI (`uv run python -m preprocessing.ingest <bundle>`) and as `POST /members`.
+The demo's operator panel (left rail, kept out of the member experience) drives every endpoint with one click, and **Upload bundle** ingests a held-out member at runtime — no redeploy. The expected format is the bundle shipped in [`backend/data/training_data/`](backend/data/training_data/); a malformed file returns a clear error, so the upload doubles as the format check. The same ingest is available as a CLI (`uv run python -m preprocessing.ingest <bundle>`) and as `POST /members`.
 
 ## Evaluation
 
@@ -67,7 +69,7 @@ backend/
   health_intelligence/   # the serving library (SQLite → answer); imports no web framework
   preprocessing/         # the normalization adapter (bundle → SQLite)
   eval/                  # the evaluation harness + labeled cases
-  data/                  # supplied synthetic bundle + test fixtures
+  data/                  # datasets — one bundle per sub-folder (training_data/ ships); DATASET selects the active one
 frontend/                # a single static page (vanilla JS, no build)
 ```
 
