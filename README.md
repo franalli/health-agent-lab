@@ -8,7 +8,7 @@ A persistent assistant over a member's longitudinal lab history. It answers free
 
 The core design choice: **the LLM is a language layer over a deterministic analytical core, not the core itself.** Every number, reference-range comparison, trend call, and escalation decision is computed by classical statistics and clinical thresholds in pure Python. The LLM only renders that ground truth into careful, plain-language answers and handles open-ended phrasing — it never computes a value or decides an escalation. That boundary is what makes the safety-critical behavior auditable and reproducible rather than a property of a prompt.
 
-Full design and rationale: [`architecture.md`](architecture.md).
+Full design and rationale: [`architecture.md`](docs/architecture.md).
 
 ## Quickstart
 
@@ -71,7 +71,7 @@ backend/
 frontend/                # a single static page (vanilla JS, no build)
 ```
 
-A thin `backend/api.py` exposes the routes and serves the static page; `analysis.py` is pure functions over typed inputs, so statistical correctness is unit-testable in isolation. The full file-by-file tree lives in [`architecture.md`](architecture.md) §14.
+A thin `backend/api.py` exposes the routes and serves the static page; `analysis.py` is pure functions over typed inputs, so statistical correctness is unit-testable in isolation. The full file-by-file tree lives in [`architecture.md`](docs/architecture.md) §14.
 
 ## Deployment
 

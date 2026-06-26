@@ -44,14 +44,15 @@ make test        # unit tests
 
 - **Build in phase order.** `architecture.md`'s build sequence (Phases 0–8) is dependency-ordered; each phase leaves something runnable. Deterministic-first — the whole non-LLM system and every safety decision are built and tested before the LLM goes on top.
 - **Keep the schema lean.** Do not add a column without data or a behavior that needs it. Phantom fields are cut on sight.
-- **Verify the data contract on touch.** If you change `schema.sql` or `models.py`, re-check the three stay aligned — schema columns ↔ Pydantic fields ↔ the actual data — and that no phantom column crept in. The consistency checks exist for exactly this.
+- **Verify the data contract on touch.** If you change `schema.sql` or `models.py`, re-check the three stay aligned — schema columns ↔ Pydantic fields ↔ the actual data — and that no phantom column crept in. The consistency checks exist for exactly this. After implementing, also reconcile any resulting schema or Pydantic-model drift in `docs/` (e.g. `docs/architecture.md`) so the documented contract matches the code.
 - **Routes stay thin.** Every API route is a thin adapter over the `pipeline` library; logic lives in the library, not the route.
 - **Statistics are classical, not ML** — Mann–Kendall, Theil–Sen, RCV, FDR. Keep the distinction precise; there is no trained model here.
 - **Determinism in the core.** Temperature 0 for the LLM; the deterministic path must be byte-identical across re-runs.
 - **Test the core in isolation** against the known-answer fixtures before wiring anything to it. At n = 3 the honest verdict is "too short to call a trend" — a correct output, not a failure.
 - **No browser storage in the UI** — the static page holds state in memory only.
 - **Docs are part of the change.** If a change alters what `README.md` or this file documents — a command, the route surface, setup, structure — update them in the same change. A doc that lies about the code is a bug.
+- **Keep this file current.** CLAUDE.md does not update itself. After completing a task or plan, ask whether it changed a rule, command, contract, invariant, or structural fact this file describes — if so, edit CLAUDE.md (and `README.md` where relevant) in the same change. Only encode durable operating rules; do not log routine code changes, fixes, or anything already recoverable from the repo or git history.
 
 ## Source of truth
 
-`architecture.md` (design + rationale) · `schema.sql` (persistence contract) · `ui-ux.md` (member + operator surface). When in doubt, those win over this file.
+`docs/architecture.md` (design + rationale) · `backend/schema.sql` (persistence contract) · `docs/ui-ux.md` (member + operator surface). When in doubt, those win over this file.

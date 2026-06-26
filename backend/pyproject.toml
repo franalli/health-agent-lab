@@ -1,0 +1,24 @@
+[project]
+name = "health-intelligence"
+version = "0.1.0"
+description = "Health Intelligence Service — an LLM language layer over a deterministic analytical core, atop a member's longitudinal lab history. Synthetic data only; not for clinical use."
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.13.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Flat package layout (not src/): the serving library and the ingestion adapter are
+# importable siblings, so `import health_intelligence.config` and
+# `python -m preprocessing.ingest` resolve regardless of working directory.
+# `eval` is added here in Phase 5 when the harness lands.
+[tool.hatch.build.targets.wheel]
+packages = ["health_intelligence", "preprocessing"]
