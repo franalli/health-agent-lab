@@ -112,9 +112,12 @@ CREATE INDEX idx_obs_member ON observations(member_id, severity);
 
 -- Clinician-review queue: the subset of findings/events that crossed the escalation
 -- threshold, from BOTH owners. dedup_key is UNIQUE, so "fire once" is a DB guarantee, not
--- application logic. Data-finding key = member·marker·data_version (scan owns it, writes via
--- INSERT OR IGNORE); chat key = member·day (assistant owns it — one open escalation per
--- member per day; there is no conversation concept in v1). Member-facing care is never
+-- application logic. Data-finding key = member·marker·analysis_version (scan owns it, writes via
+-- INSERT OR IGNORE), where analysis_version hashes ONLY the inputs analyze() reads (results,
+-- ranges, sex, age) — not notes/profile — so a notes-only edit cannot re-fire a finding whose
+-- analysis never moved (architecture §48; db.compute_analysis_version); chat key = member·day
+-- (assistant owns it — one open escalation per member per day; there is no conversation concept
+-- in v1). Member-facing care is never
 -- deduped; only this record is. observation_id is set for data findings, interaction_id for
 -- chat (the triggering turn). Not every observation escalates — only the ones recorded here.
 -- chat covers both acute-medical and crisis at this stage (not distinguished structurally —

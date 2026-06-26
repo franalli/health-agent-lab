@@ -28,13 +28,17 @@ from typing import Optional
 
 from health_intelligence.config import CONFIG_VERSION
 from health_intelligence.models import (
+    Escalation,
     EscalationKind,
     EscalationLevel,
     Feedback,
+    HealthIntelligenceResponse,
     LabResult,
     MemberProfile,
     Note,
+    Observation,
     ReferenceRange,
+    SEVERITY_ORDER,
 )
 
 # --------------------------------------------------------------------------------------------------
@@ -55,6 +59,31 @@ _EXPECTED_TABLES = {
 
 
 # --------------------------------------------------------------------------------------------------
+# Deterministic storage-id synthesis — the one place the store's surrogate keys are minted (CLAUDE.md
+# "only db.py touches SQLite"; architecture §4 db.py synthesizes storage PKs). One scheme for every
+# deterministic id (escalation_id, scan response_id, observation_id): prefix + sha256(parts)[:32].
+# 32 hex (128 bits) is at least as collision-resistant as the UNIQUE/PK it backs.
+# --------------------------------------------------------------------------------------------------
+
+def _det_id(prefix: str, *parts: str) -> str:
+    return prefix + hashlib.sha256(":".join(parts).encode("utf-8")).hexdigest()[:32]
+
+
+def _canon_results(results: list[LabResult]) -> list[list]:
+    """The canonical, order-independent results projection both content hashes share. (date, panel_id,
+    marker) uniquely identify a row, so the sort never reaches the float value field — the documented
+    'JSON ints become REAL on read' stability. Defined once so the two hashers can't drift apart."""
+    return sorted([[r.panel_date, r.panel_id, r.marker, r.value, r.unit] for r in results])
+
+
+def _hash_canon(canon: dict) -> str:
+    """The shared serialize+digest tail: compact, key-sorted JSON → 16 hex of sha256. The one place the
+    serialization convention lives, so compute_data_version and compute_analysis_version stay in lockstep."""
+    blob = json.dumps(canon, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+# --------------------------------------------------------------------------------------------------
 # Connection + schema
 # --------------------------------------------------------------------------------------------------
 
@@ -70,7 +99,12 @@ def connect(db_path=None) -> sqlite3.Connection:
     path = DEFAULT_DB_PATH if db_path is None else db_path
     if str(path) != ":memory:":
         pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(path)
+    # check_same_thread=False: FastAPI runs sync routes + their generator dependency (get_con) across
+    # anyio's threadpool, and the connection can be opened on one worker thread and used on another
+    # within a single request — the default (True) raises ProgrammingError under concurrency. Safe here
+    # because connections are never SHARED across requests (one per request, closed after) and SQLite
+    # serializes writes itself; we only relax the per-thread-affinity assertion, not isolation.
+    con = sqlite3.connect(path, check_same_thread=False)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
     return con
@@ -122,8 +156,8 @@ def _profile_to_params(p: MemberProfile) -> tuple:
 
 
 # --------------------------------------------------------------------------------------------------
-# Reads — only what feeds analyze(). Interaction/observation reads are deferred to Phase 3a (nothing
-# populates interactions until the scan); the only durable write here is emit_escalation.
+# Reads — what feeds analyze() (member/results/ranges/notes). The proactive-scan writes and the
+# observation/escalation read projections live further down (Phase 3a).
 # --------------------------------------------------------------------------------------------------
 
 def get_member(con: sqlite3.Connection, member_id: str) -> Optional[MemberProfile]:
@@ -225,13 +259,40 @@ def compute_data_version(
             "family_history": member.family_history,
             "lifestyle": dict(sorted(member.lifestyle.items())),
         },
-        # sorted() makes the fingerprint order-independent of SQLite's row order; (date, panel_id,
-        # marker) uniquely identify a row so the comparison never reaches the float value field.
-        "results": sorted([[r.panel_date, r.panel_id, r.marker, r.value, r.unit] for r in results]),
+        # _canon_results makes the fingerprint order-independent of SQLite's row order.
+        "results": _canon_results(results),
         "notes": sorted([[n.date or "", n.source or "", n.text] for n in notes]),
     }
-    blob = json.dumps(canon, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+    return _hash_canon(canon)
+
+
+def compute_analysis_version(
+    *,
+    results: list[LabResult],
+    ranges: list[ReferenceRange],
+    sex: str,
+    age: Optional[int],
+) -> str:
+    """A content fingerprint of *only* the inputs ``analysis.analyze`` actually reads — the
+    override-resolved results, the reference ranges, and the member's sex/age. Pure (no DB).
+
+    This is the §48 "finding-stable dedup_key" resolution: ``data_version`` hashes the WHOLE record
+    (incl. notes + conditions/medications), but ``analyze`` reads none of those, so keying a
+    ``data_finding`` escalation on raw ``data_version`` would mint a new key — and re-fire the
+    escalation — on a notes-only edit that never moved the analysis. The data-finding dedup_key keys on
+    THIS hash instead (``data:{member}:{marker}:{analysis_version}``), so "fire once" tracks the actual
+    finding; ``data_version`` stays the full audit snapshot everywhere else (interactions/observations).
+    Mirrors :func:`compute_data_version`'s canonicalization so the two are read the same way."""
+    canon = {
+        "sex": sex,
+        "age": age,
+        "results": _canon_results(results),
+        "ranges": sorted(
+            [[rg.marker, rg.sex, rg.unit, rg.ref_low, rg.ref_high, rg.panic_low, rg.panic_high,
+              rg.config_version] for rg in ranges]
+        ),
+    }
+    return _hash_canon(canon)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -327,7 +388,7 @@ def replace_member(
 # Phase 3a. The UNIQUE dedup_key makes "fire once" a DB guarantee, not application logic.
 # --------------------------------------------------------------------------------------------------
 
-def emit_escalation(
+def _insert_escalation(
     con: sqlite3.Connection,
     *,
     member_id: str,
@@ -339,18 +400,14 @@ def emit_escalation(
     interaction_id: Optional[str] = None,
     created_at: Optional[str] = None,
 ) -> bool:
-    """Write one clinician-review-queue row, idempotently. ``INSERT OR IGNORE`` on the UNIQUE
-    ``dedup_key`` makes a duplicate call a no-op at the database. Returns ``True`` iff THIS call
-    created the row (``rowcount == 1``), ``False`` if a row already existed — the created-vs-existing
-    signal the 'loud once, then ambient' transition needs. ``created_at`` defaults to UTC now (a
-    clock is fine here — ``db.py`` is not the pure core; only the ROW COUNT is the guarantee, not
-    byte-identity of ``created_at``). The caller owns dedup_key construction (Phase 3a)."""
+    """The escalation INSERT OR IGNORE without committing — so the scan can write it inside its own
+    transaction (atomic with the interaction + observation). Returns ``True`` iff THIS call created the
+    row. ``escalation_id`` derives deterministically from the dedup_key (the PK must be at least as
+    collision-resistant as the UNIQUE it backs, else two dedup_keys colliding on a short PK prefix would
+    drop the second via INSERT OR IGNORE on the PK instead of deduping correctly on dedup_key)."""
     if created_at is None:
         created_at = datetime.now(timezone.utc).isoformat()
-    # 32 hex (128 bits): the escalation_id PK must be at least as collision-resistant as the dedup_key
-    # UNIQUE it derives from, else two distinct dedup_keys colliding on a short prefix would drop the
-    # second escalation via INSERT OR IGNORE on the PK rather than dedup correctly on dedup_key.
-    escalation_id = "esc:" + hashlib.sha256(dedup_key.encode("utf-8")).hexdigest()[:32]
+    escalation_id = _det_id("esc:", dedup_key)
     cur = con.execute(
         "INSERT OR IGNORE INTO escalations "
         "(escalation_id, member_id, kind, dedup_key, level, observation_id, interaction_id, trigger_reason, created_at) "
@@ -358,8 +415,120 @@ def emit_escalation(
         (escalation_id, member_id, kind, dedup_key, level, observation_id, interaction_id,
          trigger_reason, created_at),
     )
-    con.commit()
     return cur.rowcount == 1
+
+
+def emit_escalation(con: sqlite3.Connection, **kwargs) -> bool:
+    """Write one clinician-review-queue row, idempotently, and commit. ``INSERT OR IGNORE`` on the
+    UNIQUE ``dedup_key`` makes a duplicate call a no-op at the database; returns ``True`` iff THIS call
+    created the row — the created-vs-existing signal the 'loud once, then ambient' transition needs. The
+    standalone (auto-committing) entry point; the scan uses :func:`_insert_escalation` inside its own
+    transaction instead. ``created_at`` defaults to UTC now (a clock is fine — db.py is not the pure
+    core; only the ROW COUNT is the guarantee). The caller owns dedup_key construction."""
+    created = _insert_escalation(con, **kwargs)
+    con.commit()
+    return created
+
+
+# --------------------------------------------------------------------------------------------------
+# Proactive-scan persistence (Phase 3a) — the interaction (audit/trace backbone) each observation hangs
+# off via its FK, the observation write, and the two read projections the routes serve. Scan ids are
+# deterministic and keyed on data_version (the caller builds them via _det_id), written INSERT OR
+# IGNORE: an identical re-scan (same data_version) hits the same key and is a no-op, while a genuine
+# data change bumps data_version → a new key → a new row, and the PRIOR row is RETAINED, not overwritten
+# (its audit/finding record stands — the same discipline as the escalation dedup). "Replace, not append"
+# for the member's live view is delivered by the version-scoped read, which returns only the current
+# data_version. These two writers do NOT commit — the scan wraps interaction+observations+escalations in
+# one transaction (atomicity); the /ask path (Phase 4) uses a per-call unique response_id, so the same
+# INSERT OR IGNORE simply always inserts and `driver` distinguishes the two write disciplines.
+# --------------------------------------------------------------------------------------------------
+
+def write_interaction(
+    con: sqlite3.Connection,
+    resp: HealthIntelligenceResponse,
+    *,
+    member_id: str,
+    driver: str,
+    question: Optional[str] = None,
+    created_at: Optional[str] = None,
+) -> str:
+    """Persist one ``HealthIntelligenceResponse`` as an ``interactions`` row (INSERT OR IGNORE on the
+    ``response_id`` PK) and return its ``response_id`` (from ``resp.metadata`` — the caller owns id
+    assignment; deterministic for the scan, unique-per-call for /ask). The full response is stored
+    verbatim as ``response_json``; the typed columns mirror its disposition axes + version tuple. Does
+    NOT commit — the caller's transaction owns it."""
+    if created_at is None:
+        created_at = datetime.now(timezone.utc).isoformat()
+    m = resp.metadata
+    con.execute(
+        "INSERT OR IGNORE INTO interactions "
+        "(response_id, member_id, driver, question, response_json, answer_disposition, escalation, "
+        " data_version, model_version, config_version, prompt_version, latency_ms, tokens, cost_usd, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (m.response_id, member_id, driver, question, resp.model_dump_json(),
+         resp.answer_disposition, resp.escalation, m.data_version, m.model_version,
+         m.config_version, m.prompt_version, m.latency_ms, m.tokens, m.cost_usd, created_at),
+    )
+    return m.response_id
+
+
+def write_observation(con: sqlite3.Connection, obs: Observation) -> None:
+    """Write one observation, INSERT OR IGNORE on its deterministic (data_version-keyed)
+    ``observation_id``. An identical re-scan is a no-op; a genuine data change mints a new id and a new
+    row, RETAINING the prior-version row (which the version-scoped read hides and an escalation may still
+    reference). Does NOT commit — the scan's transaction owns it."""
+    con.execute(
+        "INSERT OR IGNORE INTO observations "
+        "(observation_id, member_id, response_id, severity, title, trigger_reason, data_version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (obs.observation_id, obs.member_id, obs.response_id, obs.severity, obs.title,
+         obs.trigger_reason, obs.data_version),
+    )
+
+
+def get_observations(
+    con: sqlite3.Connection, member_id: str, *, data_version: Optional[str] = None
+) -> list[Observation]:
+    """The member's observations at one ``data_version`` (defaults to the *current* persisted record),
+    ranked by severity. Version-scoping is how "a re-scan replaces, not appends" reaches the member: a
+    prior version's rows still exist for audit but are never returned for the live record. Sorted by
+    severity rank (highest first), then ``observation_id`` for a stable order."""
+    if data_version is None:
+        data_version = compute_data_version(con, member_id)
+    rows = con.execute(
+        "SELECT observation_id, member_id, response_id, severity, title, trigger_reason, data_version "
+        "FROM observations WHERE member_id = ? AND data_version = ?",
+        (member_id, data_version),
+    ).fetchall()
+    obs = [
+        Observation(
+            observation_id=r["observation_id"], member_id=r["member_id"], response_id=r["response_id"],
+            severity=r["severity"], title=r["title"], trigger_reason=r["trigger_reason"],
+            data_version=r["data_version"],
+        )
+        for r in rows
+    ]
+    obs.sort(key=lambda o: (-SEVERITY_ORDER[o.severity], o.observation_id))
+    return obs
+
+
+def get_escalations(con: sqlite3.Connection, member_id: str) -> list[Escalation]:
+    """The member's clinician-review queue (read projection), oldest first. Escalations are durable —
+    never replaced by a re-scan — so this returns the full standing set across data_versions."""
+    rows = con.execute(
+        "SELECT escalation_id, member_id, kind, dedup_key, level, observation_id, interaction_id, "
+        "trigger_reason, created_at FROM escalations WHERE member_id = ? ORDER BY created_at, escalation_id",
+        (member_id,),
+    ).fetchall()
+    return [
+        Escalation(
+            escalation_id=r["escalation_id"], member_id=r["member_id"], kind=r["kind"],
+            dedup_key=r["dedup_key"], level=r["level"], observation_id=r["observation_id"],
+            interaction_id=r["interaction_id"], trigger_reason=r["trigger_reason"],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
 
 
 # --------------------------------------------------------------------------------------------------

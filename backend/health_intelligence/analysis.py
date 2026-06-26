@@ -42,9 +42,12 @@ from typing import NamedTuple, Optional
 
 from health_intelligence.config import AnalysisConfig, MarkerConfig
 from health_intelligence.models import (
+    FLOOR_ORDER,
     SEVERITY_ORDER,
+    SEVERITY_TO_FLOOR,
     ClinicalChange,
     Flag,
+    FloorLevel,
     LabResult,
     MarkerTrajectory,
     MemberProfile,
@@ -86,7 +89,7 @@ def analyze(
     member: MemberProfile,
     results: list[LabResult],
     ranges: list[ReferenceRange],
-    age: int,
+    age: Optional[int],
     cfg: AnalysisConfig,
     *,
     data_version: str,
@@ -162,7 +165,7 @@ def _unit(results: list[LabResult], marker: str) -> str:
     return next((r.unit for r in results if r.marker == marker), "")
 
 
-def _range_for(marker: str, sex: str, age: int, ranges: list[ReferenceRange]) -> Optional[ReferenceRange]:
+def _range_for(marker: str, sex: str, age: Optional[int], ranges: list[ReferenceRange]) -> Optional[ReferenceRange]:
     """The applicable band: the (marker, sex) row, else the sex-agnostic (marker, 'any') row, else
     None — so 'other'/'unknown' members and non-sex-split markers both resolve to 'any', and a marker
     with no band at all yields the typed ``no_reference`` flag downstream. ``age`` is in the
@@ -457,11 +460,12 @@ def _severity(
     return severity
 
 
-def _floor(severities: list[Severity]) -> str:
-    """Pure projection of the max per-marker severity onto the escalation axis. Nothing downstream can
-    lower it; the model only reads it."""
-    if any(s == "urgent" for s in severities):
-        return "urgent"
-    if any(s == "attention" for s in severities):
-        return "clinician_review"
-    return "none"
+def _floor(severities: list[Severity]) -> FloorLevel:
+    """Pure projection of the max per-marker severity onto the escalation axis, via the one shared
+    ``SEVERITY_TO_FLOOR`` table (so the whole-member floor and ``safety.severity_to_level``'s per-marker
+    level can't drift). Nothing downstream can lower it; the model only reads it."""
+    floor: FloorLevel = "none"
+    for s in severities:
+        if FLOOR_ORDER[SEVERITY_TO_FLOOR[s]] > FLOOR_ORDER[floor]:
+            floor = SEVERITY_TO_FLOOR[s]
+    return floor

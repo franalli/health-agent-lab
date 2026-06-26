@@ -40,7 +40,7 @@ make eval        # run the evaluation harness → report
 make test        # unit tests
 ```
 
-> The `make` targets are the intended interface, but the Makefile is not wired yet. Until it lands, run the underlying step directly — e.g. `cd backend && uv run pytest` for tests.
+> The Makefile is wired as of Phase 3a (`backend/Makefile`); `make help` lists the targets. `make eval` is a placeholder until the harness lands in Phase 5. The UI (`frontend/index.html`) lands in Phase 6 — until then `make run` serves the API only (the static mount is skipped when the directory is absent).
 
 ## How to work here
 

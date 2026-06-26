@@ -63,6 +63,11 @@ COMPOSE_MODEL = "claude-sonnet-4-6"
 #: a small model without pinning one; confirm this choice when the gate is built (Phase 4).
 GATE_MODEL = "claude-haiku-4-5"
 
+#: ``model_version`` stamped on a Mode-1 response — no model ran, but the schema column is NOT NULL and
+#: the reproducibility tuple must be whole. Mode 1's tuple is (data, config, template); this sentinel
+#: makes "no LLM was involved" explicit in the trace rather than leaving an empty string (architecture §7).
+MODEL_VERSION_DETERMINISTIC = "deterministic"
+
 # --------------------------------------------------------------------------------------------------
 # Types
 # --------------------------------------------------------------------------------------------------

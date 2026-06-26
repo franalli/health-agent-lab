@@ -22,7 +22,7 @@ make run                                          # uv-installs, builds + seeds 
 
 Open `http://localhost:8000` — one process serves both the API and the UI; no Node, no second server, no CORS.
 
-> The `make` targets are the intended interface, but the Makefile is not wired yet. All commands run from `backend/`; until the Makefile lands, run the underlying steps directly with `uv` (e.g. `cd backend && uv run pytest`).
+> The Makefile is wired (`backend/Makefile`); run the `make` targets from `backend/` (`make help` lists them). The consumer UI lands in Phase 6, so `make run` currently serves the API only; `make eval` is a placeholder until the harness lands in Phase 5.
 
 ## What it does
 

@@ -51,6 +51,16 @@ Flag = Literal["below_range", "above_range", "panic_low", "panic_high", "band_cr
 FLOOR_ORDER: dict[FloorLevel, int] = {"none": 0, "clinician_review": 1, "urgent": 2}
 SEVERITY_ORDER: dict[Severity, int] = {"info": 0, "notable": 1, "attention": 2, "urgent": 3}
 
+# The ONE severity -> escalation-floor projection (architecture §2 D3 / the _floor rule). Both the
+# core's whole-member floor (analysis._floor, the max over markers) and the per-marker escalation level
+# (safety.severity_to_level) derive from this single table, so they cannot drift into a per-marker
+# escalation that sits below the computed floor (a silent under-escalation). An out-of-range/band value
+# is at most `notable` -> `none` here: escalation is reserved for `attention` (RCV+FDR-confirmed adverse
+# trend) and `urgent` (panic).
+SEVERITY_TO_FLOOR: dict[Severity, FloorLevel] = {
+    "info": "none", "notable": "none", "attention": "clinician_review", "urgent": "urgent",
+}
+
 
 # --------------------------------------------------------------------------------------------------
 # Ingest input layer — the bundle exactly as it arrives (POST /members and the loader CLI).
