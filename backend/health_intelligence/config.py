@@ -5,24 +5,35 @@ config live in ``.env``; *nothing* clinical does. Every threshold the analysis a
 here so it is never a literal buried in logic, and any escalation decision is reproducible against
 ``CONFIG_VERSION``.
 
-Phase-0 curation discipline (see the plan): values are filled ONLY where anchored in the supplied
-materials. Externally-sourced clinical numbers — EFLM CVa/CVi, panic thresholds beyond the one the
-eval set pins, adverse directions, and vital normal bounds — ship as **typed absence** (``None`` /
-empty), NOT as guesses. This is deliberate, not unfinished: ``analysis.py``'s documented skip-paths
-fire on these ``None``s (no CVa/CVi -> RCV skipped; no panic -> flag skipped; no range -> a typed
-``no_reference`` note), so a deferred value is an *exercised edge case*. Each is curated in Phase 1
-beside the test that pins it, with its source named inline at that point.
+Curation discipline (see the plan): a clinical number is filled ONLY where a test pins it, with its
+source named inline at the point of use. Phase 0 anchored the three values the supplied materials fix
+directly; Phase 1 curates the eval-forced + demo-prominent subset (the markers the labeled cases and
+the live scan actually exercise). Anything no case touches stays **typed absence** (``None`` / empty)
+ON PURPOSE: ``analysis.py``'s documented skip-paths fire on these ``None``s (no CVa/CVi -> RCV skipped,
+trend judged on Mann-Kendall + Theil-Sen CI alone; no panic -> that flag is not evaluated; no range ->
+a typed ``no_reference`` note), so a deferred value is an *exercised edge case*, not unfinished work.
 
-What's filled now and why:
+What Phase 0 anchored (unchanged):
   - statistical policy (alpha, FDR q, n_min, Theil-Sen CI)  -> standard defaults the architecture names as config (D3)
   - HbA1c band cut-points 5.7 / 6.5                          -> eval case E01 + architecture
   - Vitamin D status bands (>=30 / 20-29 / <20)              -> printed in the supplied data
-  - Potassium critical-high threshold                        -> eval case E07 pins K+ 6.1 -> urgent
-What's deferred to Phase 1 (typed absence):
-  - CVa / CVi for every marker (EFLM Biological Variation Database)
-  - panic thresholds for every marker except the Potassium high anchored above (standard critical-value tables)
-  - adverse directions (clinical standard; consumed by _severity)
-  - vital normal bounds for BP / BMI (AHA / WHO)
+  - Potassium critical-high 6.0                              -> eval case E07 pins K+ 6.1 -> urgent
+
+What Phase 1 sources (each cited inline in MARKERS below):
+  - CVa / CVi           -> EFLM Biological Variation Database (biologicalvariation.eu) for the ~14 trended
+                           labs the eval exercises (representative within-subject CVi; CVa = the desirable
+                           analytical spec = 0.5*CVi, Fraser), plus systolic BP from BP-variability
+                           literature (demo-prominent). Potassium (panic-gated), diastolic and BMI stay
+                           deferred -> live RCV skip-path (their trends surface at notable, not escalated).
+  - adverse_direction   -> standard clinical interpretation (which way is pathological). All labs + vitals;
+                           Potassium left None (genuinely bidirectional -> safety via panic, not trend).
+  - panic thresholds    -> standard adult laboratory critical-value tables. The small set the eval/demo
+                           need (K+ high anchored P0; + K+ low, glucose hypo/hyper, Hb low); rest deferred.
+  - vital normal bounds -> AHA 2017 (BP) / WHO (BMI).
+
+CONFIG_VERSION stays ``v0``: Phase 1 *completes* the deferred set rather than changing an anchored
+value, and no escalation has yet been produced against the absent config (the core lands here, the DB
+in Phase 2). Bump only when a value that has already keyed a stored escalation changes.
 """
 
 from __future__ import annotations
@@ -35,7 +46,9 @@ from typing import Literal, Optional
 # --------------------------------------------------------------------------------------------------
 
 #: Stamped onto every reference-range row and every interaction, so an escalation is reproducible
-#: against the exact threshold set that produced it. Bump on any clinical-constant change.
+#: against the exact threshold set that produced it. Bump when a constant changes that has already
+#: keyed a stored escalation; Phase 1 filling the deferred set stays v0 (no escalation exists yet —
+#: the DB lands in Phase 2). Full rationale in the module docstring.
 CONFIG_VERSION = "v0"
 
 # --------------------------------------------------------------------------------------------------
@@ -78,6 +91,11 @@ class StatConfig:
     ts_ci_level: float = 0.95
     """Theil-Sen confidence level. A direction is asserted only when this CI excludes zero, so
     'too noisy to sign' stays a first-class verdict."""
+
+    rcv_z: float = 1.96
+    """Z for the Reference Change Value (RCV = sqrt(2)*Z*sqrt(CVa^2 + CVi^2)); 1.96 = two-sided 95%.
+    Lives here, not as a literal in analysis.py, so an RCV-gated escalation is reproducible against
+    config_version — the same discipline as alpha / ts_ci_level."""
 
 
 @dataclass(frozen=True)
@@ -139,37 +157,80 @@ class AnalysisConfig:
 
 # --------------------------------------------------------------------------------------------------
 # Per-marker table — 16 labs + 3 vitals (vitals fold in as markers). Keyed by canonical marker name.
-# Filled: HbA1c band cut-points, Vitamin D graded bands, Potassium critical-high. Everything else is
-# typed absence by design (see the module docstring).
+# Phase 1 curated adverse_direction, CVa/CVi, a small panic set and vital bounds for the eval-forced +
+# demo-prominent subset; what no case exercises stays typed absence (the live skip-paths). Per-field
+# sourcing is in the module docstring.
 # --------------------------------------------------------------------------------------------------
 
 MARKERS: dict[str, MarkerConfig] = {
-    # Labs omit `unit` — it comes from the data per reading (see MarkerConfig.unit). Only the three
-    # Phase-0 anchored values appear; every deferred constant is left as typed absence.
+    # Labs omit `unit` — it comes from the data per reading (see MarkerConfig.unit). Phase-1 curation
+    # fills adverse_direction (standard clinical interpretation), CVa/CVi (EFLM; CVa = 0.5*CVi desirable
+    # APS), and a small panic set; constants no case exercises stay typed absence (the skip-path).
     # --- Glycaemic ---
     "HbA1c": MarkerConfig(
-        # 5.7 (prediabetes) / 6.5 (diabetes) — eval E01 + architecture. Adverse direction "up" deferred.
-        band_cutpoints=(5.7, 6.5),
+        adverse_direction="up",                  # higher = worse glycaemic control (ADA)
+        cva=0.6, cvi=1.2,                        # EFLM — very tight within-subject variation
+        band_cutpoints=(5.7, 6.5),               # 5.7 prediabetes / 6.5 diabetes — eval E01 + architecture
     ),
-    "Fasting glucose": MarkerConfig(),
+    "Fasting glucose": MarkerConfig(
+        adverse_direction="up",                  # higher = hyperglycaemia
+        cva=2.5, cvi=4.9,                        # EFLM
+        panic_low=50.0, panic_high=500.0,        # critical hypo-/hyperglycaemia (critical-value tables, mg/dL)
+    ),
     # --- Lipids ---
-    "LDL cholesterol": MarkerConfig(),
-    "HDL cholesterol": MarkerConfig(),
-    "Triglycerides": MarkerConfig(),
-    "Total cholesterol": MarkerConfig(),
+    "LDL cholesterol": MarkerConfig(
+        adverse_direction="up",                  # higher = atherogenic risk
+        cva=4.2, cvi=8.3,                        # EFLM
+    ),
+    "HDL cholesterol": MarkerConfig(
+        adverse_direction="down",                # protective — LOWER is the adverse move
+        cva=3.7, cvi=7.3,                        # EFLM
+    ),
+    "Triglycerides": MarkerConfig(
+        adverse_direction="up",
+        cva=10.0, cvi=20.0,                      # EFLM — high within-subject variation
+    ),
+    "Total cholesterol": MarkerConfig(
+        adverse_direction="up",
+        cva=2.9, cvi=5.8,                        # EFLM
+    ),
     # --- Renal ---
-    "eGFR": MarkerConfig(),
-    "Creatinine": MarkerConfig(),
+    "eGFR": MarkerConfig(
+        adverse_direction="down",                # lower = worse renal function (KDIGO)
+        cva=2.65, cvi=5.3,                       # EFLM — derived from creatinine; CVi taken from creatinine
+    ),
+    "Creatinine": MarkerConfig(
+        adverse_direction="up",                  # higher = worse renal function
+        cva=2.65, cvi=5.3,                       # EFLM
+    ),
     # --- Hepatic ---
-    "ALT": MarkerConfig(),
-    "AST": MarkerConfig(),
+    "ALT": MarkerConfig(
+        adverse_direction="up",                  # higher = hepatocellular injury
+        cva=6.0, cvi=12.0,                       # EFLM
+    ),
+    "AST": MarkerConfig(
+        adverse_direction="up",
+        cva=6.0, cvi=12.0,                       # EFLM
+    ),
     # --- Inflammation ---
-    "CRP": MarkerConfig(),
+    "CRP": MarkerConfig(
+        adverse_direction="up",                  # higher = more inflammation
+        cva=21.0, cvi=42.0,                      # EFLM — very high within-subject variation
+    ),
     # --- Haematology / iron ---
-    "Hemoglobin": MarkerConfig(),
-    "Ferritin": MarkerConfig(),
+    "Hemoglobin": MarkerConfig(
+        adverse_direction="down",                # dataset/eval concern is anaemia (C04); clinically bidirectional
+        cva=1.4, cvi=2.8,                        # EFLM
+        panic_low=7.0,                           # critical anaemia / transfusion threshold (g/dL)
+    ),
+    "Ferritin": MarkerConfig(
+        adverse_direction="down",                # low = iron deficiency (C04); clinically bidirectional
+        cva=7.1, cvi=14.2,                       # EFLM
+    ),
     # --- Vitamin D: graded status bands printed in the supplied data (ng/mL) ---
     "Vitamin D (25-OH)": MarkerConfig(
+        adverse_direction="down",                # low = deficiency
+        cva=6.15, cvi=12.3,                      # EFLM
         graded_bands=(
             GradedBand("deficient", None, 20.0),     # <20
             GradedBand("insufficient", 20.0, 30.0),  # 20-29
@@ -177,18 +238,36 @@ MARKERS: dict[str, MarkerConfig] = {
         ),
     ),
     # --- Thyroid ---
-    "TSH": MarkerConfig(),
-    # --- Electrolyte: the one Phase-0 panic anchor ---
-    "Potassium": MarkerConfig(
-        # eval E07 expects URGENT for a K+ of 6.1 (C07's latest panel already reads 6.1); a
-        # critical-high of 6.0 mmol/L (standard hyperkalemia panic value) makes 6.1 trip the floor.
-        # The critical-LOW side is not anchored by any case, so it stays deferred -> Phase 1.
-        panic_high=6.0,
+    "TSH": MarkerConfig(
+        adverse_direction="up",                  # eval concern is rising TSH -> hypothyroidism (C05); bidirectional
+        cva=9.85, cvi=19.7,                      # EFLM — high within-subject variation
     ),
-    # --- Vitals: the data prints no vital units, so config IS the source (normal bounds deferred) ---
-    "systolic_bp": MarkerConfig(unit="mmHg"),
-    "diastolic_bp": MarkerConfig(unit="mmHg"),
-    "bmi": MarkerConfig(unit="kg/m2"),
+    # --- Electrolyte: panic-gated, genuinely bidirectional -> the RCV + direction skip-path ---
+    "Potassium": MarkerConfig(
+        # adverse_direction stays None: both hyper- and hypokalaemia are dangerous, so there is no single
+        # adverse TREND direction — K+ safety is the panic floor, not a trend verdict. CVa/CVi are left
+        # absent too, so RCV is skipped for K+ (the documented typed-absence path, exercised by a test).
+        panic_low=2.8,                           # severe hypokalaemia (critical-value tables, mmol/L)
+        panic_high=6.0,                          # hyperkalaemia — eval E07: C07's 6.1 -> urgent (anchored P0)
+    ),
+    # --- Vitals: the data prints no vital units, so config IS the source. Normal bounds AHA/WHO.
+    #     systolic carries CVa/CVi (RCV-gated, demo-prominent); diastolic + BMI stay RCV-free, so their
+    #     trends surface at notable but never escalate (BMI is real trajectory, not setpoint noise). ---
+    "systolic_bp": MarkerConfig(
+        unit="mmHg", adverse_direction="up",
+        ref_low=90.0, ref_high=120.0,            # AHA 2017: normal <120; <90 hypotension
+        # CVa/CVi from within-subject BP-variability literature (NOT EFLM — BP is not a lab analyte);
+        # systolic is in every panel (demo-prominent), so it is RCV-gated and can trend-escalate first-class.
+        cva=2.85, cvi=5.7,
+    ),
+    "diastolic_bp": MarkerConfig(
+        unit="mmHg", adverse_direction="up",
+        ref_low=60.0, ref_high=80.0,             # AHA 2017: normal <80
+    ),
+    "bmi": MarkerConfig(
+        unit="kg/m2", adverse_direction="up",
+        ref_low=18.5, ref_high=25.0,             # WHO: normal 18.5-24.9
+    ),
 }
 
 

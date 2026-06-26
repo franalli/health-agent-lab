@@ -42,7 +42,7 @@ Trend detection is classical, not machine-learned:
 
 - **Mann–Kendall** (Kendall's τ + an exact small-sample p-value) for monotonic trend;
 - **Theil–Sen** (with a distribution-free confidence interval) for direction and rate — "too noisy to call" is a first-class answer;
-- **Reference Change Value** (from published EFLM analytical + within-subject biological variation) for clinically-meaningful-vs-noise;
+- **Reference Change Value** (from published EFLM analytical + within-subject biological variation) for clinically-meaningful-vs-noise, where that variation is curated — otherwise the trend is judged on Mann–Kendall + Theil–Sen alone;
 - **Benjamini–Hochberg FDR** across markers, so a multi-marker panel can't raise a false flag by chance;
 - reference-range and **panic** flags, plus band-crossing, with **direction-aware** severity.
 
@@ -83,6 +83,6 @@ A single [Render](https://render.com/) Web Service: FastAPI serves both the API 
 
 ## References & disclaimer
 
-Reference Change Values use analytical and within-subject biological variation from the [EFLM Biological Variation Database](https://biologicalvariation.eu/). Reference ranges in the sample data are illustrative and synthetic.
+Reference Change Values use analytical and within-subject biological variation from the [EFLM Biological Variation Database](https://biologicalvariation.eu/) for the markers the evaluation set exercises, plus published BP-variability for systolic blood pressure (a demo-prominent vital); a marker without curated variation falls back to the Mann–Kendall + Theil–Sen trend verdict (a typed skip-path, not a silent gap). Reference ranges in the sample data are illustrative and synthetic.
 
 **This is a prototype on synthetic data. It does not diagnose, prescribe, or make clinical decisions, and must not be used for real medical care.**

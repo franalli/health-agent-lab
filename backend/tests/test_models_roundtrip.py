@@ -1,8 +1,9 @@
 """Phase 0 contract guard — the runnable bar made repeatable.
 
 Proves the three Phase-0 acceptance criteria (schema loads, models round-trip over the real data)
-plus the config-curation contract (what's anchored vs deliberately deferred as typed absence).
-This is the ONLY test Phase 0 ships; the analysis/pipeline suites arrive with their phases.
+plus the config-curation contract (what is anchored vs curated vs deliberately deferred as typed
+absence). The curation test tracks forward — Phase 1 fills the eval-forced subset, so it now asserts
+both the anchors and the surviving skip-paths; the analysis suite itself lives in test_analysis.py.
 """
 
 import json
@@ -88,11 +89,27 @@ def test_config_anchors_and_typed_absence():
     assert markers["systolic_bp"].unit == "mmHg"
     assert markers["HbA1c"].unit is None
 
-    # Externally sourced -> typed absence (curated in Phase 1 beside their tests):
-    assert all(m.cva is None and m.cvi is None for m in markers.values())
-    assert all(m.adverse_direction is None for m in markers.values())
-    panic_anchored = [k for k, v in markers.items() if v.panic_low is not None or v.panic_high is not None]
-    assert panic_anchored == ["Potassium"]
+    # Phase-1 curation (eval-forced + demo-prominent), each sourced inline in config.py:
+    assert markers["HbA1c"].adverse_direction == "up"
+    assert markers["HDL cholesterol"].adverse_direction == "down"   # protective -> lower is adverse
+    assert markers["HbA1c"].cva == 0.6 and markers["HbA1c"].cvi == 1.2  # EFLM
+    # Spot-check more RCV-driving CVa/CVi so a transposed value on any escalation-relevant marker fails here:
+    assert markers["CRP"].cva == 21.0 and markers["CRP"].cvi == 42.0
+    assert markers["TSH"].cva == 9.85 and markers["TSH"].cvi == 19.7
+    assert markers["eGFR"].cva == 2.65 and markers["eGFR"].cvi == 5.3
+    assert markers["Hemoglobin"].cva == 1.4 and markers["Hemoglobin"].cvi == 2.8
+    assert markers["systolic_bp"].ref_low == 90.0 and markers["systolic_bp"].ref_high == 120.0  # AHA
+    assert markers["bmi"].ref_high == 25.0  # WHO
+    panic_markers = {k for k, v in markers.items() if v.panic_low is not None or v.panic_high is not None}
+    assert panic_markers == {"Potassium", "Fasting glucose", "Hemoglobin"}
+    assert markers["Potassium"].panic_low == 2.8  # critical-low side now curated
+
+    # The skip-path discipline is preserved where no case exercises a constant (typed absence, not guess):
+    assert markers["Potassium"].adverse_direction is None              # bidirectional -> no single adverse trend
+    assert markers["Potassium"].cva is None and markers["Potassium"].cvi is None  # RCV skip-path
+    assert markers["systolic_bp"].cvi == 5.7                           # demo-prominent -> RCV-gated (Option C)
+    assert markers["diastolic_bp"].cvi is None and markers["bmi"].cvi is None  # RCV-free -> trends cap at notable
+    assert markers["Total cholesterol"].panic_low is None and markers["Total cholesterol"].panic_high is None
 
 
 def _valid_bundle_dict() -> dict:
