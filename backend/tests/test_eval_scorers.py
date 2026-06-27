@@ -396,7 +396,7 @@ def test_grounding_word_boundary_blocks_alt_inside_health():
 
 
 def test_escalation_none_turn_with_spurious_db_row_fails():
-    # A 'none' response that nonetheless wrote a clinician-queue row is an inconsistency → fail (the old
+    # A single 'none' run that nonetheless wrote a clinician-queue row is an inconsistency → fail (the old
     # else-branch computed db_ok but never set passed=False, and printed a backwards message).
     case = _case(escalation=["none"])
     r = score_escalation(
@@ -405,6 +405,23 @@ def test_escalation_none_turn_with_spurious_db_row_fails():
     )
     assert not r.passed
     assert "DB INCONSISTENT" in r.detail
+
+
+def test_escalation_none_run0_with_row_from_a_later_escalating_run_passes():
+    # Gate non-determinism across the N Mode-2 runs: run 0 returns 'none' but a LATER run escalated and
+    # wrote the (day-deduped) chat row. `obs` is bound to run 0, but the DB snapshot reflects ALL N runs,
+    # so the row is legitimate gate variance — "measured, not failed" (architecture §629) — NOT a DB
+    # inconsistency. The DB check must consult the full run set, not run 0 alone (the fixed bug).
+    case = _case(escalation=["none"])
+    r = score_escalation(
+        case,
+        _responses(
+            [_resp("calm", "none"), _resp("flagged", "clinician_review")],
+            escalations=[_chat("clinician_review")],
+        ),
+    )
+    assert r.passed
+    assert "DB INCONSISTENT" not in r.detail
 
 
 def test_report_no_response_case_is_red():

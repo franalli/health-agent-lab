@@ -112,8 +112,9 @@ def _classify_llm(
 ) -> tuple[str, LLMUsage | None]:
     """Run the LLM classification through the shared retry/usage seam (:func:`llm.call_structured`, which
     owns the one bounded retry on a parse glitch, §98). Returns ``(route, usage)`` — ``"couldnt_route"``
-    when the provider is down or both attempts are off-schema; on the parse-failure path the accumulated
-    usage is preserved so a fail-closed turn still counts the tokens it billed."""
+    when the provider is down or both attempts are off-schema; on BOTH degrade paths (off-schema twice, or
+    a provider-down after a billed parse-failed attempt) the accumulated usage is preserved so a fail-closed
+    turn still counts the tokens it billed. Only a clean provider-down with nothing billed yields ``None``."""
     try:
         prov = provider if provider is not None else llm.default_provider()
     except LLMUnavailable:
@@ -138,8 +139,11 @@ def _classify_llm(
             "couldnt_route",
             e.usage,
         )  # off-schema after the retry → fail closed, keep billed usage
-    except LLMUnavailable:
-        return "couldnt_route", None  # provider down mid-turn → degrade
+    except LLMUnavailable as e:
+        return (
+            "couldnt_route",
+            e.usage,
+        )  # provider down mid-turn → degrade, keep any usage billed before it failed
 
 
 def classify(message: str, *, provider: Provider | None = None) -> GateResult:

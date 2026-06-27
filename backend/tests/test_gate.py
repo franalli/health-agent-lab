@@ -11,9 +11,9 @@ the gate (a jailbroken or dead gate must still floor a self-harm / acute message
 import pytest
 
 from health_intelligence import gate, llm
-from health_intelligence.config import GATE_MODEL
+from health_intelligence.config import GATE_MAX_TOKENS, GATE_MODEL
 from health_intelligence.gate import GateClassification, emergency_phrase_floor
-from health_intelligence.llm import LLMParseError, LLMUnavailable
+from health_intelligence.llm import LLMParseError, LLMUnavailable, LLMUsage
 
 # ---- the deterministic emergency-phrase floor (pure: no provider, no network) --------------------
 
@@ -145,6 +145,46 @@ def test_provider_down_fails_closed_without_burning_a_retry(fake_provider):
     assert (
         len(prov.calls) == 1
     )  # LLMUnavailable is degradation, not a parse glitch — no retry
+
+
+def test_call_structured_preserves_billed_usage_when_retry_goes_unavailable(
+    fake_provider,
+):
+    # parse-fail on attempt 1 (already billed), then provider-down on the bounded retry: call_structured
+    # must propagate LLMUnavailable carrying the first attempt's usage, so a degrading caller can still
+    # count it (§5 'count every billed attempt'; the bug silently dropped the accumulated total).
+    u1 = LLMUsage(model=GATE_MODEL, input_tokens=10, output_tokens=5)
+    prov = fake_provider(
+        LLMParseError("glitch", usage=u1), LLMUnavailable("429 on the retry")
+    )
+    with pytest.raises(LLMUnavailable) as ei:
+        llm.call_structured(
+            prov,
+            model=GATE_MODEL,
+            system="s",
+            user="u",
+            schema=GateClassification,
+            max_tokens=GATE_MAX_TOKENS,
+            tool_name="t",
+            tool_description="d",
+        )
+    assert ei.value.usage is not None
+    assert ei.value.usage.total_tokens == u1.total_tokens  # 15 — not dropped
+    assert len(prov.calls) == 2  # attempt + one bounded retry
+
+
+def test_gate_counts_billed_tokens_on_parse_fail_then_unavailable(fake_provider):
+    # the same path end to end through the gate: fail-closed at clinician_review, but the gate's usage
+    # still reflects the tokens the parse-failed first attempt billed (not dropped on the LLMUnavailable).
+    u1 = LLMUsage(model=GATE_MODEL, input_tokens=10, output_tokens=5)
+    res = gate.classify(
+        "what's changed?",
+        provider=fake_provider(
+            LLMParseError("glitch", usage=u1), LLMUnavailable("down")
+        ),
+    )
+    assert res.route == "couldnt_route" and res.msg_floor == "clinician_review"
+    assert res.usage is not None and res.usage.total_tokens == 15
 
 
 # ---- the non-overridable emergency floor, taken in PARALLEL with the gate ------------------------

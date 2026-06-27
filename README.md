@@ -55,7 +55,7 @@ Escalation is reserved for panic thresholds and significant adverse trajectories
 
 ## Try it on your own data
 
-The demo's operator panel (left rail, kept out of the member experience) drives every endpoint with one click, and **Upload bundle** ingests a held-out member at runtime — no redeploy. The expected format is the bundle shipped in [`backend/data/training_data/`](backend/data/training_data/); a malformed file returns a clear error, so the upload doubles as the format check. The same ingest is available as a CLI (`uv run python -m preprocessing.ingest <bundle>`) and as `POST /members`.
+The demo's operator panel (left rail, kept out of the member experience) drives every endpoint with one click, and **Upload bundle** ingests a held-out member at runtime — no redeploy. The expected format is the bundle shipped in [`backend/data/training_data/`](backend/data/training_data/); a malformed file returns a clear error, so the upload doubles as the format check. The same ingest runs today as a CLI (`uv run python -m preprocessing.ingest <bundle>`); `POST /members` is its live equivalent, landing with the Phase-6 surface.
 
 ## Evaluation
 

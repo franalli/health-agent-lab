@@ -418,8 +418,12 @@ def ask(
             if e.usage is not None:
                 usages.append(e.usage)
             draft = None
-        except LLMUnavailable:
-            draft = None  # provider down -> grounded fallback. Mode 2 NEVER 500s; it fails safe (§6).
+        except LLMUnavailable as e:
+            # provider down -> grounded fallback. Mode 2 NEVER 500s; it fails safe (§6). A parse-fail-
+            # then-unavailable retry carries the first attempt's billed tokens here -> still count them.
+            if e.usage is not None:
+                usages.append(e.usage)
+            draft = None
     elif g.route != "couldnt_route":
         # out_of_scope / acute_medical / crisis -> a fixed template the GATE model routed us to.
         prose_model = GATE_MODEL

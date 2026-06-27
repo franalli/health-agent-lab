@@ -49,7 +49,17 @@ class LLMUnavailable(Exception):
     key). ``pipeline.ask`` catches this to fail *safe by construction* — the gate degrades to the
     ``couldnt_route`` template at the ``clinician_review`` floor, the composer to a deterministic
     grounded answer at the data floor (architecture §6). The Mode toggle is therefore also a killswitch:
-    on this signal the whole turn runs on the deterministic spine."""
+    on this signal the whole turn runs on the deterministic spine.
+
+    Carries an optional ``usage`` like :class:`LLMParseError`: a provider-down error bills nothing itself,
+    but when it surfaces from :func:`call_structured` *after* a first attempt already parse-failed, the
+    retry seam attaches the accumulated billed tokens here so the degraded turn's cost stamp still counts
+    them (the §5 'count every billed attempt' invariant — a parse-fail-then-unavailable retry must not
+    drop the first attempt's tokens)."""
+
+    def __init__(self, message: str, *, usage: LLMUsage | None = None) -> None:
+        super().__init__(message)
+        self.usage = usage
 
 
 class LLMParseError(Exception):
@@ -223,11 +233,13 @@ def call_structured(
     tool_description: str,
 ) -> tuple[BaseModel, LLMUsage]:
     """One structured call + ONE bounded retry on a parse glitch (architecture §98), accumulating usage
-    across every attempt. ``LLMUnavailable`` propagates immediately (provider down — retrying won't help);
-    a second ``LLMParseError`` is re-raised with the *accumulated* usage attached, so a caller that
-    degrades can still count the billed tokens. This is the single retry/usage seam BOTH the gate and the
-    composer share — a retry-policy or provider change lands in exactly one place (the architecture's
-    'no change to the composer/pipeline' promise)."""
+    across every attempt. ``LLMUnavailable`` propagates immediately (provider down — retrying won't help),
+    but with any *already-accumulated* usage from a prior parse-failed attempt attached, so even a
+    parse-fail-then-unavailable turn keeps its billed tokens; a second ``LLMParseError`` is likewise
+    re-raised with the accumulated usage attached. Either way a caller that degrades can still count the
+    billed tokens. This is the single retry/usage seam BOTH the gate and the composer share — a
+    retry-policy or provider change lands in exactly one place (the architecture's 'no change to the
+    composer/pipeline' promise)."""
     total: LLMUsage | None = None
     last: LLMParseError | None = None
     for _ in range(2):  # attempt 1 + one bounded retry
@@ -245,6 +257,12 @@ def call_structured(
         except LLMParseError as e:
             total = _sum_usage(total, e.usage)
             last = e
+        except LLMUnavailable as e:
+            # Provider down — retrying won't help, so propagate immediately; but a prior attempt may have
+            # already parse-failed and billed tokens, so carry the accumulated usage out so the degrading
+            # caller can still count it (§5: never undercount a parse-fail-then-unavailable turn).
+            e.usage = _sum_usage(total, e.usage)
+            raise
     assert last is not None  # the loop only exits here after two LLMParseErrors
     last.usage = (
         total  # re-raise with the full billed usage for the caller's accounting

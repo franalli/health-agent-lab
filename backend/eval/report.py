@@ -59,11 +59,6 @@ class CaseReport(BaseModel):
             if s.never_event is not None
         ]
 
-    def scorer(self, dimension: str) -> ScorerResult | None:
-        return next(
-            (s for s in (*self.mode2, *self.mode1) if s.dimension == dimension), None
-        )
-
 
 def _pct(xs: list[float], q: float) -> float:
     """Linear-interpolated percentile (q in [0,1]); 0.0 on empty. No numpy dependency."""
