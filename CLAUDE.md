@@ -18,6 +18,7 @@ If a change would let the model decide something safety-relevant, it is wrong. S
 - **The deterministic floor is always on.** `safety.py` computes an escalation floor from the analysis; the validator enforces `response.escalation >= floor` on *every* turn, both modes. A softer-toned answer can never sit on a harder floor.
 - **Escalation ≠ out-of-range.** A value merely outside its reference range is at most a `notable` observation. Escalation (`clinician_review` / `urgent`) is reserved for panic thresholds and RCV+FDR-significant adverse trajectories. A managed condition's expected-high marker must not escalate.
 - **Never fabricate.** No reading for a marker → the answer is "not measured", never an invented value. Every claim traces to `findings[].evidence[]`.
+- **Every narrator surfaces the core flags.** A rendered answer — template (`templates.py`) *or* LLM (`compose()`) — must state a marker's panic / out-of-range status, not merely its trend. Trend-only narration of a flagged value falsely reassures. The escalation floor guards the *level*; this guards the *prose*. It passes every structural test — it is caught only by reading the words, so read them.
 - **One normalization path.** All input enters through `preprocessing/ingest.py` (the firewall): it parses the supplied bundle's five reference-range shapes, folds vitals in as markers, and writes the internal domain model. Nothing downstream re-parses raw input. *Which* bundle it reads is resolved by `preprocessing/datasets.py` from the `DATASET` env var (default `training_data`) — each dataset is its own sub-folder of `backend/data/`, so new bundles ingest incrementally; the derived `health.db` sits at the `data/` root, not inside a bundle.
 - **One DB module.** Only `db.py` touches SQLite. Clinical constants and thresholds live in `config.py` (versioned); `.env` is secrets + runtime only.
 - **Both provider calls behind `llm.py`** — `compose()` and the gate classifier. These are the only network seams.
@@ -25,7 +26,7 @@ If a change would let the model decide something safety-relevant, it is wrong. S
 
 ## Structure
 
-`ls` shows the tree; the file-by-file map is `architecture.md` §14 (the one canonical copy — don't duplicate it here). What `ls` won't tell you is intent, and that's in the invariants above: `health_intelligence/` is the serving library (pure, imports no web framework), `preprocessing/ingest.py` is the one firewall, `eval/` is the harness, and `api.py` is thin routes serving the single static `frontend/index.html`. *(Some of these are forward references: `eval/` lands Phase 5, `frontend/` Phase 6 — the build is at Phase 4, so `llm.py` and `gate.py` are live (Mode 2 / `POST /ask`). The invariants describe the target design throughout.)*
+`ls` shows the tree; the file-by-file map is `architecture.md` §14 (the one canonical copy — don't duplicate it here). What `ls` won't tell you is intent, and that's in the invariants above: `health_intelligence/` is the serving library (pure, imports no web framework), `preprocessing/ingest.py` is the one firewall, `eval/` is the harness, and `api.py` is thin routes serving the single static `frontend/index.html`. *(One forward reference remains: `frontend/` lands Phase 6 — the build is at Phase 5a+5c, so `eval/` is live (`make eval`: the deterministic scorers + markdown/JSON report + a gated LangSmith trace sink in `eval/llm_eval.py`); only the LLM judge (semantic grounding, tone) is still a forward increment. The invariants describe the target design throughout.)*
 
 ## Commands
 
@@ -42,7 +43,7 @@ make lint        # ruff lint+format + gitleaks secret scan over the whole tree
 make test        # unit tests
 ```
 
-> The Makefile is wired as of Phase 3a (`backend/Makefile`); `make help` lists the targets. `make eval` is a placeholder until the harness lands in Phase 5. The UI (`frontend/index.html`) lands in Phase 6 — until then `make run` serves the API only (the static mount is skipped when the directory is absent).
+> The Makefile is wired as of Phase 3a (`backend/Makefile`); `make help` lists the targets. `make eval` runs the harness (Phase 5a: deterministic scorers → markdown/JSON report in `eval/reports/`); Mode 2 needs `ANTHROPIC_API_KEY` (the report measures real-API consistency and latency/cost). The UI (`frontend/index.html`) lands in Phase 6 — until then `make run` serves the API only (the static mount is skipped when the directory is absent).
 >
 > **Pre-commit hooks.** `.pre-commit-config.yaml` sits at the **repo root** (not `backend/`) because it gates the whole tree; the runner and `ruff` are dev deps in `backend/pyproject.toml`, and ruff's config is `[tool.ruff]` there. The gate is two checks — ruff (lint + format) and gitleaks (secrets) — plus basic hygiene hooks. `make hooks` installs it; `make lint` runs it on demand. Bump pinned hook revs with `pre-commit autoupdate`. `E501` (line width) is intentionally not enforced — this repo's long documented comments are by design; the formatter still wraps code.
 

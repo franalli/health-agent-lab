@@ -23,7 +23,7 @@ make run                                          # uv-installs, builds + seeds 
 
 Open `http://localhost:8000` — one process serves both the API and the UI; no Node, no second server, no CORS.
 
-> The Makefile is wired (`backend/Makefile`); run the `make` targets from `backend/` (`make help` lists them). The consumer UI lands in Phase 6, so `make run` currently serves the API only; `make eval` is a placeholder until the harness lands in Phase 5.
+> The Makefile is wired (`backend/Makefile`); run the `make` targets from `backend/` (`make help` lists them). The consumer UI lands in Phase 6, so `make run` currently serves the API only. `make eval` runs the evaluation harness (deterministic scorers + markdown/JSON report, plus a gated LangSmith trace sink); the LLM judge is the next increment.
 >
 > **Code quality gates.** Commits are checked by [pre-commit](https://pre-commit.com/) (`.pre-commit-config.yaml` at the repo root): `ruff` lints and formats Python, and `gitleaks` scans for secrets. `make hooks` installs the git hook; `make lint` runs every check over the whole tree on demand.
 
@@ -63,7 +63,7 @@ The demo's operator panel (left rail, kept out of the member experience) drives 
 make eval
 ```
 
-Runs a labeled case set through both modes and writes a markdown + JSON report. The harness mirrors the system's own discipline: deterministic scorers wherever there's a ground truth (grounding, escalation, trend verdicts, latency, cost, consistency), an LLM judge only for the irreducibly subjective (semantic support, tone). Safety failures are **never-events** that fail the run outright and surface first; over-escalation is measured, not failed. The JSON report is the regression gate. Set `LANGSMITH_API_KEY` to additionally stream each run to LangSmith for trace inspection (offline, synthetic-data-only); the local report stays canonical.
+Runs the supplied 17-case set (plus a few tagged gate/trend additions) through both modes and writes a markdown + JSON report under `backend/eval/reports/`. The harness mirrors the system's own discipline: deterministic scorers wherever there's a ground truth (grounding, escalation, trend verdicts, latency, cost, consistency), an LLM judge only for the irreducibly subjective (semantic support, tone). Safety failures are **never-events** that fail the run outright and surface first; over-escalation is measured, not failed. The JSON report is the regression gate (it persists each run's raw inputs/outputs, so a scorer change can be re-graded offline). Mode 2 calls the real Anthropic API (it measures consistency and latency/cost), so `make eval` needs `ANTHROPIC_API_KEY`. The deterministic scorers ship today, and setting `LANGSMITH_API_KEY` additionally streams each run to LangSmith for trace inspection (offline, synthetic-data-only) — the local report staying canonical. The LLM judge (semantic support, tone) is the next increment.
 
 ## Layout
 

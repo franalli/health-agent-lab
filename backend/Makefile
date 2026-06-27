@@ -25,5 +25,5 @@ hooks:  ## install the git pre-commit hook (run once after clone; config is at t
 lint:  ## run all pre-commit checks (ruff lint+format, gitleaks) over the whole tree
 	cd .. && uv run --project backend pre-commit run --all-files
 
-eval:  ## run the evaluation harness (lands in Phase 5)
-	@echo "eval harness is not built yet — it lands in Phase 5 (architecture.md build sequence)."
+eval:  ## run the evaluation harness → markdown + JSON report under eval/reports/ (Mode 2 needs ANTHROPIC_API_KEY)
+	uv run python -m eval
