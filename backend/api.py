@@ -1,9 +1,10 @@
 """api.py — the thin FastAPI layer. Routes are adapters; all logic lives in the library.
 
-Phase 3a stands up the first vertical slice: the proactive-scan routes plus liveness. Every handler is
-a few lines over ``health_intelligence`` (architecture §13, CLAUDE.md "routes stay thin") — it opens a
-connection, calls one library function, and returns its typed result. The route surface accretes per
-phase: ``/ask`` + ``/suggestions`` and the member CRUD land in Phases 4/6.
+Phase 3a stands up the first vertical slice: the proactive-scan routes plus liveness; Phase 3b adds the
+Mode-1 reactive ``GET /suggestions``. Every handler is a few lines over ``health_intelligence``
+(architecture §13, CLAUDE.md "routes stay thin") — it opens a connection, calls one library function,
+and returns its typed result. The route surface accretes per phase: ``/ask`` and the member CRUD land in
+Phases 4/6.
 
 One connection per request (a generator dependency that closes it) — SQLite connections are not safe to
 share across FastAPI's threadpool, and per-request open is cheap (the store is a local file). The DB
@@ -16,13 +17,13 @@ import os
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Optional
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 
 from health_intelligence import db, pipeline
-from health_intelligence.models import Escalation, Observation
+from health_intelligence.models import Escalation, Observation, SuggestedPrompt
 
 _DB_PATH = os.environ.get("HEALTH_DB_PATH")  # None -> db.DEFAULT_DB_PATH
 _FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
@@ -94,6 +95,22 @@ def get_escalations(member_id: str, con: sqlite3.Connection = Depends(get_con)) 
     if db.get_member(con, member_id) is None:
         raise HTTPException(status_code=404, detail=f"member {member_id!r} not found")
     return db.get_escalations(con, member_id)
+
+
+@app.get("/members/{member_id}/suggestions", response_model=list[SuggestedPrompt])
+def get_suggestions(
+    member_id: str,
+    focus: Optional[str] = None,
+    asked: list[str] = Query(default=[]),
+    con: sqlite3.Connection = Depends(get_con),
+) -> list[SuggestedPrompt]:
+    """Mode 1: data-derived preset prompts, each bound to its pre-computed answer (no LLM). ``focus``
+    (a marker just opened) and ``asked`` (markers already visited) drive the conversation loop — the
+    next chips after each answer. A pure read; re-fetching the same turn is byte-identical."""
+    try:
+        return pipeline.suggestions(con, member_id, focus=focus, asked=tuple(asked))
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"member {member_id!r} not found")
 
 
 # Serve the static member surface on the same origin (Phase 6 ships frontend/index.html). Mounted LAST

@@ -17,7 +17,7 @@ number is ever computed here; every value is read off the verdict or the referen
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 from health_intelligence.models import (
     Evidence,
@@ -25,8 +25,12 @@ from health_intelligence.models import (
     FloorLevel,
     HealthIntelligenceResponse,
     MarkerTrajectory,
+    Reading,
     ReferenceRange,
     ResponseMetadata,
+    SuggestedPrompt,
+    TrajectoryAnalysis,
+    TrendResult,
 )
 
 # --------------------------------------------------------------------------------------------------
@@ -38,6 +42,55 @@ from health_intelligence.models import (
 # --------------------------------------------------------------------------------------------------
 
 _DIRECTION_WORD = {"increasing": "rising", "decreasing": "falling", "flat": "changing"}
+
+#: Member-friendly labels for the canonical marker keys that aren't already clean. Labs read as printed
+#: ("HbA1c"); the three folded-in vitals carry snake_case STORAGE keys that must never surface in member
+#: copy. This maps only the *prose / titles / prompts* — the structured ``Evidence.marker`` field keeps
+#: the canonical key (grounding + cross-chip matching key on it), so display naming can't break either.
+_DISPLAY_NAME = {
+    "systolic_bp": "systolic blood pressure",
+    "diastolic_bp": "diastolic blood pressure",
+    "bmi": "BMI",
+}
+
+
+def _display_name(marker: str) -> str:
+    return _DISPLAY_NAME.get(marker, marker)
+
+
+def _trend_stat(t: TrendResult) -> str:
+    """The Mann-Kendall + Theil-Sen evidence stat for a signed, significant trend. The ONE place this
+    wording lives, so the scan/pivot stat (``_stat_string``) and the change drill-down stat
+    (``_change_stat``) cannot drift apart on precision or naming."""
+    slope = f", Theil-Sen slope {t.slope:.4g}/day" if t.slope is not None else ""
+    return f"Mann-Kendall p={t.p_value:.3f}, tau={t.tau:.2f}, n={t.n}{slope}"
+
+
+#: The value-status flags (out-of-range / panic / band) — distinct from ``no_reference`` (no range to
+#: judge against). A marker carrying any of these is NOT "within normal variation", whatever its trend.
+_VALUE_FLAGS = ("panic_high", "panic_low", "above_range", "below_range", "band_cross")
+
+
+def _is_flagged(traj: MarkerTrajectory) -> bool:
+    return any(f in traj.flags for f in _VALUE_FLAGS)
+
+
+def _status_clause(traj: MarkerTrajectory) -> str:
+    """A plain status sentence from the value flags, in the same panic > range > band priority as
+    ``_classify`` — so the change drill-down states a marker's out-of-range / panic standing instead of
+    silently narrating only its trend (which can read as false reassurance on a flagged value)."""
+    f = traj.flags
+    if "panic_high" in f:
+        return "This is above the critical-high threshold."
+    if "panic_low" in f:
+        return "This is below the critical-low threshold."
+    if "above_range" in f:
+        return "This is above the reference range."
+    if "below_range" in f:
+        return "This is below the reference range."
+    if "band_cross" in f:
+        return "This has crossed a clinical threshold."
+    return ""
 
 
 def _classify(traj: MarkerTrajectory) -> str:
@@ -67,7 +120,7 @@ def _classify(traj: MarkerTrajectory) -> str:
 def observation_summary(traj: MarkerTrajectory) -> tuple[str, str]:
     """(title, trigger_reason) for the ``observations`` row and the Finding text — derived from
     ``_classify`` so the title and the evidence stat always describe the same signal."""
-    m, signal = traj.marker, _classify(traj)
+    m, signal = _display_name(traj.marker), _classify(traj)
     val = f"{traj.latest.value} {traj.unit}"
     if signal == "panic_high":
         return f"{m} critically high", f"{m} latest {val} above the critical-high threshold"
@@ -98,8 +151,7 @@ def _stat_string(traj: MarkerTrajectory, rng: Optional[ReferenceRange]) -> str:
     if signal == "panic_low" and rng is not None and rng.panic_low is not None:
         return f"below critical-low {rng.panic_low} {traj.unit}"
     if signal == "trend" and t is not None:
-        slope = f", Theil-Sen slope {t.slope:.4g}/day" if t.slope is not None else ""
-        return f"Mann-Kendall p={t.p_value:.3f}, tau={t.tau:.2f}, n={t.n}{slope}"
+        return _trend_stat(t)
     if signal in ("above_range", "below_range"):
         return "outside reference range"
     if signal == "band_cross":
@@ -191,3 +243,277 @@ def refuse_template(metadata: ResponseMetadata) -> HealthIntelligenceResponse:
         escalation="none",
         metadata=metadata,
     )
+
+
+# --------------------------------------------------------------------------------------------------
+# Mode 1 reactive answering (Phase 3b) — ``suggest_prompts`` builds the navigable preset loop, each chip
+# bound to a PRE-COMPUTED ``HealthIntelligenceResponse`` templated from the same verdicts (no model call,
+# so byte-identical and ~free). The loop (architecture §147–164): drill-downs of the finding just opened
+# + a few unexplored pivots + one or two ever-present anchors. Two boundaries keep it honest:
+#   * Grounding — chips only resurface the member's OWN markers (every Evidence reads off a trajectory).
+#   * Mechanism — NO chip is a causal/"why" question; those would hedge to action or hand to Mode 2
+#     (§153). Every prompt here asks for status/data ("tell me about", "how has it changed"), and every
+#     answer reports the movement the core measured, never its cause.
+# The escalation floor is STANDING: every chip is built at the member's data floor, so even an unrelated
+# chip carries the floor (asserted in pipeline) — "floor always on" (CLAUDE.md), demonstrated.
+# --------------------------------------------------------------------------------------------------
+
+def _join_markers(markers: list[str]) -> str:
+    """"a", "a and b", "a, b and c" — a calm, readable marker list for the overview prose."""
+    if len(markers) == 1:
+        return markers[0]
+    return ", ".join(markers[:-1]) + " and " + markers[-1]
+
+
+def _change_narrative(traj: MarkerTrajectory) -> str:
+    """How a marker has moved over the recorded panels — latest value, its out-of-range / panic STATUS,
+    the net change, and the trend verdict. Status/data only: it names what the core measured (value,
+    flags, %, Mann-Kendall verdict), never a cause. FLAG-AWARE: a marker carrying a value flag is never
+    narrated as 'within normal variation' (which would be false reassurance on an out-of-range or panic
+    value — the same calm the deterministic core did not produce). Reads only off the trajectory."""
+    latest = traj.latest
+    parts = [f"Your most recent {_display_name(traj.marker)} is {latest.value} {traj.unit} (recorded {latest.date})."]
+    status = _status_clause(traj)
+    if status:
+        parts.append(status)
+    net = traj.clinical_change.net_change if traj.clinical_change is not None else None
+    if net is not None and abs(net) >= 1.0:
+        parts.append(f"That's {'up' if net > 0 else 'down'} about {abs(net):.0f}% from your first recorded reading.")
+    t = traj.trend
+    if t is not None and t.direction != "flat" and t.significant:
+        word = _DIRECTION_WORD.get(t.direction, "changing")
+        parts.append(f"Across {t.n} readings this is a {word} trend (Mann-Kendall p={t.p_value:.3f}).")
+    elif t is not None and not _is_flagged(traj):
+        parts.append(f"Across {t.n} readings there's no clear trend — the movement is within normal variation.")
+    elif t is not None:
+        parts.append(f"Across {t.n} readings there's no significant trend.")  # flagged: don't claim 'normal variation'
+    return " ".join(parts)
+
+
+def _change_stat(traj: MarkerTrajectory, rng: Optional[ReferenceRange]) -> str:
+    """The statistic the change drill-down's latest-reading evidence chip rests on. FLAG-AWARE: when the
+    value is out-of-range / panic / band, defer to ``_stat_string`` so the chip states the threshold —
+    the SAME stat that marker's pivot/scan chip shows (no cross-chip divergence). Otherwise the change
+    statistic: the Mann-Kendall verdict for a signed significant trend, else a material net % change
+    (suppressed below 1%, matching the narrative — so the chip never reads a misleading '+0%')."""
+    if _is_flagged(traj):
+        return _stat_string(traj, rng)
+    t = traj.trend
+    if t is not None and t.direction != "flat" and t.significant:
+        return _trend_stat(t)
+    cc = traj.clinical_change
+    if cc is not None and cc.net_change is not None and abs(cc.net_change) >= 1.0:
+        return f"net change {cc.net_change:+.0f}% since baseline"
+    return "latest reading"
+
+
+def _marker_finding(traj: MarkerTrajectory, rng: Optional[ReferenceRange]) -> Finding:
+    """One raised marker's ``Finding`` — the per-marker unit shared by the pivot answer and the overview
+    aggregate, so a marker reads identically whether shown singly or inside the 'what's changed' list
+    (one ``observation_summary`` title + one ``scan_finding`` evidence, one ``f:{marker}`` id scheme)."""
+    return scan_finding(traj, rng, f"f:{traj.marker}", observation_summary(traj)[0])
+
+
+def render_change(
+    traj: MarkerTrajectory,
+    rng: Optional[ReferenceRange],
+    series: list[Reading],
+    *,
+    escalation: FloorLevel,
+    metadata: ResponseMetadata,
+) -> HealthIntelligenceResponse:
+    """A focus drill-down: how this marker has moved over the recorded panels. One ``Finding`` whose
+    evidence is the member's ACTUAL readings — one verbatim ``Evidence`` each (the latest carrying the
+    change statistic) — under a plain summary of the net change and trend verdict. Status/data only
+    (never 'why' — the mechanism boundary, §153): it reports the movement the core measured, not its
+    cause. ``series`` (the dated readings) is supplied by the caller and is non-empty (the sole caller
+    only drills into a marker that exists in the record). Built AT the floor, like every Mode-1 response."""
+    last = len(series) - 1
+    finding = Finding(
+        finding_id=f"chg:{traj.marker}",
+        text=_change_narrative(traj),
+        evidence=[
+            Evidence(
+                marker=traj.marker, value=rd.value, unit=traj.unit, date=rd.date,
+                ref_low=rng.ref_low if rng else None, ref_high=rng.ref_high if rng else None,
+                stat=_change_stat(traj, rng) if i == last else None,  # the change stat sits on the latest reading
+            )
+            for i, rd in enumerate(series)
+        ],
+    )
+    return HealthIntelligenceResponse(
+        answer=finding.text,
+        findings=[finding],
+        uncertainty=f"Based on {len(series)} recorded reading{'s' if len(series) != 1 else ''} for this marker.",
+        answer_disposition="answered",
+        escalation=escalation,
+        metadata=metadata,
+    )
+
+
+def render_pivot(
+    traj: MarkerTrajectory,
+    rng: Optional[ReferenceRange],
+    *,
+    escalation: FloorLevel,
+    metadata: ResponseMetadata,
+) -> HealthIntelligenceResponse:
+    """One raised finding as its own answer — the SAME per-marker ``Finding`` the proactive scan builds
+    (``observation_summary`` title + ``scan_finding`` evidence), rendered by the 3a ``render_finding``.
+    This is the "reactive path reuses the 3a response builder" of the phase, so a chip's answer for a
+    marker is identical in substance to that marker's scan observation."""
+    return render_finding(_marker_finding(traj, rng), escalation=escalation, metadata=metadata)
+
+
+def render_overview(
+    raised: list[MarkerTrajectory],
+    rng_for: dict[str, Optional[ReferenceRange]],
+    *,
+    escalation: FloorLevel,
+    metadata: ResponseMetadata,
+) -> HealthIntelligenceResponse:
+    """The "what's changed" anchor — the aggregate the single-finding 3a builder can't produce. When
+    findings are raised, one ``Finding`` per marker (reusing ``scan_finding``) wrapped in one response
+    with summary prose; when nothing is raised, a calm, non-manufactured all-clear (the negative-control
+    branch, ui-ux §1/§6, eval E02 — "honest before reassuring" still holds: it claims only in-range +
+    no concerning trend, which is exactly what the core found). Built AT the floor."""
+    if not raised:
+        # Don't claim "within normal ranges" for a marker that HAS no reference range (no_reference, e.g.
+        # an other/unknown-sex member with a sex-split marker) — say only what's true: nothing flagged.
+        clause = ("your results sit within their normal ranges" if all(r is not None for r in rng_for.values())
+                  else "nothing in your readings is flagged")
+        return HealthIntelligenceResponse(
+            answer=(
+                f"Nothing in your recent panels stands out as needing attention — {clause}, with no "
+                "concerning trend. I'll keep watching and flag anything that drifts."
+            ),
+            findings=[],
+            uncertainty="Based on the panels currently on file.",
+            answer_disposition="answered",
+            escalation=escalation,
+            metadata=metadata,
+        )
+    findings = [_marker_finding(t, rng_for.get(t.marker)) for t in raised]
+    return HealthIntelligenceResponse(
+        answer=(
+            f"A few things are worth a closer look since your earlier panels: "
+            f"{_join_markers([_display_name(t.marker) for t in raised])}. Here's what each shows — your "
+            "clinician can interpret them in context."
+        ),
+        findings=findings,
+        uncertainty="Based on your recorded panels for these markers.",
+        answer_disposition="answered",
+        escalation=escalation,
+        metadata=metadata,
+    )
+
+
+def render_summary(
+    analysis: TrajectoryAnalysis,
+    raised: list[MarkerTrajectory],
+    *,
+    escalation: FloorLevel,
+    metadata: ResponseMetadata,
+) -> HealthIntelligenceResponse:
+    """The "overview" anchor — a terse orientation roll-up (how many markers were looked at, how many
+    are flagged), the calm landing for a vulnerable moment. No findings of its own; the detail lives in
+    the overview and the pivots."""
+    n, m = len(analysis.markers), len(raised)
+    # As in render_overview: only claim "within their normal ranges" when every marker actually HAS a
+    # reference range; otherwise fall back to the honest "not flagged" (no over-claim on a no_reference).
+    all_ranged = all("no_reference" not in t.flags for t in analysis.markers)
+    rest = "within their normal ranges" if all_ranged else "not flagged"
+    if m == 0:
+        answer = (
+            f"I looked at {n} markers from your panels, and they're all {rest} — nothing flagged right now."
+        )
+    else:
+        answer = (
+            f"I looked at {n} markers from your panels. {m} {'is' if m == 1 else 'are'} worth a closer "
+            f"look (shown on the right and in detail above); the rest are {rest}."
+        )
+    return HealthIntelligenceResponse(
+        answer=answer, findings=[], uncertainty=None,
+        answer_disposition="answered", escalation=escalation, metadata=metadata,
+    )
+
+
+#: The per-turn chip ceiling (architecture §145 / ui-ux §2: "2–5 data-derived preset prompts"). Mode 1
+#: is the calm landing for a vulnerable moment, not a wall of buttons — so a busy member's many findings
+#: are shown a few at a time, severity-ranked, with the rest reachable through the overview anchor and
+#: paged up over turns as the member visits findings (§147's "walk the map", not "dump the map").
+MAX_CHIPS = 5
+
+
+def suggest_prompts(
+    analysis: TrajectoryAnalysis,
+    raised: list[MarkerTrajectory],
+    focus: Optional[str],
+    asked: frozenset[str],
+    *,
+    rng_for: dict[str, Optional[ReferenceRange]],
+    focus_series: list[Reading],
+    escalation: FloorLevel,
+    new_metadata: Callable[[str], ResponseMetadata],
+) -> list[SuggestedPrompt]:
+    """The navigable Mode-1 chip set for one turn, each prompt bound to its pre-computed answer.
+
+    ``raised`` is the caller's raised-finding set as TRAJECTORIES, severity-sorted (pipeline owns the
+    "raise an observation?" predicate, architecture §397) — it replaces the architecture sketch's
+    ``observations`` argument because an ``Observation`` carries no marker field and none of the verdict
+    data the evidence needs, so the trajectory is the correct, self-contained source. ``rng_for``
+    (per-marker reference range), ``focus_series`` (the focused marker's dated readings), ``escalation``
+    (the data floor), and ``new_metadata`` (the deterministic ``response_id`` factory) are keyword-only
+    render context the pure narrator does not derive — the same shape as ``analyze(..., *, data_version)``.
+    (The linked-GP-note drill-down of §149 would add a ``notes`` argument; it is deferred to Phase 7, so
+    the parameter is not carried until the behavior that reads it lands — CLAUDE.md "phantom fields cut".)
+
+    ``focus`` / ``asked`` are CANONICAL marker keys (the chip prompts show ``_display_name`` labels, but
+    the loop state keys on the storage name). The chip order is the loop (§149): the opened finding's
+    drill-down, then unexplored pivots, then the ever-present anchors — which are EXEMPT from the
+    ``asked`` filter, so the loop never dead-ends (§153) and thins to anchors-only once every finding has
+    been visited (the cue to offer Mode 2). The whole turn is bounded to ``MAX_CHIPS``: anchors are
+    always shown, and the pivot slots that remain go to the most severe unexplored findings — applied
+    AFTER the ``asked`` filter, so visited findings page out and the next-most-severe page in, and
+    nothing becomes unreachable (the overview always lists all)."""
+    by_marker = {t.marker: t for t in analysis.markers}
+
+    # 1. Drill-down of the finding just opened (any marker in the member's record, raised or not).
+    drilldowns: list[SuggestedPrompt] = []
+    if focus is not None and focus in by_marker:
+        drilldowns.append(SuggestedPrompt(
+            prompt=f"How has my {_display_name(focus)} changed over time?",
+            response=render_change(
+                by_marker[focus], rng_for.get(focus), focus_series,
+                escalation=escalation, metadata=new_metadata(f"change:{focus}"),
+            ),
+        ))
+
+    # 3. Ever-present anchors (built before the pivots so the pivot budget is what remains after them).
+    anchors = [
+        SuggestedPrompt(
+            prompt="What's changed since my last results?",
+            response=render_overview(raised, rng_for, escalation=escalation, metadata=new_metadata("overview")),
+        ),
+        SuggestedPrompt(
+            prompt="Give me a quick overview of my results.",
+            response=render_summary(analysis, raised, escalation=escalation, metadata=new_metadata("summary")),
+        ),
+    ]
+
+    # 2. Unexplored pivots — severity-ranked (``raised`` is pre-sorted), filtered by ``asked`` and the
+    #    current focus, then capped to whatever the turn budget leaves after the drill-down and anchors.
+    pivot_cap = max(0, MAX_CHIPS - len(anchors) - len(drilldowns))
+    eligible = [t for t in raised if t.marker != focus and t.marker not in asked]
+    pivots = [
+        SuggestedPrompt(
+            prompt=f"Tell me about my {_display_name(t.marker)}.",
+            response=render_pivot(
+                t, rng_for.get(t.marker),
+                escalation=escalation, metadata=new_metadata(f"marker:{t.marker}"),
+            ),
+        )
+        for t in eligible[:pivot_cap]
+    ]
+
+    return drilldowns + pivots + anchors
