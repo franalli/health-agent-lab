@@ -28,9 +28,11 @@ from health_intelligence.models import (
     AskRequest,
     Escalation,
     HealthIntelligenceResponse,
+    MemberBundle,
     Observation,
     SuggestedPrompt,
 )
+from preprocessing.ingest import ingest_bundle
 
 # Load backend/.env into the process env at import (before any LLM provider is constructed) so the
 # Mode-2 path sees ANTHROPIC_API_KEY however the app is launched. A no-op when no .env is present (the
@@ -78,6 +80,41 @@ app = FastAPI(title="Health Intelligence Service", lifespan=lifespan)
 def health() -> dict[str, str]:
     """Liveness."""
     return {"status": "ok"}
+
+
+@app.get("/members")
+def get_members(con: sqlite3.Connection = Depends(get_con)) -> list[dict]:
+    """List members for the picker — ``[{member_id, age, sex}]`` (seeded + uploaded). The only route
+    the member-picker needs to enumerate what's loadable; the UI re-reads it after an upload/clear."""
+    return db.list_member_summaries(con)
+
+
+@app.post("/members")
+def post_member(
+    bundle: MemberBundle, con: sqlite3.Connection = Depends(get_con)
+) -> dict:
+    """Ingest/upsert one member bundle (Seed / Upload bundle, the holdout swap). The upload doubles as
+    the format check (ui-ux §2): FastAPI validates the body against ``MemberBundle`` first (a SHAPE error
+    → 422 before this runs), and the ``except`` below turns the firewall's SEMANTIC ``ValueError``s — an
+    unparseable reference-range, a marker/vital name collision, a missing vital unit, a divergent shared
+    range — into a 422 too, so a malformed upload always lands a clear cause in the operator readout
+    rather than an opaque 500. Re-POSTing an id refreshes that member's facts, preserves the audit/learning
+    rows, and bumps ``data_version`` (``ingest_bundle`` -> ``replace_member``)."""
+    try:
+        return ingest_bundle(con, bundle)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+
+@app.delete("/members/{member_id}")
+def delete_member(
+    member_id: str, con: sqlite3.Connection = Depends(get_con)
+) -> dict[str, bool]:
+    """Explicitly clear one member and everything that hangs off them (opt-in; ingest never clears by
+    default). 404 if the member isn't present, so the destructive op can't silently no-op a typo."""
+    if not db.delete_member(con, member_id):
+        raise HTTPException(status_code=404, detail=f"member {member_id!r} not found")
+    return {"deleted": True}
 
 
 @app.post("/members/{member_id}/scan", response_model=list[Observation])

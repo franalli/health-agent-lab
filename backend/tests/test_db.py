@@ -9,69 +9,26 @@ C07. The schema loads via db.init_db; nothing here touches SQLite except through
 """
 
 import pytest
+from builders import (
+    fresh_con as _con,
+)
+from builders import (
+    make_bundle as _bundle,
+)
+from builders import (
+    make_panel as _panel,
+)
+from builders import (
+    make_result as _r,
+)
 
 from health_intelligence import db
 from health_intelligence.analysis import analyze
 from health_intelligence.config import ANALYSIS_CONFIG, CONFIG_VERSION
-from health_intelligence.models import LabResult, MemberBundle, ReferenceRange
+from health_intelligence.models import LabResult, ReferenceRange
 from preprocessing.ingest import ingest_bundle, ingest_dataset
 
-# ---- helpers -------------------------------------------------------------------------------------
-
-
-def _con():
-    con = db.connect(":memory:")
-    db.init_db(con)
-    return con
-
-
-def _r(analyte, value, unit, reference_range):
-    return {
-        "analyte": analyte,
-        "value": value,
-        "unit": unit,
-        "reference_range": reference_range,
-    }
-
-
-def _panel(panel_id, date, results, vitals=None):
-    # default vitals sit in-range and stable, so they never raise the floor in single-marker tests
-    return {
-        "panel_id": panel_id,
-        "collected_date": date,
-        "results": results,
-        "vitals": vitals or {"systolic_bp": 118, "diastolic_bp": 76, "bmi": 22.5},
-    }
-
-
-def _bundle(
-    member_id,
-    panels,
-    *,
-    sex="male",
-    age=50,
-    conditions=None,
-    medications=None,
-    family_history=None,
-    lifestyle=None,
-    notes=None,
-):
-    return MemberBundle.model_validate(
-        {
-            "member_id": member_id,
-            "profile": {
-                "member_id": member_id,
-                "age": age,
-                "sex": sex,
-                "conditions": conditions or [],
-                "medications": medications or [],
-                "family_history": family_history or [],
-                "lifestyle": lifestyle or {},
-            },
-            "panels": panels,
-            "notes": notes or [],
-        }
-    )
+# helpers (_con / _r / _panel / _bundle) now live in tests/builders.py — imported above
 
 
 def _k_panels(values):

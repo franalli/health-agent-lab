@@ -11,6 +11,18 @@ except through db.py.
 """
 
 import pytest
+from builders import (
+    fresh_con as _con,
+)
+from builders import (
+    make_bundle as _bundle,
+)
+from builders import (
+    make_panel as _panel,
+)
+from builders import (
+    make_result as _r,
+)
 
 from health_intelligence import db, pipeline, safety, templates
 from health_intelligence.analysis import analyze
@@ -42,52 +54,7 @@ def _raised_markers(analysis):
     return [t.marker for t in analysis.markers if pipeline._is_raised(t)]
 
 
-# ---- helpers (match test_db.py style) ------------------------------------------------------------
-
-
-def _con():
-    con = db.connect(":memory:")
-    db.init_db(con)
-    return con
-
-
-def _r(analyte, value, unit, reference_range):
-    return {
-        "analyte": analyte,
-        "value": value,
-        "unit": unit,
-        "reference_range": reference_range,
-    }
-
-
-def _panel(panel_id, date, results, vitals=None):
-    return {
-        "panel_id": panel_id,
-        "collected_date": date,
-        "results": results,
-        "vitals": vitals or {"systolic_bp": 118, "diastolic_bp": 76, "bmi": 22.5},
-    }
-
-
-def _bundle(member_id, panels, *, sex="male", age=50, notes=None):
-    from health_intelligence.models import MemberBundle
-
-    return MemberBundle.model_validate(
-        {
-            "member_id": member_id,
-            "profile": {
-                "member_id": member_id,
-                "age": age,
-                "sex": sex,
-                "conditions": [],
-                "medications": [],
-                "family_history": [],
-                "lifestyle": {},
-            },
-            "panels": panels,
-            "notes": notes or [],
-        }
-    )
+# helpers (_con / _r / _panel / _bundle) now live in tests/builders.py — imported above
 
 
 def _resp(escalation):
@@ -304,6 +271,43 @@ def test_c07_potassium_forces_urgent_and_writes_exactly_one_escalation_idempoten
         == int_count
     )
     assert len(db.get_escalations(con, "C07")) == 1
+
+
+def test_rescan_overwrites_stale_observation_narration_without_fk_failure():
+    # Regression (architecture §48): write_observation is OVERWRITE-on-conflict, not keep-first
+    # INSERT OR IGNORE. A re-scan at an unchanged data_version must REFRESH the persisted projection
+    # (so a templates/display-name change self-heals on the next scan) and must do so WITHOUT a blanket
+    # delete — escalations.observation_id is a RESTRICT FK, so deleting an escalated marker's observation
+    # FK-fails. C07 carries a data_finding escalation, so it is exactly the case keep-first strands and
+    # delete-then-insert breaks.
+    con = _con()
+    ingest_dataset(con)
+    obs = pipeline.scan(con, "C07")
+    pot = next(o for o in obs if o.title.startswith("Potassium"))
+
+    # simulate stale narration persisted by an earlier templating version
+    with con:
+        con.execute(
+            "UPDATE observations SET title='STALE', trigger_reason='STALE' WHERE observation_id=?",
+            (pot.observation_id,),
+        )
+
+    # re-scan over identical data (same data_version → same observation_id, still escalation-referenced):
+    # must not FK-fail, must restore current narration, must keep exactly one row for the marker.
+    refreshed = pipeline.scan(con, "C07")
+    pot2 = next(o for o in refreshed if o.observation_id == pot.observation_id)
+    assert pot2.title == pot.title != "STALE"  # overwrite, not keep-first
+    assert pot2.trigger_reason == pot.trigger_reason != "STALE"
+    assert (
+        con.execute(
+            "SELECT COUNT(*) FROM observations WHERE observation_id=?",
+            (pot.observation_id,),
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        len(db.get_escalations(con, "C07")) == 1
+    )  # the referencing escalation survived intact
 
 
 def test_c02_negative_control_raises_no_escalation():

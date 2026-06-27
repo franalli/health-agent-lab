@@ -23,7 +23,7 @@ make run                                          # uv-installs, builds + seeds 
 
 Open `http://localhost:8000` — one process serves both the API and the UI; no Node, no second server, no CORS.
 
-> The Makefile is wired (`backend/Makefile`); run the `make` targets from `backend/` (`make help` lists them). The consumer UI lands in Phase 6, so `make run` currently serves the API only. `make eval` runs the evaluation harness (deterministic scorers + markdown/JSON report, plus a gated LangSmith trace sink); the LLM judge is the next increment.
+> The Makefile is wired (`backend/Makefile`); run the `make` targets from `backend/` (`make help` lists them). The consumer UI ships (Phase 6): `make run` serves the API **and** the static page same-origin on `:8000`. The page's Mode-2 chat needs `ANTHROPIC_API_KEY` for the real LLM path; without it, `/ask` degrades to the deterministic fallback (never an error). `make eval` runs the evaluation harness (deterministic scorers + markdown/JSON report, plus a gated LangSmith trace sink); the LLM judge is the next increment.
 >
 > **Code quality gates.** Commits are checked by [pre-commit](https://pre-commit.com/) (`.pre-commit-config.yaml` at the repo root): `ruff` lints and formats Python, and `gitleaks` scans for secrets. `make hooks` installs the git hook; `make lint` runs every check over the whole tree on demand.
 
@@ -55,7 +55,7 @@ Escalation is reserved for panic thresholds and significant adverse trajectories
 
 ## Try it on your own data
 
-The demo's operator panel (left rail, kept out of the member experience) drives every endpoint with one click, and **Upload bundle** ingests a held-out member at runtime — no redeploy. The expected format is the bundle shipped in [`backend/data/training_data/`](backend/data/training_data/); a malformed file returns a clear error, so the upload doubles as the format check. The same ingest runs today as a CLI (`uv run python -m preprocessing.ingest <bundle>`); `POST /members` is its live equivalent, landing with the Phase-6 surface.
+The demo's operator panel (left rail, kept out of the member experience) drives every endpoint with one click, and **Upload bundle** ingests a held-out member at runtime — no redeploy. The expected format is one `MemberBundle`; a ready single-member template ships at [`frontend/sample_member_bundle.json`](frontend/sample_member_bundle.json) (and **Seed sample** ingests it in one click). A malformed file returns a clear error in the operator readout, so the upload doubles as the format check. The same ingest runs as a CLI (`uv run python -m preprocessing.ingest <bundle>`); `POST /members` is its live equivalent — the Phase-6 surface.
 
 ## Evaluation
 

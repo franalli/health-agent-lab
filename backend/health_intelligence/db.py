@@ -257,6 +257,20 @@ def list_members(con: sqlite3.Connection) -> list[str]:
     ]
 
 
+def list_member_summaries(con: sqlite3.Connection) -> list[dict]:
+    """The member-picker projection (``GET /members``): just enough to populate the dropdown —
+    ``[{member_id, age, sex}]``, ordered by id. Deliberately thinner than ``MemberProfile`` (no
+    conditions/medications/notes): the picker only needs a label, and the full record loads on
+    select. A plain dict, not a model — architecture §13 keeps read projections like this off the
+    contract surface."""
+    return [
+        {"member_id": r["member_id"], "age": r["age"], "sex": r["sex"]}
+        for r in con.execute(
+            "SELECT member_id, age, sex FROM members ORDER BY member_id"
+        )
+    ]
+
+
 # --------------------------------------------------------------------------------------------------
 # data_version — a deterministic content fingerprint of the member's PERSISTED record. Stable across
 # identical re-ingests (same data -> same hash) and changes iff the data changed: that is the "bump".
@@ -454,6 +468,38 @@ def replace_member(
         )
 
 
+def delete_member(con: sqlite3.Connection, member_id: str) -> bool:
+    """Explicitly clear ONE member and everything that hangs off them — the ``DELETE /members/{id}``
+    op (architecture §13: opt-in, since ingest never clears by default). Returns whether the member
+    existed (drives the ``{deleted}`` ack / 404).
+
+    FKs are ON with no ``ON DELETE CASCADE`` (schema.sql), so delete children before parents in one
+    atomic transaction, in FK-dependency order: ``escalations`` (point at observations + interactions)
+    -> ``observations`` (point at interactions) -> ``interactions`` -> the owned ``lab_results`` /
+    ``notes`` -> ``feedback`` -> ``members`` last. ``reference_ranges`` are intentionally untouched —
+    they are GLOBAL (shared across members, keyed by ``config:sex:marker``), so a member delete must
+    not strip a band another member still reads; ``prompt_versions`` is likewise global. Unlike
+    ``replace_member`` (which preserves the audit/learning trail on re-ingest), this is the one path
+    that tears the whole member down."""
+    with con:  # atomic: all-or-nothing
+        # children first (FK-safe), parent last
+        con.execute("DELETE FROM escalations WHERE member_id = ?", (member_id,))
+        con.execute("DELETE FROM observations WHERE member_id = ?", (member_id,))
+        con.execute("DELETE FROM interactions WHERE member_id = ?", (member_id,))
+        con.execute("DELETE FROM lab_results WHERE member_id = ?", (member_id,))
+        con.execute("DELETE FROM notes WHERE member_id = ?", (member_id,))
+        con.execute("DELETE FROM feedback WHERE member_id = ?", (member_id,))
+        # the parent DELETE's rowcount IS the existence signal (child deletes on an absent member are
+        # harmless no-ops), so no separate SELECT is needed.
+        existed = (
+            con.execute(
+                "DELETE FROM members WHERE member_id = ?", (member_id,)
+            ).rowcount
+            > 0
+        )
+    return existed
+
+
 # --------------------------------------------------------------------------------------------------
 # Idempotent escalation emit — built now (its idempotency is a mandated test), wired to the scan in
 # Phase 3a. The UNIQUE dedup_key makes "fire once" a DB guarantee, not application logic.
@@ -528,15 +574,21 @@ def emit_escalation(con: sqlite3.Connection, **kwargs) -> bool:
 
 # --------------------------------------------------------------------------------------------------
 # Proactive-scan persistence (Phase 3a) — the interaction (audit/trace backbone) each observation hangs
-# off via its FK, the observation write, and the two read projections the routes serve. Scan ids are
-# deterministic and keyed on data_version (the caller builds them via _det_id), written INSERT OR
-# IGNORE: an identical re-scan (same data_version) hits the same key and is a no-op, while a genuine
-# data change bumps data_version → a new key → a new row, and the PRIOR row is RETAINED, not overwritten
-# (its audit/finding record stands — the same discipline as the escalation dedup). "Replace, not append"
-# for the member's live view is delivered by the version-scoped read, which returns only the current
-# data_version. These two writers do NOT commit — the scan wraps interaction+observations+escalations in
-# one transaction (atomicity); the /ask path (Phase 4) uses a per-call unique response_id, so the same
-# INSERT OR IGNORE simply always inserts and `driver` distinguishes the two write disciplines.
+# off via its FK, the observation write, and the two read projections the routes serve. Both scan ids are
+# deterministic and keyed on data_version (the caller builds them via _det_id), but the TWO writers use
+# DELIBERATELY DIFFERENT disciplines (architecture §48):
+#   • write_interaction → KEEP-FIRST `INSERT OR IGNORE`: an identical re-scan hits the same response_id and
+#     is a no-op; the PRIOR audit row is RETAINED, not overwritten (an append-only trace, like the
+#     escalation dedup). A genuine data change bumps data_version → a new id → a new row.
+#   • write_observation → OVERWRITE-on-conflict (`ON CONFLICT ... DO UPDATE`): a same-data_version re-scan
+#     REFRESHES the derived projection in place (severity/title/trigger_reason), so a templates/display-name
+#     edit self-heals on the next scan. NOT a blanket DELETE — the escalations.observation_id RESTRICT FK
+#     forbids deleting an escalated marker's observation; overwrite-in-place keeps that reference valid.
+# "Replace, not append" for the member's live view is delivered by the version-scoped read, which returns
+# only the current data_version (prior rows persist for audit/escalation-reference, never shown). Neither
+# writer commits — the scan wraps interaction+observations+escalations in one transaction (atomicity); the
+# /ask path (Phase 4) uses a per-call unique response_id, so its INSERT OR IGNORE always inserts and
+# `driver` distinguishes the two write disciplines.
 # --------------------------------------------------------------------------------------------------
 
 
@@ -584,14 +636,29 @@ def write_interaction(
 
 
 def write_observation(con: sqlite3.Connection, obs: Observation) -> None:
-    """Write one observation, INSERT OR IGNORE on its deterministic (data_version-keyed)
-    ``observation_id``. An identical re-scan is a no-op; a genuine data change mints a new id and a new
-    row, RETAINING the prior-version row (which the version-scoped read hides and an escalation may still
-    reference). Does NOT commit — the scan's transaction owns it."""
+    """Write one observation as an OVERWRITE-on-conflict (UPSERT) on its deterministic
+    (data_version-keyed) ``observation_id``. This is the observation set's *replace* discipline
+    (architecture §48): a re-scan at the same ``data_version`` refreshes the derived projection
+    (severity/title/trigger_reason/response_id) **in place** rather than keeping the first write — so a
+    narration change (e.g. a ``templates`` / display-name edit) self-heals on the next scan instead of
+    stranding stale prose at a fixed ``data_version``.
+
+    Overwrite-in-place, **not** a blanket delete: ``escalations.observation_id`` is a RESTRICT FK to this
+    row, so ``DELETE FROM observations`` would fail on any escalated marker (proven on the K⁺-panic
+    member); updating the same id keeps that reference valid. Cross-version supersession is handled
+    elsewhere — a genuine data change mints a NEW id (new ``data_version``) and a new row, and the
+    version-scoped read (``get_observations``) returns only the current version, so prior rows persist
+    for audit/escalation-reference but are never shown. In-version refresh here + version-scoped read =
+    the §48 "replace the set" semantics. Distinct from ``write_interaction``, which stays keep-first
+    ``INSERT OR IGNORE`` (an append-only audit row, not a refreshable projection). Does NOT commit — the
+    scan's transaction owns it."""
     con.execute(
-        "INSERT OR IGNORE INTO observations "
+        "INSERT INTO observations "
         "(observation_id, member_id, response_id, severity, title, trigger_reason, data_version) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(observation_id) DO UPDATE SET "
+        "response_id=excluded.response_id, severity=excluded.severity, "
+        "title=excluded.title, trigger_reason=excluded.trigger_reason",
         (
             obs.observation_id,
             obs.member_id,

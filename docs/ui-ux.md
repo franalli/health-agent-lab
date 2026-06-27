@@ -26,8 +26,9 @@ A single page: two **member** regions, plus an **operator** control panel held v
 
 ```
 +----------------------------------------------------------------------+
-| (i) Sample data — does not constitute medical advice.                |
-| (!) Some results flagged for your care team.                  [view] |
+| (!) Some results flagged for your care team.                  [view] |  (only when active)
++----------------------------------------------------------------------+
+| Health Intelligence       (!) Member [C07 v]  Mode [ Guided | Ask ]   |
 +------------------+------------------------------+--------------------+
 | CONTROL PANEL    | CONVERSATION                 | OBSERVATIONS       |
 | (operator)       |                              |                    |
@@ -51,7 +52,13 @@ A single page: two **member** regions, plus an **operator** control panel held v
 +------------------+------------------------------+--------------------+
 ```
 
+The **sample-data notice** ("synthetic only — not medical advice") is a persistent warning glyph `(!)` in the header next to **Member**, rather than a standing banner — it stays out of the way but reveals the full text on hover/focus (and carries it as an `aria-label` for screen readers), so the header's one banner row is reserved for the escalation summary, which appears only when an escalation is active.
+
+The two seams between these regions are **drag-resizable gutters**: the operator can widen the control panel, the member can give Observations more room, and the centre conversation flexes to fill what's left. Each side is clamped (never past 40% of the viewport, so the conversation is never squeezed out) and the chosen split is held in memory only — no storage, reset on reload (double-click a gutter, press Home, or just reload to restore the default). The gutters are keyboard-operable separators (focus, then ←/→). Below ~820px the three regions stack into one scrolling column and the gutters drop away. *(Build note, Phase 6.)*
+
 The member never configures, tunes, or sees system internals — the conversation and observations are the entire member experience. The **control panel** (top-left, labeled operator-only) is the demo surface: a button for every scaffolded route, grouped **Data** (seed · **upload bundle** · clear member), **Proactive** (run scan · observations · suggestions · clinician queue), **Learning** (run learn · sample clinician override · reset learning), and **System** (health) — each route's JSON response shown in a readout below, the two destructive actions (clear, reset) behind a confirm. It is deliberately *not* in the chat and adds no new behaviour: it only fires routes the API already exposes, so the whole system is exercisable end-to-end from the page (run a scan and watch observations update; post an override then reset it; gate a `/learn` candidate) without curl.
+
+*(Build note, Phase 6: the panel is driven by a route registry — a button per **scaffolded** route — so the **Learning** group (`/learn` · `/feedback` · `/reset`) is a Phase-7 drop-in that appears unchanged once those routes land. The Phase-6 panel therefore ships **Data**/**Proactive**/**System** only, and **Clear member** is the single destructive action behind a confirm.)*
 
 **Upload bundle** is the holdout path — how an unseen dataset is brought in at runtime. The holdout is data we've never seen, so it can't be a pre-baked option: the button reads a `MemberBundle` JSON file, `POST`s it to `/members` (the same route "Seed member" uses), and the server validates it against the Pydantic models — a malformed file returns a clear error in the same readout, so the upload *is* the format check. On success the header **member-picker** gains the uploaded member and switches to it, and the surface repopulates for the new data. So on the deployment, unseen data can be loaded and demoed immediately — no redeploy, no curl — and the picker selects among the 15 seeded members and anything uploaded. The same `POST /members` is documented in the README as a `curl` for a scriptable equivalent; the sample bundle ships in the repo as the format template.
 
@@ -118,7 +125,7 @@ Severity drives visual weight, and that's the whole model — there is no dismis
 | `attention` | Amber card, prominent; tied to a "raise with your GP" next step. |
 | `urgent` | Calm banner at top, immediate next step + clinician handoff. |
 
-Each observation carries a **"why am I seeing this?"** expansion — its `trigger_reason` (which statistical signal fired) plus the evidence — so a proactive nudge is never a black box. The panel shows the member's current observations; a re-scan on new data replaces them, so the member isn't shown stale findings. This panel is the **detail layer** of the three-layer escalation rendering (§4); the floating banner is its ambient summary, and only a transition turn ever touches a chat bubble.
+Each observation carries a **"why am I seeing this?"** expansion — its `trigger_reason` (which statistical signal fired) plus the evidence — so a proactive nudge is never a black box. *(Build note, Phase 6: the expansion renders the `trigger_reason` prose, which already names the signal, the value, and the threshold it crossed; the full evidence chips for that marker are one click away via its Mode-1 chip in the conversation, since the `Observation` projection carries no `evidence[]` and §13 adds no observation→interaction read route.)* The panel shows the member's current observations; a re-scan on new data replaces them, so the member isn't shown stale findings. This panel is the **detail layer** of the three-layer escalation rendering (§4); the floating banner is its ambient summary, and only a transition turn ever touches a chat bubble.
 
 ---
 
@@ -150,4 +157,4 @@ The safety-correct move — escalate, or admit "I can't be sure" — frequently 
 
 ## 9. Out of scope
 
-A polished design system, theming, animations, responsive breakpoints, auth, and account management are out of scope — this surface exists to demonstrate *how output lands*, not to ship. The microcopy and the disposition/severity treatments carry the UX judgment; everything else is intentionally rough, and a CLI chat loop is an honest fallback if time is better spent on the eval harness.
+A polished design system, theming, animations, a multi-breakpoint responsive grid, auth, and account management are out of scope — beyond the drag-resizable side panels and the single narrow-screen stack (§2), this surface exists to demonstrate *how output lands*, not to ship. The microcopy and the disposition/severity treatments carry the UX judgment; everything else is intentionally rough, and a CLI chat loop is an honest fallback if time is better spent on the eval harness.
