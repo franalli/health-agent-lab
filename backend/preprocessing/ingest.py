@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-from typing import Optional
 
 from health_intelligence import db
 from health_intelligence.config import CONFIG_VERSION, MARKERS
@@ -43,16 +42,19 @@ VITALS: tuple[str, ...] = ("systolic_bp", "diastolic_bp", "bmi")
 # and ('female', ...). One-sided forms leave the absent bound None.
 # --------------------------------------------------------------------------------------------------
 
+
 def parse_reference_range(
     raw: str, marker: str
-) -> list[tuple[RangeSex, Optional[float], Optional[float]]]:
+) -> list[tuple[RangeSex, float | None, float | None]]:
     """Parse one printed range string into ``[(sex, ref_low, ref_high)]``.
 
     Precedence is deliberate — (1) Vitamin-D multi-band, (2) sex-split, (3) scalar — because the
     multi-band string contains ``<20`` / ``20-29`` substrings the scalar patterns would otherwise
     mis-match, and the sex-split wrapper must be peeled before its halves reach the scalar parser.
     """
-    del marker  # reserved (architecture's documented signature; dispatch is structural on `raw`)
+    del (
+        marker
+    )  # reserved (architecture's documented signature; dispatch is structural on `raw`)
     s = raw.strip()
     # (1) Vitamin-D multi-band: graded, semicolon-separated (e.g. ">=30 sufficient; 20-29 ...; <20 ...").
     if ";" in s:
@@ -69,7 +71,9 @@ def parse_reference_range(
     return [("any", low, high)]
 
 
-def _parse_graded_deficiency_floor(s: str) -> list[tuple[RangeSex, Optional[float], Optional[float]]]:
+def _parse_graded_deficiency_floor(
+    s: str,
+) -> list[tuple[RangeSex, float | None, float | None]]:
     """Reduce the Vitamin-D multi-band to one reference interval: the deficiency floor. ``ref_low`` is
     the threshold from the ``<NN deficient`` clause (below it is unambiguously abnormal -> below_range);
     the sufficient/insufficient/deficient nuance is owned by ``config.graded_bands`` (band-crossing),
@@ -80,19 +84,19 @@ def _parse_graded_deficiency_floor(s: str) -> list[tuple[RangeSex, Optional[floa
     raise ValueError(f"unrecognized graded range string: {s!r}")
 
 
-def _parse_scalar(s: str) -> tuple[Optional[float], Optional[float]]:
+def _parse_scalar(s: str) -> tuple[float | None, float | None]:
     """Parse a single scalar form into ``(ref_low, ref_high)``. ``<=``/``>=`` are matched before
     ``<``/``>`` so the longer operator wins; ``fullmatch`` rejects anything unexpected loudly."""
     s = s.strip()
-    if (m := re.fullmatch(r"<=\s*([0-9.]+)", s)):
+    if m := re.fullmatch(r"<=\s*([0-9.]+)", s):
         return (None, float(m.group(1)))
-    if (m := re.fullmatch(r"<\s*([0-9.]+)", s)):
+    if m := re.fullmatch(r"<\s*([0-9.]+)", s):
         return (None, float(m.group(1)))
-    if (m := re.fullmatch(r">=\s*([0-9.]+)", s)):
+    if m := re.fullmatch(r">=\s*([0-9.]+)", s):
         return (float(m.group(1)), None)
-    if (m := re.fullmatch(r">\s*([0-9.]+)", s)):
+    if m := re.fullmatch(r">\s*([0-9.]+)", s):
         return (float(m.group(1)), None)
-    if (m := re.fullmatch(r"([0-9.]+)\s*-\s*([0-9.]+)", s)):
+    if m := re.fullmatch(r"([0-9.]+)\s*-\s*([0-9.]+)", s):
         return (float(m.group(1)), float(m.group(2)))
     raise ValueError(f"unrecognized reference range: {s!r}")
 
@@ -100,6 +104,7 @@ def _parse_scalar(s: str) -> tuple[Optional[float], Optional[float]]:
 # --------------------------------------------------------------------------------------------------
 # Per-bundle ingest — normalize, then hand domain objects to db.replace_member (the SQL seam).
 # --------------------------------------------------------------------------------------------------
+
 
 def ingest_bundle(con, bundle: MemberBundle) -> dict:
     """Normalize one member and persist it (replacing any prior version). Returns summary counts."""
@@ -109,23 +114,39 @@ def ingest_bundle(con, bundle: MemberBundle) -> dict:
 
     for panel in bundle.panels:
         for res in panel.results:
-            results.append(LabResult(
-                marker=res.analyte,                 # analyte -> marker is identity (canonical already)
-                value=res.value, unit=res.unit,
-                panel_id=panel.panel_id, panel_date=panel.collected_date,
-            ))
+            results.append(
+                LabResult(
+                    marker=res.analyte,  # analyte -> marker is identity (canonical already)
+                    value=res.value,
+                    unit=res.unit,
+                    panel_id=panel.panel_id,
+                    panel_date=panel.collected_date,
+                )
+            )
             lab_range_src.setdefault(res.analyte, (res.reference_range, res.unit))
         for vk in VITALS:
-            results.append(LabResult(
-                marker=vk, value=getattr(panel.vitals, vk),
-                unit=_require_unit(vk),             # vitals' unit comes from config (data prints none)
-                panel_id=panel.panel_id, panel_date=panel.collected_date,
-            ))
+            results.append(
+                LabResult(
+                    marker=vk,
+                    value=getattr(panel.vitals, vk),
+                    unit=_require_unit(
+                        vk
+                    ),  # vitals' unit comes from config (data prints none)
+                    panel_id=panel.panel_id,
+                    panel_date=panel.collected_date,
+                )
+            )
 
     _assert_unique_markers_per_panel(results)
     ranges = _build_ranges(lab_range_src)
-    db.replace_member(con, profile=bundle.profile, results=results, ranges=ranges, notes=bundle.notes)
-    return {"member_id": bundle.member_id, "results": len(results), "ranges": len(ranges)}
+    db.replace_member(
+        con, profile=bundle.profile, results=results, ranges=ranges, notes=bundle.notes
+    )
+    return {
+        "member_id": bundle.member_id,
+        "results": len(results),
+        "ranges": len(ranges),
+    }
 
 
 def _assert_unique_markers_per_panel(results: list[LabResult]) -> None:
@@ -156,12 +177,18 @@ def _build_ranges(lab_range_src: dict[str, tuple[str, str]]) -> list[ReferenceRa
         panic_high = mcfg.panic_high if mcfg else None
         parsed = parse_reference_range(raw, marker)
         for sex, ref_low, ref_high in parsed:
-            ranges.append(ReferenceRange(
-                marker=marker, sex=sex, unit=unit,
-                ref_low=ref_low, ref_high=ref_high,
-                panic_low=panic_low, panic_high=panic_high,
-                config_version=CONFIG_VERSION,
-            ))
+            ranges.append(
+                ReferenceRange(
+                    marker=marker,
+                    sex=sex,
+                    unit=unit,
+                    ref_low=ref_low,
+                    ref_high=ref_high,
+                    panic_low=panic_low,
+                    panic_high=panic_high,
+                    config_version=CONFIG_VERSION,
+                )
+            )
         # A sex-split marker has only male/female rows. An 'other'/'unknown'-sex member would fall
         # through _range_for (sex row -> 'any') to a non-existent 'any' row and get a `no_reference`
         # flag *before* the panic check — so a sex-independent panic (e.g. Hemoglobin 7.0) would
@@ -169,22 +196,36 @@ def _build_ranges(lab_range_src: dict[str, tuple[str, str]]) -> list[ReferenceRa
         # row (ref bounds None — we can't pick a sex's normal range) so the safety floor still fires.
         # "Rather over-escalate than miss" (architecture §6). Only markers WITH a panic get the row,
         # so non-panic sex-split markers keep their honest `no_reference` for an unknown-sex member.
-        if all(sex != "any" for sex, _, _ in parsed) and (panic_low is not None or panic_high is not None):
-            ranges.append(ReferenceRange(
-                marker=marker, sex="any", unit=unit,
-                ref_low=None, ref_high=None,
-                panic_low=panic_low, panic_high=panic_high,
-                config_version=CONFIG_VERSION,
-            ))
+        if all(sex != "any" for sex, _, _ in parsed) and (
+            panic_low is not None or panic_high is not None
+        ):
+            ranges.append(
+                ReferenceRange(
+                    marker=marker,
+                    sex="any",
+                    unit=unit,
+                    ref_low=None,
+                    ref_high=None,
+                    panic_low=panic_low,
+                    panic_high=panic_high,
+                    config_version=CONFIG_VERSION,
+                )
+            )
 
     for vk in VITALS:
         mcfg = MARKERS[vk]
-        ranges.append(ReferenceRange(
-            marker=vk, sex="any", unit=_require_unit(vk),
-            ref_low=mcfg.ref_low, ref_high=mcfg.ref_high,
-            panic_low=mcfg.panic_low, panic_high=mcfg.panic_high,
-            config_version=CONFIG_VERSION,
-        ))
+        ranges.append(
+            ReferenceRange(
+                marker=vk,
+                sex="any",
+                unit=_require_unit(vk),
+                ref_low=mcfg.ref_low,
+                ref_high=mcfg.ref_high,
+                panic_low=mcfg.panic_low,
+                panic_high=mcfg.panic_high,
+                config_version=CONFIG_VERSION,
+            )
+        )
 
     return ranges
 
@@ -202,7 +243,8 @@ def _require_unit(marker: str) -> str:
 # Whole-dataset ingest + CLI
 # --------------------------------------------------------------------------------------------------
 
-def ingest_dataset(con, dataset: Optional[str] = None) -> dict:
+
+def ingest_dataset(con, dataset: str | None = None) -> dict:
     """Load ``members.json`` for the active dataset, validate every bundle (the firewall check —
     ``extra='forbid'`` makes a malformed bundle fail loudly), and write each. Returns summary counts."""
     raw = json.loads(members_path(dataset).read_text())
@@ -213,7 +255,9 @@ def ingest_dataset(con, dataset: Optional[str] = None) -> dict:
         summary = ingest_bundle(con, bundle)
         members += 1
         total_results += summary["results"]
-    n_ranges = len(db.get_ranges(con))  # via db.py (the one SQLite seam), scoped to the active config
+    n_ranges = len(
+        db.get_ranges(con)
+    )  # via db.py (the one SQLite seam), scoped to the active config
     return {"members": members, "results": total_results, "ranges": n_ranges}
 
 
@@ -228,28 +272,45 @@ def _verify(con) -> None:
         return
     mid = member_ids[0]
     member, results, ranges, age, data_version = db.load_for_analysis(con, mid)
-    analysis = analyze(member, results, ranges, age, ANALYSIS_CONFIG, data_version=data_version)
-    print(f"  {mid}: data_version={data_version}  overall_floor={analysis.overall_floor}")
+    analysis = analyze(
+        member, results, ranges, age, ANALYSIS_CONFIG, data_version=data_version
+    )
+    print(
+        f"  {mid}: data_version={data_version}  overall_floor={analysis.overall_floor}"
+    )
     for mk in analysis.markers:
         flags = ",".join(mk.flags) or "-"
         print(f"    {mk.marker:20s} severity={mk.severity:9s} flags={flags}")
 
 
-def main(argv: Optional[list[str]] = None) -> None:
-    ap = argparse.ArgumentParser(description="Ingest a member bundle into SQLite (the firewall).")
-    ap.add_argument("bundle", nargs="?", default=None,
-                    help="dataset sub-folder under backend/data (default: DATASET env or training_data)")
-    ap.add_argument("--db", default=None, help="SQLite path (default: backend/data/health.db)")
-    ap.add_argument("--verify", action="store_true",
-                    help="after ingest, query one member and run analysis over the DB")
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(
+        description="Ingest a member bundle into SQLite (the firewall)."
+    )
+    ap.add_argument(
+        "bundle",
+        nargs="?",
+        default=None,
+        help="dataset sub-folder under backend/data (default: DATASET env or training_data)",
+    )
+    ap.add_argument(
+        "--db", default=None, help="SQLite path (default: backend/data/health.db)"
+    )
+    ap.add_argument(
+        "--verify",
+        action="store_true",
+        help="after ingest, query one member and run analysis over the DB",
+    )
     args = ap.parse_args(argv)
 
     con = db.connect(args.db)
     try:
         db.init_db(con)
         summary = ingest_dataset(con, args.bundle)
-        print(f"ingested {summary['members']} members, {summary['results']} results, "
-              f"{summary['ranges']} reference ranges")
+        print(
+            f"ingested {summary['members']} members, {summary['results']} results, "
+            f"{summary['ranges']} reference ranges"
+        )
         if args.verify:
             _verify(con)
     finally:

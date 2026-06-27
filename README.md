@@ -17,12 +17,15 @@ Requires [uv](https://docs.astral.sh/uv/), which manages the Python toolchain an
 ```bash
 git clone <repo> && cd health-intelligence
 echo "ANTHROPIC_API_KEY=sk-..." > backend/.env   # only needed for Mode 2 (LLM answers)
+cd backend && make hooks                          # install pre-commit hooks (ruff + gitleaks); once after clone
 make run                                          # uv-installs, builds + seeds the DB, serves on :8000
 ```
 
 Open `http://localhost:8000` — one process serves both the API and the UI; no Node, no second server, no CORS.
 
 > The Makefile is wired (`backend/Makefile`); run the `make` targets from `backend/` (`make help` lists them). The consumer UI lands in Phase 6, so `make run` currently serves the API only; `make eval` is a placeholder until the harness lands in Phase 5.
+>
+> **Code quality gates.** Commits are checked by [pre-commit](https://pre-commit.com/) (`.pre-commit-config.yaml` at the repo root): `ruff` lints and formats Python, and `gitleaks` scans for secrets. `make hooks` installs the git hook; `make lint` runs every check over the whole tree on demand.
 
 ## What it does
 

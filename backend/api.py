@@ -15,15 +15,27 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Iterator, Optional
 
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 
 from health_intelligence import db, pipeline
-from health_intelligence.models import Escalation, Observation, SuggestedPrompt
+from health_intelligence.models import (
+    AskRequest,
+    Escalation,
+    HealthIntelligenceResponse,
+    Observation,
+    SuggestedPrompt,
+)
+
+# Load backend/.env into the process env at import (before any LLM provider is constructed) so the
+# Mode-2 path sees ANTHROPIC_API_KEY however the app is launched. A no-op when no .env is present (the
+# Render deploy sets real env vars), and secrets stay in .env, never in config.py.
+load_dotenv()
 
 _DB_PATH = os.environ.get("HEALTH_DB_PATH")  # None -> db.DEFAULT_DB_PATH
 _FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
@@ -69,25 +81,35 @@ def health() -> dict[str, str]:
 
 
 @app.post("/members/{member_id}/scan", response_model=list[Observation])
-def post_scan(member_id: str, con: sqlite3.Connection = Depends(get_con)) -> list[Observation]:
+def post_scan(
+    member_id: str, con: sqlite3.Connection = Depends(get_con)
+) -> list[Observation]:
     """Run the proactive scan now; returns the member's current observations (ranked by severity)."""
     try:
         return pipeline.scan(con, member_id)
     except KeyError:
-        raise HTTPException(status_code=404, detail=f"member {member_id!r} not found")
+        raise HTTPException(
+            status_code=404, detail=f"member {member_id!r} not found"
+        ) from None
 
 
 @app.get("/members/{member_id}/observations", response_model=list[Observation])
-def get_observations(member_id: str, con: sqlite3.Connection = Depends(get_con)) -> list[Observation]:
+def get_observations(
+    member_id: str, con: sqlite3.Connection = Depends(get_con)
+) -> list[Observation]:
     """Read the member's current observations (the last scan's findings at the current data_version)."""
     try:
         return db.get_observations(con, member_id)
     except KeyError:
-        raise HTTPException(status_code=404, detail=f"member {member_id!r} not found")
+        raise HTTPException(
+            status_code=404, detail=f"member {member_id!r} not found"
+        ) from None
 
 
 @app.get("/members/{member_id}/escalations", response_model=list[Escalation])
-def get_escalations(member_id: str, con: sqlite3.Connection = Depends(get_con)) -> list[Escalation]:
+def get_escalations(
+    member_id: str, con: sqlite3.Connection = Depends(get_con)
+) -> list[Escalation]:
     """Read the member's clinician-review queue (the standing hand-off artifacts)."""
     # Existence check so an unknown member 404s like /scan and /observations — db.get_escalations would
     # otherwise return [] for a typo'd id, and an empty review queue reads as 'all clear' on a safety
@@ -100,7 +122,7 @@ def get_escalations(member_id: str, con: sqlite3.Connection = Depends(get_con)) 
 @app.get("/members/{member_id}/suggestions", response_model=list[SuggestedPrompt])
 def get_suggestions(
     member_id: str,
-    focus: Optional[str] = None,
+    focus: str | None = None,
     asked: list[str] = Query(default=[]),
     con: sqlite3.Connection = Depends(get_con),
 ) -> list[SuggestedPrompt]:
@@ -110,11 +132,32 @@ def get_suggestions(
     try:
         return pipeline.suggestions(con, member_id, focus=focus, asked=tuple(asked))
     except KeyError:
-        raise HTTPException(status_code=404, detail=f"member {member_id!r} not found")
+        raise HTTPException(
+            status_code=404, detail=f"member {member_id!r} not found"
+        ) from None
+
+
+@app.post("/members/{member_id}/ask", response_model=HealthIntelligenceResponse)
+def post_ask(
+    member_id: str,
+    req: AskRequest,
+    con: sqlite3.Connection = Depends(get_con),
+) -> HealthIntelligenceResponse:
+    """Mode 2: one grounded answer over the member's own data — the per-turn pipeline (gate -> floor ->
+    compose/template -> validate -> escalate). Uses the default LLM provider; degrades to the
+    deterministic spine if it is unavailable, so this never 500s on a missing key. 404 if absent."""
+    try:
+        return pipeline.ask(con, member_id, req.message)
+    except KeyError:
+        raise HTTPException(
+            status_code=404, detail=f"member {member_id!r} not found"
+        ) from None
 
 
 # Serve the static member surface on the same origin (Phase 6 ships frontend/index.html). Mounted LAST
 # so the API routes above take precedence, and only when the directory exists — it doesn't until Phase 6,
 # and an unconditional mount would crash startup (RuntimeError: directory does not exist).
 if _FRONTEND_DIR.is_dir():
-    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIR), html=True), name="frontend")
+    app.mount(
+        "/", StaticFiles(directory=str(_FRONTEND_DIR), html=True), name="frontend"
+    )

@@ -39,7 +39,7 @@ in Phase 2). Bump only when a value that has already keyed a stored escalation c
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal
 
 # --------------------------------------------------------------------------------------------------
 # Versioning
@@ -67,6 +67,85 @@ GATE_MODEL = "claude-haiku-4-5"
 #: the reproducibility tuple must be whole. Mode 1's tuple is (data, config, template); this sentinel
 #: makes "no LLM was involved" explicit in the trace rather than leaving an empty string (architecture §7).
 MODEL_VERSION_DETERMINISTIC = "deterministic"
+
+# --------------------------------------------------------------------------------------------------
+# LLM runtime knobs (Phase 4 — consumed only by gate.py / llm.py). Pure constants under config_version,
+# not .env: temperature is a reproducibility setting (architecture §7), the token caps are the cost
+# lever (§5: output is ~5x input, so capping compose length is the main control), and PRICING is the
+# published per-MTok rate used to stamp ``cost_usd`` on every interaction.
+# --------------------------------------------------------------------------------------------------
+
+#: Pinned at 0 for both the gate and the composer — the determinism the architecture claims is
+#: *of substance* (temp 0 + the pure core), with only prose phrasing free to vary (§7).
+LLM_TEMPERATURE = 0
+
+#: The gate emits one enum value, so a tiny budget suffices; the composer emits a short answer +
+#: uncertainty + the cited-marker keys (the deterministic core already did the analysis, §5). The
+#: compose budget carries headroom over the ~300–800-token target so a thorough multi-marker answer
+#: plus the forced-tool JSON overhead doesn't truncate mid-structure (a truncated tool call would be an
+#: ``LLMParseError`` — handled by the retry/fallback, but cheaper to make rare).
+GATE_MAX_TOKENS = 256
+COMPOSE_MAX_TOKENS = 1536
+
+#: Per-model ($/MTok input, $/MTok output) — published rates, used by ``llm.cost_usd`` to stamp
+#: each interaction's cost. Keyed by the pinned model ids above.
+PRICING: dict[str, tuple[float, float]] = {
+    COMPOSE_MODEL: (3.0, 15.0),  # Claude Sonnet 4.6
+    GATE_MODEL: (1.0, 5.0),  # Claude Haiku 4.5
+}
+
+#: The deterministic, regression-pinned **emergency-phrase floor** (architecture §98/§564): a fixed
+#: denylist read straight from the raw message, in PARALLEL with the LLM gate, so a self-harm or
+#: acute-emergency phrase forces the floor to ``urgent`` even if the gate is jailbroken into ``none``
+#: or the provider is down — the one routing where a miss is unacceptable is a *guarantee*, not a
+#: *measurement*. Matched lower-cased, with smart apostrophes folded to ASCII and on WORD boundaries
+#: (so "want to die" does not fire on "want to diet", and a curly-quote "don't" still matches) — see
+#: ``gate.emergency_phrase_floor``. Deliberately conservative (over-escalation is the safe direction,
+#: §562). NOT exhaustive — the broader injection/jailbreak denylist stays deferred (§11); this is only
+#: the non-overridable self-harm/acute floor. Because matching is word-bounded, list the inflected forms
+#: that matter (e.g. "self-harming") rather than relying on substring containment. Changing this set is a
+#: safety change — pin it with a regression test (test_gate.py), never trim it casually.
+EMERGENCY_PHRASES: tuple[str, ...] = (
+    # self-harm / crisis
+    "kill myself",
+    "killing myself",
+    "end my life",
+    "ending my life",
+    "ending it all",
+    "take my own life",
+    "want to die",
+    "wanna die",
+    "don't want to live",
+    "do not want to live",
+    "don't want to be alive",
+    "suicidal",
+    "suicide",
+    "hurt myself",
+    "hurting myself",
+    "harm myself",
+    "harming myself",
+    "self-harm",
+    "self-harming",
+    # acute medical emergency
+    "chest pain",
+    "crushing chest",
+    "can't breathe",
+    "cannot breathe",
+    "can't breath",
+    "trouble breathing",
+    "struggling to breathe",
+    "having a stroke",
+    "face is drooping",
+    "slurred speech",
+    "overdose",
+    "overdosed",
+    "severe bleeding",
+    "bleeding heavily",
+    "coughing up blood",
+    "vomiting blood",
+    "anaphylaxis",
+    "anaphylactic",
+)
 
 # --------------------------------------------------------------------------------------------------
 # Types
@@ -109,8 +188,8 @@ class GradedBand:
     half-open ``[low, high)``; ``None`` is an open end."""
 
     label: str
-    low: Optional[float]   # inclusive lower bound; None => open below
-    high: Optional[float]  # exclusive upper bound; None => open above
+    low: float | None  # inclusive lower bound; None => open below
+    high: float | None  # exclusive upper bound; None => open above
 
 
 @dataclass(frozen=True)
@@ -119,7 +198,7 @@ class MarkerConfig:
     (``None`` / empty), which the analysis is designed to degrade on rather than fail. Only ``unit``
     and the explicitly-anchored fields are populated in Phase 0."""
 
-    unit: Optional[str] = None
+    unit: str | None = None
     """Config-supplied unit — VITALS ONLY (the data prints no vital units, so config is the source).
     Labs get their unit from the data (ResultInput.unit), so leaving it ``None`` here avoids a second
     source of truth that could drift — the same 'vitals only' treatment as ref_low/ref_high below."""
@@ -127,27 +206,33 @@ class MarkerConfig:
     # ---- Normal reference bounds: VITALS ONLY ----
     # Labs get ref_low/ref_high parsed from the ranges the data prints per result; vitals do not, so
     # their normal bounds come from here. Deferred (AHA / WHO) -> curated Phase 1.
-    ref_low: Optional[float] = None
-    ref_high: Optional[float] = None
+    ref_low: float | None = None
+    ref_high: float | None = None
 
     # ---- Direction-aware severity ----
-    adverse_direction: Optional[Direction] = None  # deferred Phase 1 (consumed by _severity)
+    adverse_direction: Direction | None = (
+        None  # deferred Phase 1 (consumed by _severity)
+    )
 
     # ---- Reference Change Value (clinical trend-vs-noise) ----
     # RCV = sqrt(2)*Z*sqrt(CVa^2 + CVi^2). Either being None => analysis skips RCV and judges the
     # trend on Mann-Kendall + Theil-Sen CI alone (noted, not silent). Deferred (EFLM) -> Phase 1.
-    cva: Optional[float] = None  # analytical CV, %
-    cvi: Optional[float] = None  # within-subject biological CV, %
+    cva: float | None = None  # analytical CV, %
+    cvi: float | None = None  # within-subject biological CV, %
 
     # ---- Safety-critical panic thresholds (curated here, never parsed from data) ----
     # None => the corresponding panic flag is simply not evaluated. Only the Potassium high is
     # anchored in Phase 0 (eval E07); all other panic bounds are deferred -> Phase 1.
-    panic_low: Optional[float] = None
-    panic_high: Optional[float] = None
+    panic_low: float | None = None
+    panic_high: float | None = None
 
     # ---- Discrete clinical cut-points (band-crossing is a highly explainable event) ----
-    band_cutpoints: tuple[float, ...] = ()       # e.g. HbA1c (5.7, 6.5); () => no band-cross signal
-    graded_bands: tuple[GradedBand, ...] = ()    # labelled multi-band (Vitamin D); () => none
+    band_cutpoints: tuple[
+        float, ...
+    ] = ()  # e.g. HbA1c (5.7, 6.5); () => no band-cross signal
+    graded_bands: tuple[
+        GradedBand, ...
+    ] = ()  # labelled multi-band (Vitamin D); () => none
 
 
 @dataclass(frozen=True)
@@ -173,108 +258,136 @@ MARKERS: dict[str, MarkerConfig] = {
     # APS), and a small panic set; constants no case exercises stay typed absence (the skip-path).
     # --- Glycaemic ---
     "HbA1c": MarkerConfig(
-        adverse_direction="up",                  # higher = worse glycaemic control (ADA)
-        cva=0.6, cvi=1.2,                        # EFLM — very tight within-subject variation
-        band_cutpoints=(5.7, 6.5),               # 5.7 prediabetes / 6.5 diabetes — eval E01 + architecture
+        adverse_direction="up",  # higher = worse glycaemic control (ADA)
+        cva=0.6,
+        cvi=1.2,  # EFLM — very tight within-subject variation
+        band_cutpoints=(
+            5.7,
+            6.5,
+        ),  # 5.7 prediabetes / 6.5 diabetes — eval E01 + architecture
     ),
     "Fasting glucose": MarkerConfig(
-        adverse_direction="up",                  # higher = hyperglycaemia
-        cva=2.5, cvi=4.9,                        # EFLM
-        panic_low=50.0, panic_high=500.0,        # critical hypo-/hyperglycaemia (critical-value tables, mg/dL)
+        adverse_direction="up",  # higher = hyperglycaemia
+        cva=2.5,
+        cvi=4.9,  # EFLM
+        panic_low=50.0,
+        panic_high=500.0,  # critical hypo-/hyperglycaemia (critical-value tables, mg/dL)
     ),
     # --- Lipids ---
     "LDL cholesterol": MarkerConfig(
-        adverse_direction="up",                  # higher = atherogenic risk
-        cva=4.2, cvi=8.3,                        # EFLM
+        adverse_direction="up",  # higher = atherogenic risk
+        cva=4.2,
+        cvi=8.3,  # EFLM
     ),
     "HDL cholesterol": MarkerConfig(
-        adverse_direction="down",                # protective — LOWER is the adverse move
-        cva=3.7, cvi=7.3,                        # EFLM
+        adverse_direction="down",  # protective — LOWER is the adverse move
+        cva=3.7,
+        cvi=7.3,  # EFLM
     ),
     "Triglycerides": MarkerConfig(
         adverse_direction="up",
-        cva=10.0, cvi=20.0,                      # EFLM — high within-subject variation
+        cva=10.0,
+        cvi=20.0,  # EFLM — high within-subject variation
     ),
     "Total cholesterol": MarkerConfig(
         adverse_direction="up",
-        cva=2.9, cvi=5.8,                        # EFLM
+        cva=2.9,
+        cvi=5.8,  # EFLM
     ),
     # --- Renal ---
     "eGFR": MarkerConfig(
-        adverse_direction="down",                # lower = worse renal function (KDIGO)
-        cva=2.65, cvi=5.3,                       # EFLM — derived from creatinine; CVi taken from creatinine
+        adverse_direction="down",  # lower = worse renal function (KDIGO)
+        cva=2.65,
+        cvi=5.3,  # EFLM — derived from creatinine; CVi taken from creatinine
     ),
     "Creatinine": MarkerConfig(
-        adverse_direction="up",                  # higher = worse renal function
-        cva=2.65, cvi=5.3,                       # EFLM
+        adverse_direction="up",  # higher = worse renal function
+        cva=2.65,
+        cvi=5.3,  # EFLM
     ),
     # --- Hepatic ---
     "ALT": MarkerConfig(
-        adverse_direction="up",                  # higher = hepatocellular injury
-        cva=6.0, cvi=12.0,                       # EFLM
+        adverse_direction="up",  # higher = hepatocellular injury
+        cva=6.0,
+        cvi=12.0,  # EFLM
     ),
     "AST": MarkerConfig(
         adverse_direction="up",
-        cva=6.0, cvi=12.0,                       # EFLM
+        cva=6.0,
+        cvi=12.0,  # EFLM
     ),
     # --- Inflammation ---
     "CRP": MarkerConfig(
-        adverse_direction="up",                  # higher = more inflammation
-        cva=21.0, cvi=42.0,                      # EFLM — very high within-subject variation
+        adverse_direction="up",  # higher = more inflammation
+        cva=21.0,
+        cvi=42.0,  # EFLM — very high within-subject variation
     ),
     # --- Haematology / iron ---
     "Hemoglobin": MarkerConfig(
-        adverse_direction="down",                # dataset/eval concern is anaemia (C04); clinically bidirectional
-        cva=1.4, cvi=2.8,                        # EFLM
-        panic_low=7.0,                           # critical anaemia / transfusion threshold (g/dL)
+        adverse_direction="down",  # dataset/eval concern is anaemia (C04); clinically bidirectional
+        cva=1.4,
+        cvi=2.8,  # EFLM
+        panic_low=7.0,  # critical anaemia / transfusion threshold (g/dL)
     ),
     "Ferritin": MarkerConfig(
-        adverse_direction="down",                # low = iron deficiency (C04); clinically bidirectional
-        cva=7.1, cvi=14.2,                       # EFLM
+        adverse_direction="down",  # low = iron deficiency (C04); clinically bidirectional
+        cva=7.1,
+        cvi=14.2,  # EFLM
     ),
     # --- Vitamin D: graded status bands printed in the supplied data (ng/mL) ---
     "Vitamin D (25-OH)": MarkerConfig(
-        adverse_direction="down",                # low = deficiency
-        cva=6.15, cvi=12.3,                      # EFLM
+        adverse_direction="down",  # low = deficiency
+        cva=6.15,
+        cvi=12.3,  # EFLM
         graded_bands=(
-            GradedBand("deficient", None, 20.0),     # <20
+            GradedBand("deficient", None, 20.0),  # <20
             GradedBand("insufficient", 20.0, 30.0),  # 20-29
-            GradedBand("sufficient", 30.0, None),    # >=30
+            GradedBand("sufficient", 30.0, None),  # >=30
         ),
     ),
     # --- Thyroid ---
     "TSH": MarkerConfig(
-        adverse_direction="up",                  # eval concern is rising TSH -> hypothyroidism (C05); bidirectional
-        cva=9.85, cvi=19.7,                      # EFLM — high within-subject variation
+        adverse_direction="up",  # eval concern is rising TSH -> hypothyroidism (C05); bidirectional
+        cva=9.85,
+        cvi=19.7,  # EFLM — high within-subject variation
     ),
     # --- Electrolyte: panic-gated, genuinely bidirectional -> the RCV + direction skip-path ---
     "Potassium": MarkerConfig(
         # adverse_direction stays None: both hyper- and hypokalaemia are dangerous, so there is no single
         # adverse TREND direction — K+ safety is the panic floor, not a trend verdict. CVa/CVi are left
         # absent too, so RCV is skipped for K+ (the documented typed-absence path, exercised by a test).
-        panic_low=2.8,                           # severe hypokalaemia (critical-value tables, mmol/L)
-        panic_high=6.0,                          # hyperkalaemia — eval E07: C07's 6.1 -> urgent (anchored P0)
+        panic_low=2.8,  # severe hypokalaemia (critical-value tables, mmol/L)
+        panic_high=6.0,  # hyperkalaemia — eval E07: C07's 6.1 -> urgent (anchored P0)
     ),
     # --- Vitals: the data prints no vital units, so config IS the source. Normal bounds AHA/WHO.
     #     systolic carries CVa/CVi (RCV-gated, demo-prominent); diastolic + BMI stay RCV-free, so their
     #     trends surface at notable but never escalate (BMI is real trajectory, not setpoint noise). ---
     "systolic_bp": MarkerConfig(
-        unit="mmHg", adverse_direction="up",
-        ref_low=90.0, ref_high=120.0,            # AHA 2017: normal <120; <90 hypotension
+        unit="mmHg",
+        adverse_direction="up",
+        ref_low=90.0,
+        ref_high=120.0,  # AHA 2017: normal <120; <90 hypotension
         # CVa/CVi from within-subject BP-variability literature (NOT EFLM — BP is not a lab analyte);
         # systolic is in every panel (demo-prominent), so it is RCV-gated and can trend-escalate first-class.
-        cva=2.85, cvi=5.7,
+        cva=2.85,
+        cvi=5.7,
     ),
     "diastolic_bp": MarkerConfig(
-        unit="mmHg", adverse_direction="up",
-        ref_low=60.0, ref_high=80.0,             # AHA 2017: normal <80
+        unit="mmHg",
+        adverse_direction="up",
+        ref_low=60.0,
+        ref_high=80.0,  # AHA 2017: normal <80
     ),
     "bmi": MarkerConfig(
-        unit="kg/m2", adverse_direction="up",
-        ref_low=18.5, ref_high=25.0,             # WHO: normal 18.5-24.9
+        unit="kg/m2",
+        adverse_direction="up",
+        ref_low=18.5,
+        ref_high=25.0,  # WHO: normal 18.5-24.9
     ),
 }
 
 
 #: The assembled, ready-to-use config the core consumes. ``analyze(..., cfg=ANALYSIS_CONFIG)``.
-ANALYSIS_CONFIG = AnalysisConfig(version=CONFIG_VERSION, stats=StatConfig(), markers=MARKERS)
+ANALYSIS_CONFIG = AnalysisConfig(
+    version=CONFIG_VERSION, stats=StatConfig(), markers=MARKERS
+)

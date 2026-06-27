@@ -25,7 +25,7 @@ If a change would let the model decide something safety-relevant, it is wrong. S
 
 ## Structure
 
-`ls` shows the tree; the file-by-file map is `architecture.md` §14 (the one canonical copy — don't duplicate it here). What `ls` won't tell you is intent, and that's in the invariants above: `health_intelligence/` is the serving library (pure, imports no web framework), `preprocessing/ingest.py` is the one firewall, `eval/` is the harness, and `api.py` is thin routes serving the single static `frontend/index.html`.
+`ls` shows the tree; the file-by-file map is `architecture.md` §14 (the one canonical copy — don't duplicate it here). What `ls` won't tell you is intent, and that's in the invariants above: `health_intelligence/` is the serving library (pure, imports no web framework), `preprocessing/ingest.py` is the one firewall, `eval/` is the harness, and `api.py` is thin routes serving the single static `frontend/index.html`. *(Some of these are forward references: `eval/` lands Phase 5, `frontend/` Phase 6 — the build is at Phase 4, so `llm.py` and `gate.py` are live (Mode 2 / `POST /ask`). The invariants describe the target design throughout.)*
 
 ## Commands
 
@@ -33,14 +33,18 @@ Dependencies and the virtualenv are managed with **uv**. All commands run from `
 
 ```
 uv sync          # install
+make hooks       # install the git pre-commit hook (run once after clone)
 make init-db     # create the SQLite schema
 make seed        # ingest the supplied bundle
 make run         # init + seed + serve API and UI on :8000
 make eval        # run the evaluation harness → report
+make lint        # ruff lint+format + gitleaks secret scan over the whole tree
 make test        # unit tests
 ```
 
 > The Makefile is wired as of Phase 3a (`backend/Makefile`); `make help` lists the targets. `make eval` is a placeholder until the harness lands in Phase 5. The UI (`frontend/index.html`) lands in Phase 6 — until then `make run` serves the API only (the static mount is skipped when the directory is absent).
+>
+> **Pre-commit hooks.** `.pre-commit-config.yaml` sits at the **repo root** (not `backend/`) because it gates the whole tree; the runner and `ruff` are dev deps in `backend/pyproject.toml`, and ruff's config is `[tool.ruff]` there. The gate is two checks — ruff (lint + format) and gitleaks (secrets) — plus basic hygiene hooks. `make hooks` installs it; `make lint` runs it on demand. Bump pinned hook revs with `pre-commit autoupdate`. `E501` (line width) is intentionally not enforced — this repo's long documented comments are by design; the formatter still wraps code.
 
 ## How to work here
 

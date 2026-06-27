@@ -1,7 +1,7 @@
 # Health Intelligence Service — the intended interface (CLAUDE.md "Commands"). Run from backend/.
 # uv owns the venv + dependency resolution; every target runs inside it.
 
-.PHONY: init-db seed run test eval help
+.PHONY: init-db seed run test eval lint hooks help
 .DEFAULT_GOAL := help
 
 help:  ## list targets
@@ -18,6 +18,12 @@ run: seed  ## init + seed + serve the API on :8000 (UI mounts here once frontend
 
 test:  ## unit tests
 	uv run pytest
+
+hooks:  ## install the git pre-commit hook (run once after clone; config is at the repo root)
+	cd .. && uv run --project backend pre-commit install
+
+lint:  ## run all pre-commit checks (ruff lint+format, gitleaks) over the whole tree
+	cd .. && uv run --project backend pre-commit run --all-files
 
 eval:  ## run the evaluation harness (lands in Phase 5)
 	@echo "eval harness is not built yet — it lands in Phase 5 (architecture.md build sequence)."

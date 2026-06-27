@@ -17,7 +17,7 @@ number is ever computed here; every value is read off the verdict or the referen
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from collections.abc import Callable
 
 from health_intelligence.models import (
     Evidence,
@@ -123,9 +123,15 @@ def observation_summary(traj: MarkerTrajectory) -> tuple[str, str]:
     m, signal = _display_name(traj.marker), _classify(traj)
     val = f"{traj.latest.value} {traj.unit}"
     if signal == "panic_high":
-        return f"{m} critically high", f"{m} latest {val} above the critical-high threshold"
+        return (
+            f"{m} critically high",
+            f"{m} latest {val} above the critical-high threshold",
+        )
     if signal == "panic_low":
-        return f"{m} critically low", f"{m} latest {val} below the critical-low threshold"
+        return (
+            f"{m} critically low",
+            f"{m} latest {val} below the critical-low threshold",
+        )
     if signal == "trend":
         t = traj.trend
         word = _DIRECTION_WORD.get(t.direction, "changing") if t else "changing"
@@ -138,11 +144,26 @@ def observation_summary(traj: MarkerTrajectory) -> tuple[str, str]:
     if signal == "below_range":
         return f"{m} below range", f"{m} latest {val} below the reference range"
     if signal == "band_cross":
-        return f"{m} crossed a clinical threshold", f"{m} moved across a clinical band cut-point"
+        return (
+            f"{m} crossed a clinical threshold",
+            f"{m} moved across a clinical band cut-point",
+        )
     return f"{m} flagged", f"{m} flagged ({', '.join(traj.flags) or 'no signal'})"
 
 
-def _stat_string(traj: MarkerTrajectory, rng: Optional[ReferenceRange]) -> str:
+def qa_title(traj: MarkerTrajectory) -> str:
+    """A neutral, factual ``Finding.text`` for a marker a Mode-2 question cited but the core did NOT
+    raise (severity 'info'). ``observation_summary`` assumes a raised signal and would mislabel a benign
+    value ("X flagged"); for an in-range, no-trend marker the honest label is just its latest reading.
+    The number is read off the verdict, never computed (the one law). Raised markers keep the
+    signal-aware ``observation_summary`` title instead (so a flagged value is never narrated as calm)."""
+    return (
+        f"{_display_name(traj.marker)}: latest {traj.latest.value} {traj.unit} "
+        f"(recorded {traj.latest.date})"
+    )
+
+
+def _stat_string(traj: MarkerTrajectory, rng: ReferenceRange | None) -> str:
     """The statistic/threshold the claim rests on (evidence chip) — switched on the SAME ``_classify``
     decision as the title, so the two never diverge."""
     signal, t = _classify(traj), traj.trend
@@ -160,7 +181,7 @@ def _stat_string(traj: MarkerTrajectory, rng: Optional[ReferenceRange]) -> str:
 
 
 def scan_finding(
-    traj: MarkerTrajectory, rng: Optional[ReferenceRange], finding_id: str, title: str
+    traj: MarkerTrajectory, rng: ReferenceRange | None, finding_id: str, title: str
 ) -> Finding:
     """One ``Finding`` (text + a single backing ``Evidence``) for a raised marker. ``title`` is passed in
     (computed once by the caller via ``observation_summary``) so finding.text == observation.title by
@@ -184,6 +205,7 @@ def scan_finding(
 # severity. Phase 4 replaces the terse ``answer`` prose with LLM narration; findings + floor stay.
 # --------------------------------------------------------------------------------------------------
 
+
 def render_finding(
     finding: Finding,
     *,
@@ -204,6 +226,7 @@ def render_finding(
 # Safety responders (architecture §2 D4) — fixed templates the Phase-4 gate routes to. Stubs in 3a:
 # defined so the contract and the calm microcopy exist; not wired to a route until the gate lands.
 # --------------------------------------------------------------------------------------------------
+
 
 def seek_care_template(metadata: ResponseMetadata) -> HealthIntelligenceResponse:
     """Acute-medical responder: the unmissable next step leads; no lab narration to dilute it."""
@@ -245,6 +268,25 @@ def refuse_template(metadata: ResponseMetadata) -> HealthIntelligenceResponse:
     )
 
 
+def couldnt_route_template(metadata: ResponseMetadata) -> HealthIntelligenceResponse:
+    """The gate's fail-closed responder (architecture §98): when the input classifier returns an
+    off-enum/unparseable result twice, or the provider is down, the turn lands here — the floor HOLDS at
+    ``clinician_review`` (set by the caller, never below) while the copy blends both possibilities so
+    clarification lives in the words without lowering the floor. It never free-composes a possibly-urgent
+    message and never replies with a bare rephrase-ask and no floor: the glitched message is exactly the
+    one the gate exists to catch. ``answer_disposition='answered'`` — it gives a real next step."""
+    return HealthIntelligenceResponse(
+        answer=(
+            "I couldn't quite tell what you're asking. If you're worried about symptoms you're having "
+            "right now, please don't wait on me — contact your GP or urgent care. Otherwise, try "
+            "rephrasing and I'll help you make sense of your own results."
+        ),
+        answer_disposition="answered",
+        escalation="clinician_review",
+        metadata=metadata,
+    )
+
+
 # --------------------------------------------------------------------------------------------------
 # Mode 1 reactive answering (Phase 3b) — ``suggest_prompts`` builds the navigable preset loop, each chip
 # bound to a PRE-COMPUTED ``HealthIntelligenceResponse`` templated from the same verdicts (no model call,
@@ -258,8 +300,9 @@ def refuse_template(metadata: ResponseMetadata) -> HealthIntelligenceResponse:
 # chip carries the floor (asserted in pipeline) — "floor always on" (CLAUDE.md), demonstrated.
 # --------------------------------------------------------------------------------------------------
 
+
 def _join_markers(markers: list[str]) -> str:
-    """"a", "a and b", "a, b and c" — a calm, readable marker list for the overview prose."""
+    """ "a", "a and b", "a, b and c" — a calm, readable marker list for the overview prose."""
     if len(markers) == 1:
         return markers[0]
     return ", ".join(markers[:-1]) + " and " + markers[-1]
@@ -272,25 +315,35 @@ def _change_narrative(traj: MarkerTrajectory) -> str:
     narrated as 'within normal variation' (which would be false reassurance on an out-of-range or panic
     value — the same calm the deterministic core did not produce). Reads only off the trajectory."""
     latest = traj.latest
-    parts = [f"Your most recent {_display_name(traj.marker)} is {latest.value} {traj.unit} (recorded {latest.date})."]
+    parts = [
+        f"Your most recent {_display_name(traj.marker)} is {latest.value} {traj.unit} (recorded {latest.date})."
+    ]
     status = _status_clause(traj)
     if status:
         parts.append(status)
     net = traj.clinical_change.net_change if traj.clinical_change is not None else None
     if net is not None and abs(net) >= 1.0:
-        parts.append(f"That's {'up' if net > 0 else 'down'} about {abs(net):.0f}% from your first recorded reading.")
+        parts.append(
+            f"That's {'up' if net > 0 else 'down'} about {abs(net):.0f}% from your first recorded reading."
+        )
     t = traj.trend
     if t is not None and t.direction != "flat" and t.significant:
         word = _DIRECTION_WORD.get(t.direction, "changing")
-        parts.append(f"Across {t.n} readings this is a {word} trend (Mann-Kendall p={t.p_value:.3f}).")
+        parts.append(
+            f"Across {t.n} readings this is a {word} trend (Mann-Kendall p={t.p_value:.3f})."
+        )
     elif t is not None and not _is_flagged(traj):
-        parts.append(f"Across {t.n} readings there's no clear trend — the movement is within normal variation.")
+        parts.append(
+            f"Across {t.n} readings there's no clear trend — the movement is within normal variation."
+        )
     elif t is not None:
-        parts.append(f"Across {t.n} readings there's no significant trend.")  # flagged: don't claim 'normal variation'
+        parts.append(
+            f"Across {t.n} readings there's no significant trend."
+        )  # flagged: don't claim 'normal variation'
     return " ".join(parts)
 
 
-def _change_stat(traj: MarkerTrajectory, rng: Optional[ReferenceRange]) -> str:
+def _change_stat(traj: MarkerTrajectory, rng: ReferenceRange | None) -> str:
     """The statistic the change drill-down's latest-reading evidence chip rests on. FLAG-AWARE: when the
     value is out-of-range / panic / band, defer to ``_stat_string`` so the chip states the threshold —
     the SAME stat that marker's pivot/scan chip shows (no cross-chip divergence). Otherwise the change
@@ -307,7 +360,7 @@ def _change_stat(traj: MarkerTrajectory, rng: Optional[ReferenceRange]) -> str:
     return "latest reading"
 
 
-def _marker_finding(traj: MarkerTrajectory, rng: Optional[ReferenceRange]) -> Finding:
+def _marker_finding(traj: MarkerTrajectory, rng: ReferenceRange | None) -> Finding:
     """One raised marker's ``Finding`` — the per-marker unit shared by the pivot answer and the overview
     aggregate, so a marker reads identically whether shown singly or inside the 'what's changed' list
     (one ``observation_summary`` title + one ``scan_finding`` evidence, one ``f:{marker}`` id scheme)."""
@@ -316,7 +369,7 @@ def _marker_finding(traj: MarkerTrajectory, rng: Optional[ReferenceRange]) -> Fi
 
 def render_change(
     traj: MarkerTrajectory,
-    rng: Optional[ReferenceRange],
+    rng: ReferenceRange | None,
     series: list[Reading],
     *,
     escalation: FloorLevel,
@@ -334,9 +387,15 @@ def render_change(
         text=_change_narrative(traj),
         evidence=[
             Evidence(
-                marker=traj.marker, value=rd.value, unit=traj.unit, date=rd.date,
-                ref_low=rng.ref_low if rng else None, ref_high=rng.ref_high if rng else None,
-                stat=_change_stat(traj, rng) if i == last else None,  # the change stat sits on the latest reading
+                marker=traj.marker,
+                value=rd.value,
+                unit=traj.unit,
+                date=rd.date,
+                ref_low=rng.ref_low if rng else None,
+                ref_high=rng.ref_high if rng else None,
+                stat=_change_stat(traj, rng)
+                if i == last
+                else None,  # the change stat sits on the latest reading
             )
             for i, rd in enumerate(series)
         ],
@@ -353,7 +412,7 @@ def render_change(
 
 def render_pivot(
     traj: MarkerTrajectory,
-    rng: Optional[ReferenceRange],
+    rng: ReferenceRange | None,
     *,
     escalation: FloorLevel,
     metadata: ResponseMetadata,
@@ -362,12 +421,14 @@ def render_pivot(
     (``observation_summary`` title + ``scan_finding`` evidence), rendered by the 3a ``render_finding``.
     This is the "reactive path reuses the 3a response builder" of the phase, so a chip's answer for a
     marker is identical in substance to that marker's scan observation."""
-    return render_finding(_marker_finding(traj, rng), escalation=escalation, metadata=metadata)
+    return render_finding(
+        _marker_finding(traj, rng), escalation=escalation, metadata=metadata
+    )
 
 
 def render_overview(
     raised: list[MarkerTrajectory],
-    rng_for: dict[str, Optional[ReferenceRange]],
+    rng_for: dict[str, ReferenceRange | None],
     *,
     escalation: FloorLevel,
     metadata: ResponseMetadata,
@@ -380,8 +441,11 @@ def render_overview(
     if not raised:
         # Don't claim "within normal ranges" for a marker that HAS no reference range (no_reference, e.g.
         # an other/unknown-sex member with a sex-split marker) — say only what's true: nothing flagged.
-        clause = ("your results sit within their normal ranges" if all(r is not None for r in rng_for.values())
-                  else "nothing in your readings is flagged")
+        clause = (
+            "your results sit within their normal ranges"
+            if all(r is not None for r in rng_for.values())
+            else "nothing in your readings is flagged"
+        )
         return HealthIntelligenceResponse(
             answer=(
                 f"Nothing in your recent panels stands out as needing attention — {clause}, with no "
@@ -424,17 +488,19 @@ def render_summary(
     all_ranged = all("no_reference" not in t.flags for t in analysis.markers)
     rest = "within their normal ranges" if all_ranged else "not flagged"
     if m == 0:
-        answer = (
-            f"I looked at {n} markers from your panels, and they're all {rest} — nothing flagged right now."
-        )
+        answer = f"I looked at {n} markers from your panels, and they're all {rest} — nothing flagged right now."
     else:
         answer = (
             f"I looked at {n} markers from your panels. {m} {'is' if m == 1 else 'are'} worth a closer "
             f"look (shown on the right and in detail above); the rest are {rest}."
         )
     return HealthIntelligenceResponse(
-        answer=answer, findings=[], uncertainty=None,
-        answer_disposition="answered", escalation=escalation, metadata=metadata,
+        answer=answer,
+        findings=[],
+        uncertainty=None,
+        answer_disposition="answered",
+        escalation=escalation,
+        metadata=metadata,
     )
 
 
@@ -448,10 +514,10 @@ MAX_CHIPS = 5
 def suggest_prompts(
     analysis: TrajectoryAnalysis,
     raised: list[MarkerTrajectory],
-    focus: Optional[str],
+    focus: str | None,
     asked: frozenset[str],
     *,
-    rng_for: dict[str, Optional[ReferenceRange]],
+    rng_for: dict[str, ReferenceRange | None],
     focus_series: list[Reading],
     escalation: FloorLevel,
     new_metadata: Callable[[str], ResponseMetadata],
@@ -481,23 +547,38 @@ def suggest_prompts(
     # 1. Drill-down of the finding just opened (any marker in the member's record, raised or not).
     drilldowns: list[SuggestedPrompt] = []
     if focus is not None and focus in by_marker:
-        drilldowns.append(SuggestedPrompt(
-            prompt=f"How has my {_display_name(focus)} changed over time?",
-            response=render_change(
-                by_marker[focus], rng_for.get(focus), focus_series,
-                escalation=escalation, metadata=new_metadata(f"change:{focus}"),
-            ),
-        ))
+        drilldowns.append(
+            SuggestedPrompt(
+                prompt=f"How has my {_display_name(focus)} changed over time?",
+                response=render_change(
+                    by_marker[focus],
+                    rng_for.get(focus),
+                    focus_series,
+                    escalation=escalation,
+                    metadata=new_metadata(f"change:{focus}"),
+                ),
+            )
+        )
 
     # 3. Ever-present anchors (built before the pivots so the pivot budget is what remains after them).
     anchors = [
         SuggestedPrompt(
             prompt="What's changed since my last results?",
-            response=render_overview(raised, rng_for, escalation=escalation, metadata=new_metadata("overview")),
+            response=render_overview(
+                raised,
+                rng_for,
+                escalation=escalation,
+                metadata=new_metadata("overview"),
+            ),
         ),
         SuggestedPrompt(
             prompt="Give me a quick overview of my results.",
-            response=render_summary(analysis, raised, escalation=escalation, metadata=new_metadata("summary")),
+            response=render_summary(
+                analysis,
+                raised,
+                escalation=escalation,
+                metadata=new_metadata("summary"),
+            ),
         ),
     ]
 
@@ -509,8 +590,10 @@ def suggest_prompts(
         SuggestedPrompt(
             prompt=f"Tell me about my {_display_name(t.marker)}.",
             response=render_pivot(
-                t, rng_for.get(t.marker),
-                escalation=escalation, metadata=new_metadata(f"marker:{t.marker}"),
+                t,
+                rng_for.get(t.marker),
+                escalation=escalation,
+                metadata=new_metadata(f"marker:{t.marker}"),
             ),
         )
         for t in eligible[:pivot_cap]

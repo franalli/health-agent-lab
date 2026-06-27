@@ -1,0 +1,34 @@
+# Pre-commit hooks for health-agent-lab.
+# Install once with:  uv run --project backend pre-commit install
+# Run on all files:   uv run --project backend pre-commit run --all-files
+#
+# Two gates: linting (ruff) and secrets detection (gitleaks). Ruff reads its
+# config from backend/pyproject.toml ([tool.ruff]) — it discovers that file by
+# searching upward from each Python file, even though this hook runs from the
+# repo root.
+
+repos:
+  # --- general hygiene ---------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: detect-private-key   # cheap belt-and-suspenders alongside gitleaks
+
+  # --- linting + formatting ---------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.20
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  # --- secrets detection -------------------------------------------------
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.0
+    hooks:
+      - id: gitleaks

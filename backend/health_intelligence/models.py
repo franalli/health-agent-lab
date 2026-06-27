@@ -17,7 +17,7 @@ Two conventions make the split legible:
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -25,31 +25,58 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # Enumerations — each mirrors a schema.sql CHECK constraint VERBATIM. Change one, change both.
 # --------------------------------------------------------------------------------------------------
 
-MemberSex = Literal["female", "male", "other", "unknown"]      # members.sex
-RangeSex = Literal["female", "male", "any"]                    # reference_ranges.sex
-Driver = Literal["ask", "scan", "suggested"]                   # interactions.driver
-AnswerDisposition = Literal["answered", "refused", "out_of_scope"]  # interactions.answer_disposition
-FloorLevel = Literal["none", "clinician_review", "urgent"]     # the escalation/floor axis: interactions.escalation + overall_floor
-Severity = Literal["info", "notable", "attention", "urgent"]   # observations.severity
-EscalationKind = Literal["data_finding", "chat"]               # escalations.kind
-EscalationLevel = Literal["clinician_review", "urgent"]        # escalations.level (no 'none' — only escalated rows exist)
-FeedbackKind = Literal[                                        # feedback.kind
-    "range_override", "suppress_marker", "preference",
-    "helpful", "incorrect", "escalation_accept", "escalation_reject",
+MemberSex = Literal["female", "male", "other", "unknown"]  # members.sex
+RangeSex = Literal["female", "male", "any"]  # reference_ranges.sex
+Driver = Literal["ask", "scan", "suggested"]  # interactions.driver
+AnswerDisposition = Literal[
+    "answered", "refused", "out_of_scope"
+]  # interactions.answer_disposition
+FloorLevel = Literal[
+    "none", "clinician_review", "urgent"
+]  # the escalation/floor axis: interactions.escalation + overall_floor
+Severity = Literal["info", "notable", "attention", "urgent"]  # observations.severity
+EscalationKind = Literal["data_finding", "chat"]  # escalations.kind
+EscalationLevel = Literal[
+    "clinician_review", "urgent"
+]  # escalations.level (no 'none' — only escalated rows exist)
+FeedbackKind = Literal[  # feedback.kind
+    "range_override",
+    "suppress_marker",
+    "preference",
+    "helpful",
+    "incorrect",
+    "escalation_accept",
+    "escalation_reject",
 ]
-FeedbackSource = Literal["clinician", "member", "system"]      # feedback.source
-PromptStatus = Literal["proposed", "promoted", "rejected", "reverted"]  # prompt_versions.status
+FeedbackSource = Literal["clinician", "member", "system"]  # feedback.source
+PromptStatus = Literal[
+    "proposed", "promoted", "rejected", "reverted"
+]  # prompt_versions.status
 
 # Computed-only enums (no table column — internal to the analysis):
-TrendDirection = Literal["increasing", "decreasing", "flat"]  # "flat" = CI includes zero, can't sign
-Flag = Literal["below_range", "above_range", "panic_low", "panic_high", "band_cross", "no_reference"]
+TrendDirection = Literal[
+    "increasing", "decreasing", "flat"
+]  # "flat" = CI includes zero, can't sign
+Flag = Literal[
+    "below_range",
+    "above_range",
+    "panic_low",
+    "panic_high",
+    "band_cross",
+    "no_reference",
+]
 
 # Ordinal rank for the two safety axes — the ONE place their order is defined, so no code ever
 # string-compares these Literals. Lexicographically "clinician_review" < "none", so a raw
 # `escalation >= floor` would INVERT the floor; the validator and the _floor / _severity projections
 # (Phase 1/3a) MUST rank through these maps (e.g. max-severity = max(markers, key=lambda m: SEVERITY_ORDER[m.severity])).
 FLOOR_ORDER: dict[FloorLevel, int] = {"none": 0, "clinician_review": 1, "urgent": 2}
-SEVERITY_ORDER: dict[Severity, int] = {"info": 0, "notable": 1, "attention": 2, "urgent": 3}
+SEVERITY_ORDER: dict[Severity, int] = {
+    "info": 0,
+    "notable": 1,
+    "attention": 2,
+    "urgent": 3,
+}
 
 # The ONE severity -> escalation-floor projection (architecture §2 D3 / the _floor rule). Both the
 # core's whole-member floor (analysis._floor, the max over markers) and the per-marker escalation level
@@ -58,7 +85,10 @@ SEVERITY_ORDER: dict[Severity, int] = {"info": 0, "notable": 1, "attention": 2, 
 # is at most `notable` -> `none` here: escalation is reserved for `attention` (RCV+FDR-confirmed adverse
 # trend) and `urgent` (panic).
 SEVERITY_TO_FLOOR: dict[Severity, FloorLevel] = {
-    "info": "none", "notable": "none", "attention": "clinician_review", "urgent": "urgent",
+    "info": "none",
+    "notable": "none",
+    "attention": "clinician_review",
+    "urgent": "urgent",
 }
 
 
@@ -67,6 +97,7 @@ SEVERITY_TO_FLOOR: dict[Severity, FloorLevel] = {
 # `panels[]` is a transient PARSE shape: ingest flattens it to dated results keyed by panel_id and
 # folds `vitals` in as markers; nothing downstream sees PanelInput again.
 # --------------------------------------------------------------------------------------------------
+
 
 class _IngestModel(BaseModel):
     """Base for the upload/ingest contracts: ``extra='forbid'`` makes a mistyped key a clear
@@ -106,20 +137,22 @@ class MemberProfile(_IngestModel):
     load-bearing for analysis — ranges key on sex alone (no age bands in the data)."""
 
     member_id: str
-    age: Optional[int] = None
+    age: int | None = None
     sex: MemberSex
     conditions: list[str] = Field(default_factory=list)
     medications: list[str] = Field(default_factory=list)
     family_history: list[str] = Field(default_factory=list)
-    lifestyle: dict[str, str] = Field(default_factory=dict)  # {exercise, alcohol, smoking, sleep}
+    lifestyle: dict[str, str] = Field(
+        default_factory=dict
+    )  # {exercise, alcohol, smoking, sleep}
 
 
 class Note(_IngestModel):
     """Free-text note with provenance. ``source`` is 'GP summary' (clinician) | 'in-app' | 'onboarding'
     (member-reported); date/source nullable per schema, text required."""
 
-    date: Optional[str] = None
-    source: Optional[str] = None
+    date: str | None = None
+    source: str | None = None
     text: str
 
 
@@ -133,7 +166,7 @@ class MemberBundle(_IngestModel):
     notes: list[Note] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def _member_ids_agree(self) -> "MemberBundle":
+    def _member_ids_agree(self) -> MemberBundle:
         # member_id is carried at the bundle root AND in the profile; a mismatch would cross-wire
         # storage (db.py keys on the root id) with narration (which reads profile.member_id).
         if self.profile.member_id != self.member_id:
@@ -154,6 +187,7 @@ class AskRequest(BaseModel):
 # Storage PKs (result_id, note_id, member_id FKs) live in the row mapping, not here.
 # --------------------------------------------------------------------------------------------------
 
+
 class LabResult(BaseModel):
     """One reading in canonical form (analyte->marker, vitals unified in). Units are consistent per
     marker, so no conversion ever happens downstream."""
@@ -161,7 +195,7 @@ class LabResult(BaseModel):
     marker: str
     value: float
     unit: str
-    panel_id: str   # the draw's identity: results sharing it are one panel
+    panel_id: str  # the draw's identity: results sharing it are one panel
     panel_date: str  # orders a marker's trajectory
 
 
@@ -172,10 +206,10 @@ class ReferenceRange(BaseModel):
     marker: str
     sex: RangeSex
     unit: str
-    ref_low: Optional[float] = None
-    ref_high: Optional[float] = None
-    panic_low: Optional[float] = None
-    panic_high: Optional[float] = None
+    ref_low: float | None = None
+    ref_high: float | None = None
+    panic_low: float | None = None
+    panic_high: float | None = None
     config_version: str
 
 
@@ -183,6 +217,7 @@ class ReferenceRange(BaseModel):
 # Computed layer — produced by analysis.py (Phase 1), held in memory, never their own tables. The
 # LLM consumes these as GROUND TRUTH it may not recompute.
 # --------------------------------------------------------------------------------------------------
+
 
 class Reading(BaseModel):
     value: float
@@ -195,11 +230,13 @@ class TrendResult(BaseModel):
 
     method: Literal["mann_kendall"] = "mann_kendall"
     direction: TrendDirection
-    tau: float                                       # Kendall's tau in [-1, 1]
-    p_value: float                                   # exact small-sample MK p-value
-    slope: Optional[float] = None                    # Theil-Sen slope (per unit time)
-    slope_ci: Optional[tuple[float, float]] = None   # distribution-free CI; signs direction iff it excludes 0
-    n: int                                           # readings the trend was computed over
+    tau: float  # Kendall's tau in [-1, 1]
+    p_value: float  # exact small-sample MK p-value
+    slope: float | None = None  # Theil-Sen slope (per unit time)
+    slope_ci: tuple[float, float] | None = (
+        None  # distribution-free CI; signs direction iff it excludes 0
+    )
+    n: int  # readings the trend was computed over
     significant: bool = False
 
 
@@ -207,9 +244,9 @@ class ClinicalChange(BaseModel):
     """Reference Change Value verdict — did the net change clear the marker's own analytical+biological
     noise? ``exceeds_rcv`` is ``None`` when CVa/CVi are absent (the typed-absence skip-path)."""
 
-    rcv: Optional[float] = None
-    net_change: Optional[float] = None
-    exceeds_rcv: Optional[bool] = None
+    rcv: float | None = None
+    net_change: float | None = None
+    exceeds_rcv: bool | None = None
 
 
 class MarkerTrajectory(BaseModel):
@@ -219,8 +256,8 @@ class MarkerTrajectory(BaseModel):
     marker: str
     unit: str
     latest: Reading
-    trend: Optional[TrendResult] = None
-    clinical_change: Optional[ClinicalChange] = None
+    trend: TrendResult | None = None
+    clinical_change: ClinicalChange | None = None
     flags: list[Flag] = Field(default_factory=list)
     severity: Severity
 
@@ -241,6 +278,7 @@ class TrajectoryAnalysis(BaseModel):
 # read projections of the proactive findings and the clinician-review queue.
 # --------------------------------------------------------------------------------------------------
 
+
 class Evidence(BaseModel):
     """One load-bearing claim's provenance — shown verbatim because the numbers came from code.
     Range fields mirror how the panel reported it; ``stat`` names the statistic the claim rests on."""
@@ -249,9 +287,9 @@ class Evidence(BaseModel):
     value: float
     unit: str
     date: str
-    ref_low: Optional[float] = None
-    ref_high: Optional[float] = None
-    stat: Optional[str] = None
+    ref_low: float | None = None
+    ref_high: float | None = None
+    stat: str | None = None
 
 
 class Finding(BaseModel):
@@ -270,9 +308,9 @@ class ResponseMetadata(BaseModel):
     model_version: str
     config_version: str
     prompt_version: int = 0
-    latency_ms: Optional[int] = None
-    tokens: Optional[int] = None
-    cost_usd: Optional[float] = None
+    latency_ms: int | None = None
+    tokens: int | None = None
+    cost_usd: float | None = None
 
 
 class HealthIntelligenceResponse(BaseModel):
@@ -282,7 +320,7 @@ class HealthIntelligenceResponse(BaseModel):
 
     answer: str
     findings: list[Finding] = Field(default_factory=list)
-    uncertainty: Optional[str] = None
+    uncertainty: str | None = None
     answer_disposition: AnswerDisposition
     escalation: FloorLevel = "none"
     metadata: ResponseMetadata
@@ -311,8 +349,8 @@ class Escalation(BaseModel):
     kind: EscalationKind
     dedup_key: str
     level: EscalationLevel
-    observation_id: Optional[str] = None
-    interaction_id: Optional[str] = None
+    observation_id: str | None = None
+    interaction_id: str | None = None
     trigger_reason: str
     created_at: str
 
@@ -322,13 +360,14 @@ class Escalation(BaseModel):
 # (feedback_id, active, created_at) are assigned by db.py; member_id comes from the route path.
 # --------------------------------------------------------------------------------------------------
 
+
 class Feedback(BaseModel):
     """A correction (range_override / suppress_marker / preference) or a signal (helpful / incorrect /
     escalation_accept|reject). ``target`` is a marker (overrides) or finding_id (signals)."""
 
     kind: FeedbackKind
-    target: Optional[str] = None
-    payload: Optional[dict[str, Any]] = None
+    target: str | None = None
+    payload: dict[str, Any] | None = None
     source: FeedbackSource
 
 
@@ -337,6 +376,31 @@ class Feedback(BaseModel):
 # loop is a walk over these.
 # --------------------------------------------------------------------------------------------------
 
+
 class SuggestedPrompt(BaseModel):
     prompt: str
     response: HealthIntelligenceResponse
+
+
+# --------------------------------------------------------------------------------------------------
+# Mode 2 LLM layer (Phase 4) — computed seams, NOT schema tables. ``ComposeDraft`` is the *only* thing
+# the composer LLM is allowed to emit: prose + which markers it relied on. The deterministic core then
+# attaches the real ``Evidence`` (numbers come from code, never the model) and sets ``escalation`` to the
+# floor, lifting the draft into a full ``HealthIntelligenceResponse``. Keeping the model's surface this
+# narrow is what makes "never assert a value the deterministic layer did not produce" (CLAUDE.md's one
+# law) structurally true for the evidence chips — the model can choose *which* markers are relevant and
+# *how* to phrase the answer, but it cannot mint a number or touch the safety floor.
+# --------------------------------------------------------------------------------------------------
+
+
+class ComposeDraft(BaseModel):
+    """The composer LLM's structured output (Mode 2). ``cited_markers`` are CANONICAL marker keys (e.g.
+    "HbA1c", "systolic_bp") the answer drew on; ``pipeline`` resolves each to a code-built ``Finding`` +
+    ``Evidence`` from the ``TrajectoryAnalysis`` and drops any key not in the member's data (a fabricated
+    marker can never produce an evidence chip). ``escalation`` is deliberately absent — it is the
+    deterministic floor's to set, never the model's."""
+
+    answer: str
+    uncertainty: str | None = None
+    answer_disposition: AnswerDisposition
+    cited_markers: list[str] = Field(default_factory=list)

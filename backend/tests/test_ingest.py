@@ -17,7 +17,9 @@ def test_parse_reference_range_all_five_shapes():
     # lower-bound only (>=low): eGFR
     assert parse_reference_range(">=90", "eGFR") == [("any", 90.0, None)]
     # sex-split wrapping a bounded form: Creatinine (also Hemoglobin, Ferritin)
-    assert parse_reference_range("0.74-1.35 (male) / 0.59-1.04 (female)", "Creatinine") == [
+    assert parse_reference_range(
+        "0.74-1.35 (male) / 0.59-1.04 (female)", "Creatinine"
+    ) == [
         ("male", 0.74, 1.35),
         ("female", 0.59, 1.04),
     ]

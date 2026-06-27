@@ -23,11 +23,11 @@ import hashlib
 import json
 import pathlib
 import sqlite3
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
 from health_intelligence.config import CONFIG_VERSION
 from health_intelligence.models import (
+    SEVERITY_ORDER,
     Escalation,
     EscalationKind,
     EscalationLevel,
@@ -38,7 +38,6 @@ from health_intelligence.models import (
     Note,
     Observation,
     ReferenceRange,
-    SEVERITY_ORDER,
 )
 
 # --------------------------------------------------------------------------------------------------
@@ -53,8 +52,15 @@ SCHEMA_PATH = _BACKEND / "schema.sql"
 
 #: The nine tables schema.sql defines; init_db is a no-op once they all exist.
 _EXPECTED_TABLES = {
-    "members", "lab_results", "notes", "reference_ranges", "interactions",
-    "observations", "escalations", "feedback", "prompt_versions",
+    "members",
+    "lab_results",
+    "notes",
+    "reference_ranges",
+    "interactions",
+    "observations",
+    "escalations",
+    "feedback",
+    "prompt_versions",
 }
 
 
@@ -65,6 +71,7 @@ _EXPECTED_TABLES = {
 # 32 hex (128 bits) is at least as collision-resistant as the UNIQUE/PK it backs.
 # --------------------------------------------------------------------------------------------------
 
+
 def _det_id(prefix: str, *parts: str) -> str:
     return prefix + hashlib.sha256(":".join(parts).encode("utf-8")).hexdigest()[:32]
 
@@ -73,7 +80,9 @@ def _canon_results(results: list[LabResult]) -> list[list]:
     """The canonical, order-independent results projection both content hashes share. (date, panel_id,
     marker) uniquely identify a row, so the sort never reaches the float value field — the documented
     'JSON ints become REAL on read' stability. Defined once so the two hashers can't drift apart."""
-    return sorted([[r.panel_date, r.panel_id, r.marker, r.value, r.unit] for r in results])
+    return sorted(
+        [[r.panel_date, r.panel_id, r.marker, r.value, r.unit] for r in results]
+    )
 
 
 def _hash_canon(canon: dict) -> str:
@@ -86,6 +95,7 @@ def _hash_canon(canon: dict) -> str:
 # --------------------------------------------------------------------------------------------------
 # Connection + schema
 # --------------------------------------------------------------------------------------------------
+
 
 def connect(db_path=None) -> sqlite3.Connection:
     """Open a connection with the invariants every caller needs.
@@ -115,7 +125,9 @@ def init_db(con: sqlite3.Connection, schema_path: pathlib.Path = SCHEMA_PATH) ->
     ``IF NOT EXISTS``), so guard on presence: if all nine are already there, no-op; else run the
     script. schema.sql is the locked persistence contract — never edited here. Safe to call on
     every startup (Phase 8 relies on this)."""
-    existing = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    existing = {
+        r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
     present = _EXPECTED_TABLES & existing
     if present == _EXPECTED_TABLES:
         return
@@ -135,6 +147,7 @@ def init_db(con: sqlite3.Connection, schema_path: pathlib.Path = SCHEMA_PATH) ->
 # synthesized on write (replace_member) and dropped on read — the domain models omit them by design.
 # --------------------------------------------------------------------------------------------------
 
+
 def _row_to_profile(row: sqlite3.Row) -> MemberProfile:
     return MemberProfile(
         member_id=row["member_id"],
@@ -149,9 +162,13 @@ def _row_to_profile(row: sqlite3.Row) -> MemberProfile:
 
 def _profile_to_params(p: MemberProfile) -> tuple:
     return (
-        p.member_id, p.sex, p.age,
-        json.dumps(p.conditions), json.dumps(p.medications),
-        json.dumps(p.family_history), json.dumps(p.lifestyle),
+        p.member_id,
+        p.sex,
+        p.age,
+        json.dumps(p.conditions),
+        json.dumps(p.medications),
+        json.dumps(p.family_history),
+        json.dumps(p.lifestyle),
     )
 
 
@@ -160,8 +177,11 @@ def _profile_to_params(p: MemberProfile) -> tuple:
 # observation/escalation read projections live further down (Phase 3a).
 # --------------------------------------------------------------------------------------------------
 
-def get_member(con: sqlite3.Connection, member_id: str) -> Optional[MemberProfile]:
-    row = con.execute("SELECT * FROM members WHERE member_id = ?", (member_id,)).fetchone()
+
+def get_member(con: sqlite3.Connection, member_id: str) -> MemberProfile | None:
+    row = con.execute(
+        "SELECT * FROM members WHERE member_id = ?", (member_id,)
+    ).fetchone()
     return _row_to_profile(row) if row else None
 
 
@@ -172,15 +192,20 @@ def get_results(con: sqlite3.Connection, member_id: str) -> list[LabResult]:
         (member_id,),
     ).fetchall()
     return [
-        LabResult(marker=r["marker"], value=r["value"], unit=r["unit"],
-                  panel_id=r["panel_id"], panel_date=r["panel_date"])
+        LabResult(
+            marker=r["marker"],
+            value=r["value"],
+            unit=r["unit"],
+            panel_id=r["panel_id"],
+            panel_date=r["panel_date"],
+        )
         for r in rows
     ]
 
 
 def get_ranges(
     con: sqlite3.Connection,
-    markers: Optional[set[str]] = None,
+    markers: set[str] | None = None,
     config_version: str = CONFIG_VERSION,
 ) -> list[ReferenceRange]:
     """Reference ranges for the active ``config_version``. The range_id embeds the version, so a
@@ -188,21 +213,27 @@ def get_ranges(
     version or ``_range_for`` would see duplicate (marker, sex) rows across generations. ``markers``
     None returns all; when scoped, returns ALL sexes for those markers so the sex selection + 'any'
     fallback still resolve."""
-    sql = ("SELECT marker, sex, unit, ref_low, ref_high, panic_low, panic_high, config_version "
-           "FROM reference_ranges WHERE config_version = ?")
+    sql = (
+        "SELECT marker, sex, unit, ref_low, ref_high, panic_low, panic_high, config_version "
+        "FROM reference_ranges WHERE config_version = ?"
+    )
     params: list = [config_version]
     if markers is not None:
         marker_list = list(markers)
         if not marker_list:
             return []
-        sql += " AND marker IN (%s)" % ",".join("?" * len(marker_list))
+        sql += f" AND marker IN ({','.join('?' * len(marker_list))})"
         params += marker_list
     rows = con.execute(sql, params).fetchall()
     return [
         ReferenceRange(
-            marker=r["marker"], sex=r["sex"], unit=r["unit"],
-            ref_low=r["ref_low"], ref_high=r["ref_high"],
-            panic_low=r["panic_low"], panic_high=r["panic_high"],
+            marker=r["marker"],
+            sex=r["sex"],
+            unit=r["unit"],
+            ref_low=r["ref_low"],
+            ref_high=r["ref_high"],
+            panic_low=r["panic_low"],
+            panic_high=r["panic_high"],
             config_version=r["config_version"],
         )
         for r in rows
@@ -220,7 +251,10 @@ def get_notes(con: sqlite3.Connection, member_id: str) -> list[Note]:
 
 
 def list_members(con: sqlite3.Connection) -> list[str]:
-    return [r["member_id"] for r in con.execute("SELECT member_id FROM members ORDER BY member_id")]
+    return [
+        r["member_id"]
+        for r in con.execute("SELECT member_id FROM members ORDER BY member_id")
+    ]
 
 
 # --------------------------------------------------------------------------------------------------
@@ -231,13 +265,14 @@ def list_members(con: sqlite3.Connection) -> list[str]:
 # the raw bundle, because JSON ints (systolic_bp: 130) become REAL 130.0 on read.
 # --------------------------------------------------------------------------------------------------
 
+
 def compute_data_version(
     con: sqlite3.Connection,
     member_id: str,
     *,
-    member: Optional[MemberProfile] = None,
-    results: Optional[list[LabResult]] = None,
-    notes: Optional[list[Note]] = None,
+    member: MemberProfile | None = None,
+    results: list[LabResult] | None = None,
+    notes: list[Note] | None = None,
 ) -> str:
     # Accept already-loaded rows so load_for_analysis doesn't re-query member/results just to hash
     # them; default to fetching when called standalone. Must be the RAW persisted rows (pre-override).
@@ -254,7 +289,7 @@ def compute_data_version(
         "profile": {
             "sex": member.sex,
             "age": member.age,
-            "conditions": member.conditions,          # stored input order (round-trips stably)
+            "conditions": member.conditions,  # stored input order (round-trips stably)
             "medications": member.medications,
             "family_history": member.family_history,
             "lifestyle": dict(sorted(member.lifestyle.items())),
@@ -271,7 +306,7 @@ def compute_analysis_version(
     results: list[LabResult],
     ranges: list[ReferenceRange],
     sex: str,
-    age: Optional[int],
+    age: int | None,
 ) -> str:
     """A content fingerprint of *only* the inputs ``analysis.analyze`` actually reads — the
     override-resolved results, the reference ranges, and the member's sex/age. Pure (no DB).
@@ -288,8 +323,19 @@ def compute_analysis_version(
         "age": age,
         "results": _canon_results(results),
         "ranges": sorted(
-            [[rg.marker, rg.sex, rg.unit, rg.ref_low, rg.ref_high, rg.panic_low, rg.panic_high,
-              rg.config_version] for rg in ranges]
+            [
+                [
+                    rg.marker,
+                    rg.sex,
+                    rg.unit,
+                    rg.ref_low,
+                    rg.ref_high,
+                    rg.panic_low,
+                    rg.panic_high,
+                    rg.config_version,
+                ]
+                for rg in ranges
+            ]
         ),
     }
     return _hash_canon(canon)
@@ -299,6 +345,7 @@ def compute_analysis_version(
 # Write — the one transactional member upsert. db.py owns all SQL (CLAUDE.md), so ingest normalizes
 # and hands domain objects here; this function synthesizes the storage PKs and persists them.
 # --------------------------------------------------------------------------------------------------
+
 
 def _assert_ranges_consistent(con: sqlite3.Connection, range_rows: list[tuple]) -> None:
     """Guard the global reference_ranges table: it is constant per (marker, sex, config_version), so a
@@ -317,7 +364,9 @@ def _assert_ranges_consistent(con: sqlite3.Connection, range_rows: list[tuple]) 
     ).fetchall()
     for s in stored:
         incoming = by_id[s["range_id"]]
-        if tuple(s)[1:] != incoming[1:]:  # compare every column but the range_id key (index 0)
+        if (
+            tuple(s)[1:] != incoming[1:]
+        ):  # compare every column but the range_id key (index 0)
             raise ValueError(
                 f"reference range for {s['marker']}/{s['sex']} diverges from the stored definition "
                 f"(stored ref={s['ref_low']}–{s['ref_high']} vs incoming {incoming[4]}–{incoming[5]}); "
@@ -359,16 +408,38 @@ def replace_member(
         con.executemany(
             "INSERT INTO lab_results (result_id, member_id, panel_id, marker, value, unit, panel_date) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [(f"{mid}:{r.panel_id}:{r.marker}", mid, r.panel_id, r.marker, r.value, r.unit, r.panel_date)
-             for r in results],
+            [
+                (
+                    f"{mid}:{r.panel_id}:{r.marker}",
+                    mid,
+                    r.panel_id,
+                    r.marker,
+                    r.value,
+                    r.unit,
+                    r.panel_date,
+                )
+                for r in results
+            ],
         )
         con.executemany(
             "INSERT INTO notes (note_id, member_id, note_date, source, text) VALUES (?, ?, ?, ?, ?)",
-            [(f"{mid}:note:{i}", mid, n.date, n.source, n.text) for i, n in enumerate(notes)],
+            [
+                (f"{mid}:note:{i}", mid, n.date, n.source, n.text)
+                for i, n in enumerate(notes)
+            ],
         )
         range_rows = [
-            (f"range:{rg.config_version}:{rg.sex}:{rg.marker}", rg.marker, rg.sex, rg.unit,
-             rg.ref_low, rg.ref_high, rg.panic_low, rg.panic_high, rg.config_version)
+            (
+                f"range:{rg.config_version}:{rg.sex}:{rg.marker}",
+                rg.marker,
+                rg.sex,
+                rg.unit,
+                rg.ref_low,
+                rg.ref_high,
+                rg.panic_low,
+                rg.panic_high,
+                rg.config_version,
+            )
             for rg in ranges
         ]
         _assert_ranges_consistent(con, range_rows)
@@ -388,6 +459,7 @@ def replace_member(
 # Phase 3a. The UNIQUE dedup_key makes "fire once" a DB guarantee, not application logic.
 # --------------------------------------------------------------------------------------------------
 
+
 def _insert_escalation(
     con: sqlite3.Connection,
     *,
@@ -396,26 +468,50 @@ def _insert_escalation(
     dedup_key: str,
     level: EscalationLevel,
     trigger_reason: str,
-    observation_id: Optional[str] = None,
-    interaction_id: Optional[str] = None,
-    created_at: Optional[str] = None,
+    observation_id: str | None = None,
+    interaction_id: str | None = None,
+    created_at: str | None = None,
 ) -> bool:
     """The escalation INSERT OR IGNORE without committing — so the scan can write it inside its own
     transaction (atomic with the interaction + observation). Returns ``True`` iff THIS call created the
     row. ``escalation_id`` derives deterministically from the dedup_key (the PK must be at least as
     collision-resistant as the UNIQUE it backs, else two dedup_keys colliding on a short PK prefix would
-    drop the second via INSERT OR IGNORE on the PK instead of deduping correctly on dedup_key)."""
+    drop the second via INSERT OR IGNORE on the PK instead of deduping correctly on dedup_key).
+
+    Level UPGRADE on conflict: a ``chat`` escalation's dedup_key is day-scoped, so a later ``urgent``
+    turn can land on a row that an earlier ``clinician_review`` turn created the same day. A bare INSERT
+    OR IGNORE would drop the urgent one, leaving the clinician queue showing the lower level and masking
+    the acute event — so an existing ``clinician_review`` row is UPGRADED to ``urgent`` (and repointed at
+    the urgent interaction/reason). Only that one direction upgrades; an equal or lower incoming level is
+    left untouched, so a re-emitted ``data_finding`` (deterministic, same level by construction) and the
+    fire-once guarantee are unaffected, and an escalation is never silently downgraded."""
     if created_at is None:
-        created_at = datetime.now(timezone.utc).isoformat()
+        created_at = datetime.now(UTC).isoformat()
     escalation_id = _det_id("esc:", dedup_key)
     cur = con.execute(
         "INSERT OR IGNORE INTO escalations "
         "(escalation_id, member_id, kind, dedup_key, level, observation_id, interaction_id, trigger_reason, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (escalation_id, member_id, kind, dedup_key, level, observation_id, interaction_id,
-         trigger_reason, created_at),
+        (
+            escalation_id,
+            member_id,
+            kind,
+            dedup_key,
+            level,
+            observation_id,
+            interaction_id,
+            trigger_reason,
+            created_at,
+        ),
     )
-    return cur.rowcount == 1
+    created = cur.rowcount == 1
+    if not created and level == "urgent":
+        con.execute(
+            "UPDATE escalations SET level = 'urgent', trigger_reason = ?, interaction_id = ? "
+            "WHERE dedup_key = ? AND level = 'clinician_review'",
+            (trigger_reason, interaction_id, dedup_key),
+        )
+    return created
 
 
 def emit_escalation(con: sqlite3.Connection, **kwargs) -> bool:
@@ -443,14 +539,15 @@ def emit_escalation(con: sqlite3.Connection, **kwargs) -> bool:
 # INSERT OR IGNORE simply always inserts and `driver` distinguishes the two write disciplines.
 # --------------------------------------------------------------------------------------------------
 
+
 def write_interaction(
     con: sqlite3.Connection,
     resp: HealthIntelligenceResponse,
     *,
     member_id: str,
     driver: str,
-    question: Optional[str] = None,
-    created_at: Optional[str] = None,
+    question: str | None = None,
+    created_at: str | None = None,
 ) -> str:
     """Persist one ``HealthIntelligenceResponse`` as an ``interactions`` row (INSERT OR IGNORE on the
     ``response_id`` PK) and return its ``response_id`` (from ``resp.metadata`` — the caller owns id
@@ -458,16 +555,30 @@ def write_interaction(
     verbatim as ``response_json``; the typed columns mirror its disposition axes + version tuple. Does
     NOT commit — the caller's transaction owns it."""
     if created_at is None:
-        created_at = datetime.now(timezone.utc).isoformat()
+        created_at = datetime.now(UTC).isoformat()
     m = resp.metadata
     con.execute(
         "INSERT OR IGNORE INTO interactions "
         "(response_id, member_id, driver, question, response_json, answer_disposition, escalation, "
         " data_version, model_version, config_version, prompt_version, latency_ms, tokens, cost_usd, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (m.response_id, member_id, driver, question, resp.model_dump_json(),
-         resp.answer_disposition, resp.escalation, m.data_version, m.model_version,
-         m.config_version, m.prompt_version, m.latency_ms, m.tokens, m.cost_usd, created_at),
+        (
+            m.response_id,
+            member_id,
+            driver,
+            question,
+            resp.model_dump_json(),
+            resp.answer_disposition,
+            resp.escalation,
+            m.data_version,
+            m.model_version,
+            m.config_version,
+            m.prompt_version,
+            m.latency_ms,
+            m.tokens,
+            m.cost_usd,
+            created_at,
+        ),
     )
     return m.response_id
 
@@ -481,13 +592,20 @@ def write_observation(con: sqlite3.Connection, obs: Observation) -> None:
         "INSERT OR IGNORE INTO observations "
         "(observation_id, member_id, response_id, severity, title, trigger_reason, data_version) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (obs.observation_id, obs.member_id, obs.response_id, obs.severity, obs.title,
-         obs.trigger_reason, obs.data_version),
+        (
+            obs.observation_id,
+            obs.member_id,
+            obs.response_id,
+            obs.severity,
+            obs.title,
+            obs.trigger_reason,
+            obs.data_version,
+        ),
     )
 
 
 def get_observations(
-    con: sqlite3.Connection, member_id: str, *, data_version: Optional[str] = None
+    con: sqlite3.Connection, member_id: str, *, data_version: str | None = None
 ) -> list[Observation]:
     """The member's observations at one ``data_version`` (defaults to the *current* persisted record),
     ranked by severity. Version-scoping is how "a re-scan replaces, not appends" reaches the member: a
@@ -502,8 +620,12 @@ def get_observations(
     ).fetchall()
     obs = [
         Observation(
-            observation_id=r["observation_id"], member_id=r["member_id"], response_id=r["response_id"],
-            severity=r["severity"], title=r["title"], trigger_reason=r["trigger_reason"],
+            observation_id=r["observation_id"],
+            member_id=r["member_id"],
+            response_id=r["response_id"],
+            severity=r["severity"],
+            title=r["title"],
+            trigger_reason=r["trigger_reason"],
             data_version=r["data_version"],
         )
         for r in rows
@@ -522,9 +644,14 @@ def get_escalations(con: sqlite3.Connection, member_id: str) -> list[Escalation]
     ).fetchall()
     return [
         Escalation(
-            escalation_id=r["escalation_id"], member_id=r["member_id"], kind=r["kind"],
-            dedup_key=r["dedup_key"], level=r["level"], observation_id=r["observation_id"],
-            interaction_id=r["interaction_id"], trigger_reason=r["trigger_reason"],
+            escalation_id=r["escalation_id"],
+            member_id=r["member_id"],
+            kind=r["kind"],
+            dedup_key=r["dedup_key"],
+            level=r["level"],
+            observation_id=r["observation_id"],
+            interaction_id=r["interaction_id"],
+            trigger_reason=r["trigger_reason"],
             created_at=r["created_at"],
         )
         for r in rows
@@ -537,6 +664,7 @@ def get_escalations(con: sqlite3.Connection, member_id: str) -> list[Escalation]
 # mutate the caller's inputs in place). Phase 2: feedback is empty, so it is a faithful pass-through.
 # --------------------------------------------------------------------------------------------------
 
+
 def _apply_overrides(
     results: list[LabResult],
     ranges: list[ReferenceRange],
@@ -546,7 +674,9 @@ def _apply_overrides(
     ReferenceRange), ``suppress_marker`` (drop a marker's results+ranges), and ``preference`` (a
     composer hint, not an analysis input) here. Phase 2 applies none — returns shallow copies so the
     new-lists contract holds even with an empty override set."""
-    del overrides  # reserved (Phase 7 applies them); Phase 2 has no active overrides to fold in
+    del (
+        overrides
+    )  # reserved (Phase 7 applies them); Phase 2 has no active overrides to fold in
     return list(results), list(ranges)
 
 
@@ -563,7 +693,8 @@ def resolve_overrides(
     ).fetchall()
     overrides = [
         Feedback(
-            kind=r["kind"], target=r["target"],
+            kind=r["kind"],
+            target=r["target"],
             payload=json.loads(r["payload_json"]) if r["payload_json"] else None,
             source=r["source"],
         )
@@ -576,9 +707,10 @@ def resolve_overrides(
 # Assembly — everything analyze() needs for one member, override-resolved.
 # --------------------------------------------------------------------------------------------------
 
+
 def load_for_analysis(
     con: sqlite3.Connection, member_id: str
-) -> tuple[MemberProfile, list[LabResult], list[ReferenceRange], Optional[int], str]:
+) -> tuple[MemberProfile, list[LabResult], list[ReferenceRange], int | None, str]:
     """Assemble ``(member, results, ranges, age, data_version)`` for ``analyze``. Raises ``KeyError``
     if the member is absent. ``data_version`` is computed over the raw persisted record (pre-override)
     — overrides are a separately-versioned learning artifact, so the fingerprint tracks the source of

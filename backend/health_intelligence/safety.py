@@ -16,8 +16,6 @@ string compare, since lexicographically "clinician_review" < "none" would invert
 
 from __future__ import annotations
 
-from typing import Optional
-
 from health_intelligence.models import (
     FLOOR_ORDER,
     SEVERITY_TO_FLOOR,
@@ -41,7 +39,7 @@ def data_floor(analysis: TrajectoryAnalysis) -> FloorLevel:
     return analysis.overall_floor
 
 
-def severity_to_level(severity: Severity) -> Optional[EscalationLevel]:
+def severity_to_level(severity: Severity) -> EscalationLevel | None:
     """The escalation level a single marker's severity projects onto the clinician-review queue, or
     ``None`` when it doesn't escalate — derived from the SAME ``SEVERITY_TO_FLOOR`` table the core's
     whole-member ``_floor`` uses, so the max over a member's per-marker levels equals ``overall_floor``
@@ -55,7 +53,16 @@ def meets_floor(escalation: FloorLevel, floor: FloorLevel) -> bool:
     return FLOOR_ORDER[escalation] >= FLOOR_ORDER[floor]
 
 
-def validate(resp: HealthIntelligenceResponse, floor: FloorLevel) -> HealthIntelligenceResponse:
+def max_floor(a: FloorLevel, b: FloorLevel) -> FloorLevel:
+    """The higher of two floors on the ranked escalation axis — the ``floor = max(data, message)`` of the
+    Mode-2 turn (architecture §2 D4), and the ``max`` of the gate's classification with the deterministic
+    emergency-phrase floor inside the gate. Ranked through ``FLOOR_ORDER``, never string-compared."""
+    return a if FLOOR_ORDER[a] >= FLOOR_ORDER[b] else b
+
+
+def validate(
+    resp: HealthIntelligenceResponse, floor: FloorLevel
+) -> HealthIntelligenceResponse:
     """Enforce ``resp.escalation >= floor`` and return the response unchanged when it passes. Raises
     :class:`FloorViolation` otherwise — the validator never silently *raises* the response's escalation
     to meet the floor (that would mask a generator that under-escalated); the caller owns the repair."""

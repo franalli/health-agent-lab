@@ -2,17 +2,44 @@
 name = "health-intelligence"
 version = "0.1.0"
 description = "Health Intelligence Service — an LLM language layer over a deterministic analytical core, atop a member's longitudinal lab history. Synthetic data only; not for clinical use."
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.13.4",
-    "fastapi>=0.115",
-    "uvicorn>=0.34",
+    "fastapi>=0.138.1",
+    "uvicorn>=0.49.0",
+    "anthropic>=0.112.0",      # Phase 4: the LLM provider — imported ONLY by health_intelligence/llm.py
+    "python-dotenv>=1.2.2",   # load backend/.env (ANTHROPIC_API_KEY) at app startup — secrets/runtime only
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
-    "httpx>=0.28",
+    "httpx>=0.28.1",
+    "pre-commit>=4.6.0",      # git hook runner — config at repo root (.pre-commit-config.yaml)
+    "ruff>=0.15.20",           # linter + formatter; pinned again in .pre-commit-config.yaml for the hook
+]
+
+[tool.ruff]
+target-version = "py312"   # matches requires-python = ">=3.12"
+line-length = 88
+
+[tool.ruff.lint]
+# E/F = pyflakes + pycodestyle, I = import sorting, UP = pyupgrade, B = bugbear.
+# Modest set: catches real defects and stale idioms without imposing heavy churn.
+select = ["E", "F", "I", "UP", "B"]
+# E501 (line-too-long) is left to the formatter for code; this repo's long, documented
+# inline comments are intentional, so we don't gate commits on their width.
+ignore = ["E501"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection markers are *meant* to be called in argument defaults;
+# they're effectively immutable, so B008 (function-call-in-default) does not apply.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Body",
+    "fastapi.Path",
+    "fastapi.Header",
 ]
 
 [build-system]

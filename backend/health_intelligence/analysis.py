@@ -38,7 +38,7 @@ import math
 from collections import Counter
 from datetime import date
 from statistics import NormalDist, median
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 from health_intelligence.config import AnalysisConfig, MarkerConfig
 from health_intelligence.models import (
@@ -75,8 +75,8 @@ class _MarkerWork(NamedTuple):
     marker: str
     unit: str
     series: list[Reading]
-    trend: Optional[TrendResult]
-    change: Optional[ClinicalChange]
+    trend: TrendResult | None
+    change: ClinicalChange | None
     flags: list[Flag]
     mcfg: MarkerConfig
 
@@ -85,11 +85,12 @@ class _MarkerWork(NamedTuple):
 # Public entry point — pure: identical inputs give identical output.
 # --------------------------------------------------------------------------------------------------
 
+
 def analyze(
     member: MemberProfile,
     results: list[LabResult],
     ranges: list[ReferenceRange],
-    age: Optional[int],
+    age: int | None,
     cfg: AnalysisConfig,
     *,
     data_version: str,
@@ -106,20 +107,24 @@ def analyze(
     for marker in _ordered_markers(results):
         mcfg = cfg.markers.get(marker, MarkerConfig())
         series = _series(results, marker)
-        work.append(_MarkerWork(
-            marker=marker,
-            unit=_unit(results, marker),
-            series=series,
-            trend=_trend(series, cfg),
-            change=_clinical_change(series, mcfg, cfg.stats.rcv_z),
-            flags=_flags(series, _range_for(marker, member.sex, age, ranges), mcfg),
-            mcfg=mcfg,
-        ))
+        work.append(
+            _MarkerWork(
+                marker=marker,
+                unit=_unit(results, marker),
+                series=series,
+                trend=_trend(series, cfg),
+                change=_clinical_change(series, mcfg, cfg.stats.rcv_z),
+                flags=_flags(series, _range_for(marker, member.sex, age, ranges), mcfg),
+                mcfg=mcfg,
+            )
+        )
 
     # Cross-marker pass — Benjamini-Hochberg over the p<alpha candidates sets `significant` (see _fdr).
     significant = _fdr([(w.marker, w.trend) for w in work if w.trend is not None], cfg)
     for w in work:
-        if w.trend is not None:  # only trended markers are in `significant`; also narrows the Optional
+        if (
+            w.trend is not None
+        ):  # only trended markers are in `significant`; also narrows the Optional
             w.trend.significant = significant[w.marker]
 
     # Pass 2 — assemble each trajectory with its direction-aware severity, then project the floor.
@@ -147,6 +152,7 @@ def analyze(
 # Series + range selection
 # --------------------------------------------------------------------------------------------------
 
+
 def _ordered_markers(results: list[LabResult]) -> list[str]:
     """Distinct markers in first-seen order (stable output ordering, no set nondeterminism)."""
     seen: dict[str, None] = {}
@@ -165,22 +171,26 @@ def _unit(results: list[LabResult], marker: str) -> str:
     return next((r.unit for r in results if r.marker == marker), "")
 
 
-def _range_for(marker: str, sex: str, age: Optional[int], ranges: list[ReferenceRange]) -> Optional[ReferenceRange]:
+def _range_for(
+    marker: str, sex: str, age: int | None, ranges: list[ReferenceRange]
+) -> ReferenceRange | None:
     """The applicable band: the (marker, sex) row, else the sex-agnostic (marker, 'any') row, else
     None — so 'other'/'unknown' members and non-sex-split markers both resolve to 'any', and a marker
     with no band at all yields the typed ``no_reference`` flag downstream. ``age`` is in the
     architecture's signature for future age-banded ranges; the supplied data has none, so it is unused."""
-    del age  # reserved (no age-banded ranges in the data); keeps the documented signature
+    del (
+        age
+    )  # reserved (no age-banded ranges in the data); keeps the documented signature
     cands = [r for r in ranges if r.marker == marker]
-    return (
-        next((r for r in cands if r.sex == sex), None)
-        or next((r for r in cands if r.sex == "any"), None)
+    return next((r for r in cands if r.sex == sex), None) or next(
+        (r for r in cands if r.sex == "any"), None
     )
 
 
 # --------------------------------------------------------------------------------------------------
 # Mann-Kendall (monotonic trend) — tie-aware S, exact small-sample p
 # --------------------------------------------------------------------------------------------------
+
 
 def _kendall_s(values: list[float]) -> int:
     """Kendall's S over the time-ordered values: sum of sign(v_j - v_i) for i<j; ties contribute 0."""
@@ -212,10 +222,14 @@ def _mk_pvalue(values: list[float], s: int) -> float:
     if s == 0:
         return 1.0
     if len(set(values)) == n and n <= _EXACT_DP_MAX:
-        return _exact_p_inversions(n, s)   # distinct: fast exact via the inversion-count distribution
+        return _exact_p_inversions(
+            n, s
+        )  # distinct: fast exact via the inversion-count distribution
     if n <= _EXACT_ENUM_MAX:
-        return _exact_p_enum(values, s)     # ties: exact via full multiset-ordering enumeration
-    return _normal_p(values, s)             # large n with ties: tie-corrected normal approximation
+        return _exact_p_enum(
+            values, s
+        )  # ties: exact via full multiset-ordering enumeration
+    return _normal_p(values, s)  # large n with ties: tie-corrected normal approximation
 
 
 def _exact_p_enum(values: list[float], s_obs: int) -> float:
@@ -273,7 +287,8 @@ def _s_variance(values: list[float]) -> float:
 # Theil-Sen (direction, rate, distribution-free CI)
 # --------------------------------------------------------------------------------------------------
 
-def _theil_sen(series: list[Reading]) -> tuple[Optional[float], list[float]]:
+
+def _theil_sen(series: list[Reading]) -> tuple[float | None, list[float]]:
     """Median of pairwise slopes (per day) and the sorted slope list (for the CI)."""
     pts = [(date.fromisoformat(r.date).toordinal(), r.value) for r in series]
     slopes = [
@@ -288,11 +303,15 @@ def _theil_sen(series: list[Reading]) -> tuple[Optional[float], list[float]]:
     return median(slopes), slopes
 
 
-def _theil_sen_ci(slopes: list[float], values: list[float], ci_level: float) -> tuple[float, float]:
+def _theil_sen_ci(
+    slopes: list[float], values: list[float], ci_level: float
+) -> tuple[float, float]:
     """Gilbert (1987) distribution-free CI from Var(S): the limits are order statistics of the
     pairwise slopes at ranks (N -/+ C)/2, C = Z * sqrt(Var(S))."""
     nslopes = len(slopes)
-    c = NormalDist().inv_cdf(1.0 - (1.0 - ci_level) / 2.0) * math.sqrt(_s_variance(values))
+    c = NormalDist().inv_cdf(1.0 - (1.0 - ci_level) / 2.0) * math.sqrt(
+        _s_variance(values)
+    )
     lo = _clamp(int(round((nslopes - c) / 2.0)) - 1, 0, nslopes - 1)
     hi = _clamp(int(round((nslopes + c) / 2.0)), 0, nslopes - 1)
     return slopes[lo], slopes[hi]
@@ -306,7 +325,8 @@ def _clamp(i: int, lo: int, hi: int) -> int:
 # _trend — Mann-Kendall + Theil-Sen assembled; None below n_min (no trend claimed, not a noisy one)
 # --------------------------------------------------------------------------------------------------
 
-def _trend(series: list[Reading], cfg: AnalysisConfig) -> Optional[TrendResult]:
+
+def _trend(series: list[Reading], cfg: AnalysisConfig) -> TrendResult | None:
     n = len(series)
     if n < cfg.stats.n_min:
         return None
@@ -337,7 +357,10 @@ def _trend(series: list[Reading], cfg: AnalysisConfig) -> Optional[TrendResult]:
 # _clinical_change — Reference Change Value (clinical trend-vs-noise gate)
 # --------------------------------------------------------------------------------------------------
 
-def _clinical_change(series: list[Reading], mcfg: MarkerConfig, rcv_z: float) -> Optional[ClinicalChange]:
+
+def _clinical_change(
+    series: list[Reading], mcfg: MarkerConfig, rcv_z: float
+) -> ClinicalChange | None:
     """RCV = sqrt(2)*Z*sqrt(CVa^2 + CVi^2) (Z from cfg.stats.rcv_z); the net (latest-vs-earliest) percent
     change clears it or is noise. CVa or CVi absent -> typed skip-path (``exceeds_rcv = None``): the
     trend is judged on Mann-Kendall + Theil-Sen CI alone, never silently treated as cleared-or-not."""
@@ -347,7 +370,7 @@ def _clinical_change(series: list[Reading], mcfg: MarkerConfig, rcv_z: float) ->
     net = ((latest - baseline) / baseline * 100.0) if baseline != 0 else None
     if mcfg.cva is None or mcfg.cvi is None:
         return ClinicalChange(rcv=None, net_change=net, exceeds_rcv=None)
-    rcv = math.sqrt(2.0) * rcv_z * math.sqrt(mcfg.cva ** 2 + mcfg.cvi ** 2)
+    rcv = math.sqrt(2.0) * rcv_z * math.sqrt(mcfg.cva**2 + mcfg.cvi**2)
     exceeds = (abs(net) >= rcv) if net is not None else None
     return ClinicalChange(rcv=rcv, net_change=net, exceeds_rcv=exceeds)
 
@@ -356,7 +379,10 @@ def _clinical_change(series: list[Reading], mcfg: MarkerConfig, rcv_z: float) ->
 # _flags — range / panic / band on the latest value (work at n=1; band-cross needs n>=2)
 # --------------------------------------------------------------------------------------------------
 
-def _flags(series: list[Reading], rng: Optional[ReferenceRange], mcfg: MarkerConfig) -> list[Flag]:
+
+def _flags(
+    series: list[Reading], rng: ReferenceRange | None, mcfg: MarkerConfig
+) -> list[Flag]:
     if rng is None:
         return ["no_reference"]
     latest = series[-1].value
@@ -377,7 +403,7 @@ def _flags(series: list[Reading], rng: Optional[ReferenceRange], mcfg: MarkerCon
     return flags
 
 
-def _band_index(value: float, mcfg: MarkerConfig) -> Optional[int]:
+def _band_index(value: float, mcfg: MarkerConfig) -> int | None:
     """Which discrete band the value sits in (cut-points: count thresholds cleared; graded: the [low,
     high) segment). ``None`` when the marker has no band concept OR the value falls outside every
     graded band — both mean 'no band to compare', so a band-cross is not inferred against it."""
@@ -385,7 +411,9 @@ def _band_index(value: float, mcfg: MarkerConfig) -> Optional[int]:
         return sum(1 for cut in mcfg.band_cutpoints if value >= cut)
     if mcfg.graded_bands:
         for idx, band in enumerate(mcfg.graded_bands):
-            if (band.low is None or value >= band.low) and (band.high is None or value < band.high):
+            if (band.low is None or value >= band.low) and (
+                band.high is None or value < band.high
+            ):
                 return idx
         return None  # outside all graded bands -> no band (not a sentinel index that would fake a cross)
     return None
@@ -394,6 +422,7 @@ def _band_index(value: float, mcfg: MarkerConfig) -> Optional[int]:
 # --------------------------------------------------------------------------------------------------
 # Cross-marker FDR — Benjamini-Hochberg over the p<alpha candidates (see module-docstring note)
 # --------------------------------------------------------------------------------------------------
+
 
 def _fdr(trends: list[tuple[str, TrendResult]], cfg: AnalysisConfig) -> dict[str, bool]:
     """Set per-marker significance. The doc's ``p < alpha`` trigger defines the candidate family; BH at
@@ -410,7 +439,11 @@ def _fdr(trends: list[tuple[str, TrendResult]], cfg: AnalysisConfig) -> dict[str
     for rank, (_, t) in enumerate(candidates, start=1):
         if t.p_value <= (rank / m) * q:
             max_rank = rank
-    survivors = {marker for rank, (marker, _) in enumerate(candidates, start=1) if rank <= max_rank}
+    survivors = {
+        marker
+        for rank, (marker, _) in enumerate(candidates, start=1)
+        if rank <= max_rank
+    }
     return {marker: (marker in survivors) for marker, _ in trends}
 
 
@@ -418,17 +451,20 @@ def _fdr(trends: list[tuple[str, TrendResult]], cfg: AnalysisConfig) -> dict[str
 # Severity (direction-aware) + floor projection
 # --------------------------------------------------------------------------------------------------
 
-def _is_adverse(direction: str, adverse: Optional[str]) -> bool:
+
+def _is_adverse(direction: str, adverse: str | None) -> bool:
     """A signed trend moving the wrong way. ``adverse is None`` (uncurated / bidirectional, e.g.
     Potassium) -> not classifiable, so it never raises severity (panic, not trend, guards those)."""
     if adverse is None:
         return False
-    return (direction == "increasing" and adverse == "up") or (direction == "decreasing" and adverse == "down")
+    return (direction == "increasing" and adverse == "up") or (
+        direction == "decreasing" and adverse == "down"
+    )
 
 
 def _severity(
-    trend: Optional[TrendResult],
-    change: Optional[ClinicalChange],
+    trend: TrendResult | None,
+    change: ClinicalChange | None,
     flags: list[Flag],
     mcfg: MarkerConfig,
 ) -> Severity:
@@ -448,11 +484,19 @@ def _severity(
     if any(f in flags for f in ("below_range", "above_range", "band_cross")):
         raise_to("notable")
 
-    if trend is not None and trend.significant and _is_adverse(trend.direction, mcfg.adverse_direction):
+    if (
+        trend is not None
+        and trend.significant
+        and _is_adverse(trend.direction, mcfg.adverse_direction)
+    ):
         if change is not None and change.exceeds_rcv is True:
-            raise_to("attention")    # RCV + FDR confirmed adverse trend -> counts toward the floor
+            raise_to(
+                "attention"
+            )  # RCV + FDR confirmed adverse trend -> counts toward the floor
         elif change is None or change.exceeds_rcv is None:
-            raise_to("notable")      # no CVa/CVi -> surfaced on MK + CI, not escalated without RCV
+            raise_to(
+                "notable"
+            )  # no CVa/CVi -> surfaced on MK + CI, not escalated without RCV
         # change.exceeds_rcv is False -> net change within biological noise (RCV) -> not a counted trend
 
     if "panic_low" in flags or "panic_high" in flags:
