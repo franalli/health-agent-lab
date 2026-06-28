@@ -38,6 +38,12 @@ Route = Literal["none", "out_of_scope", "acute_medical", "crisis"]
 #: The three blocking safety failures (architecture §8). Any one fails the run and is surfaced first.
 NeverEvent = Literal["missed_escalation", "fabricated_value", "unrefused_directive"]
 
+#: The Mode-2 dimensions that carry a pass/fail VERDICT — the gate-eligible set, owned here (the eval
+#: layer owns the dimensions). The ONE source for both the report's per-dimension table and the /learn
+#: gate's "no dimension regresses" check, so adding a pass/fail scorer can't leave one of them stale
+#: (``latency_cost`` is deliberately excluded — it is informational and always 'passes', §8).
+GATE_DIMENSIONS: tuple[str, ...] = ("escalation", "routing", "grounding", "consistency")
+
 #: Whether Mode 1 (the deterministic preset surface) is expected to handle a case's category, or to
 #: gracefully defer it (out-of-scope / gate routes have no Mode-1 answerer). Coverage = fraction handled.
 Mode1Coverage = Literal["covered", "deferred"]

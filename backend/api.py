@@ -23,16 +23,18 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 
-from health_intelligence import db, pipeline
+from health_intelligence import db, learn, pipeline
 from health_intelligence.models import (
     AskRequest,
     Escalation,
+    Feedback,
     HealthIntelligenceResponse,
     MemberBundle,
     Observation,
     SuggestedPrompt,
 )
-from preprocessing.ingest import ingest_bundle
+from preprocessing.datasets import DEFAULT_DATASET
+from preprocessing.ingest import ingest_bundle, ingest_dataset
 
 # Load backend/.env into the process env at import (before any LLM provider is constructed) so the
 # Mode-2 path sees ANTHROPIC_API_KEY however the app is launched. A no-op when no .env is present (the
@@ -189,6 +191,81 @@ def post_ask(
         raise HTTPException(
             status_code=404, detail=f"member {member_id!r} not found"
         ) from None
+
+
+# --------------------------------------------------------------------------------------------------
+# Phase 7 — self-improvement + inspection. Still thin adapters: the override/reset/promotion LOGIC lives
+# in the library (db.py resolves corrections into analysis inputs; learn.py rule-assembles + gates a
+# candidate prompt), and the safety boundary (floor, validator, gate) is untouched (architecture §9).
+# --------------------------------------------------------------------------------------------------
+
+
+@app.post("/members/{member_id}/feedback")
+def post_feedback(
+    member_id: str, fb: Feedback, con: sqlite3.Connection = Depends(get_con)
+) -> dict[str, str]:
+    """Record a correction (range_override / suppress_marker / preference) or a signal (helpful /
+    incorrect / escalation_accept|reject). Overrides re-resolve into the core's inputs on the next
+    scan/ask (both modes); signals feed ``/learn``. 404 if the member is absent."""
+    if db.get_member(con, member_id) is None:
+        raise HTTPException(status_code=404, detail=f"member {member_id!r} not found")
+    return {"feedback_id": db.insert_feedback(con, member_id, fb)}
+
+
+@app.get("/members/{member_id}/trajectory")
+def get_trajectory(
+    member_id: str,
+    marker: str | None = None,
+    con: sqlite3.Connection = Depends(get_con),
+) -> list[dict]:
+    """Full per-marker series for inspection/plotting (architecture §13/§751): readings + the analysis
+    pass's trend/flags/Theil–Sen line + reference range. A UI/operator read for charting + human
+    verification — the LLM NEVER receives the raw series, only the collapsed verdict. Optional
+    ``?marker=`` narrows to one. 404 if the member is absent."""
+    try:
+        return pipeline.trajectory(con, member_id, marker=marker)
+    except KeyError:
+        raise HTTPException(
+            status_code=404, detail=f"member {member_id!r} not found"
+        ) from None
+
+
+@app.post("/reset")
+def post_reset(con: sqlite3.Connection = Depends(get_con)) -> dict:
+    """Erase learning -> v0 (architecture §9): deactivate all feedback and revert promoted prompts to the
+    baseline. NOT a data wipe — the dataset, members, and the learning trail are preserved (that is
+    ``/admin/reseed``)."""
+    counts = db.reset_learning(con)
+    return {"learning_reset": True, **counts}
+
+
+@app.post("/learn")
+def post_learn(con: sqlite3.Connection = Depends(get_con)) -> dict:
+    """Prompt-scan: rule-assemble a candidate composer prompt from the active feedback signals, gate it
+    through the eval harness IN-PROCESS, and promote or reject (architecture §9). Guarded against credit
+    drain (single-flight lock · feedback-set debounce · structural pre-check · daily cap). 409 if a run
+    is already in progress; 503 if no working LLM (it measures the candidate's real outputs, so it can't
+    meaningfully gate a degraded run)."""
+    try:
+        return learn.run_learn(con)
+    except learn.LearnBusy as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except learn.LearnUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+@app.post("/admin/reseed")
+def post_reseed(con: sqlite3.Connection = Depends(get_con)) -> dict:
+    """Factory reset (demo hygiene; distinct from ``/reset``): flush the whole app back to its initial
+    state — a full NUKE (DROP + recreate every table via ``db.nuke_all``), then re-ingest the shipped
+    ``training_data`` bundle (architecture §756: "the training_data bundle only"). Pinned to
+    ``DEFAULT_DATASET`` deliberately, NOT the active ``DATASET`` env, so a factory reset always restores
+    the original 15 members regardless of which bundle is selected; uploaded holdouts, feedback, learning,
+    and the audit trail are all dropped, and the prompt reverts to the v0 baseline (empty
+    ``prompt_versions`` → composer falls back to BASE). An operator op, not a member feature."""
+    db.nuke_all(con)
+    summary = ingest_dataset(con, DEFAULT_DATASET)
+    return {"reseeded": True, **summary}
 
 
 # Serve the static member surface on the same origin (Phase 6 ships frontend/index.html). Mounted LAST

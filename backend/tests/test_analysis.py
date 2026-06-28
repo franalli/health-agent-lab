@@ -118,8 +118,10 @@ def test_seeded_slope_is_detected_and_its_rate_recovered():
 # --------------------------------------------------------------------------------------------------
 
 
-def test_n3_is_too_short_to_call_a_trend_but_flags_still_compute():
-    # C12: only 3 panels, eGFR 75 -> 61 (below the >=90 range). n=3 < n_min=4 -> no trend claimed.
+def test_n3_abstains_on_the_trend_but_escalates_a_monotonic_rcv_clearing_decline():
+    # C12 / E12: only 3 panels, eGFR 75 -> 68 -> 61 (below the >=90 range). n=3 < n_min=4, so NO trend
+    # is claimed (MK's exact p floors at 0.33 there — FDR unreachable). But the decline is strictly
+    # monotonic and clears RCV, so the sub-n_min rule (Fix 2) escalates it to clinician_review.
     out = analysis.analyze(
         _member("C12"),
         _results("eGFR", "mL/min/1.73m2", [75.0, 68.0, 61.0]),
@@ -129,12 +131,67 @@ def test_n3_is_too_short_to_call_a_trend_but_flags_still_compute():
         data_version="d1",
     )
     egfr = _marker(out, "eGFR")
-    assert egfr.trend is None  # honest abstention, a first-class verdict
+    assert (
+        egfr.trend is None
+    )  # honest abstention on the trend — no MK/Theil-Sen verdict at n=3
     assert "below_range" in egfr.flags  # range flags still compute at n<n_min
-    assert egfr.severity == "notable"  # out-of-range is at most notable...
-    # NOTE (architecture-vs-eval, settle in Phase 5): out-of-range is `notable` and the trend abstains,
-    # so the floor is `none` here, while eval E12 expects a routine clinician review. A sub-n_min
-    # escalation policy is a *rule*, not a constant; Phase 1 implements the documented abstention.
+    assert (
+        egfr.clinical_change.exceeds_rcv is True
+    )  # the 2-point RCV test IS valid at low n
+    assert (
+        egfr.severity == "attention"
+    )  # monotonic + adverse + RCV -> escalates (Fix 2)
+    assert out.overall_floor == "clinician_review"  # matching eval E12
+
+
+def test_sparse_rule_refuses_volatile_within_rcv_improving_and_uncurated():
+    # The §6 stress matrix: the sub-n_min rule must fire ONLY on a consistent, beyond-noise, adverse
+    # move — and refuse everything else. This is what makes it a generalizing rule, not a C12 patch.
+    def floor_of(values, ref_low=90.0):
+        out = analysis.analyze(
+            _member("T"),
+            _results("eGFR", "mL/min/1.73m2", values),
+            [_range("eGFR", ref_low=ref_low)],
+            age=58,
+            cfg=CFG,
+            data_version="d1",
+        )
+        return _marker(out, "eGFR").severity, out.overall_floor
+
+    assert floor_of([75.0, 68.0, 61.0]) == (
+        "attention",
+        "clinician_review",
+    )  # consistent decline: fires
+    assert floor_of([75.0, 90.0, 61.0]) == (
+        "notable",
+        "none",
+    )  # volatile V-shape: monotonicity blocks
+    assert floor_of([75.0, 74.0, 73.0]) == (
+        "notable",
+        "none",
+    )  # mild: within RCV, RCV gate blocks
+    # rising eGFR is the GOOD direction (adverse is "down") -> not adverse -> never escalates
+    assert floor_of([61.0, 68.0, 75.0], ref_low=90.0)[1] == "none"
+
+
+def test_sparse_rule_does_not_fire_without_cva_cvi():
+    # A marker with no curated CVa/CVi cannot confirm "beyond noise" (exceeds_rcv is None), so a
+    # monotonic adverse sparse change is surfaced (notable) but NEVER escalated — same discipline as the
+    # n>=n_min path. "Ferritin" carries CV data in config; use an uncurated synthetic marker instead.
+    out = analysis.analyze(
+        _member("T"),
+        _results(
+            "ZZZ unknown marker", "u", [50.0, 40.0, 30.0]
+        ),  # monotonic down, no config entry
+        [_range("ZZZ unknown marker", ref_low=60.0)],
+        age=58,
+        cfg=CFG,
+        data_version="d1",
+    )
+    zzz = _marker(out, "ZZZ unknown marker")
+    assert zzz.trend is None
+    assert zzz.clinical_change.exceeds_rcv is None  # no CVa/CVi -> unconfirmable
+    assert zzz.severity == "notable"  # surfaced (below range) but NOT escalated
     assert out.overall_floor == "none"
 
 
@@ -163,6 +220,103 @@ def test_in_range_noise_reads_as_noise_not_a_trend():
     assert egfr.clinical_change.exceeds_rcv is False
     assert egfr.severity == "info"
     assert out.overall_floor == "none"
+
+
+# --------------------------------------------------------------------------------------------------
+# Direction resolved by the significance test when a tie flattens the Theil-Sen CI (C11 / E11)
+# --------------------------------------------------------------------------------------------------
+
+
+def _trend_obj(direction, tau, *, significant, p_value=0.02):
+    """A bare TrendResult to exercise `_resolve_direction` in isolation (the core ethos: unit-test the
+    rule, not just the member)."""
+    return TrendResult(
+        direction=direction, tau=tau, p_value=p_value, n=5, significant=significant
+    )
+
+
+def test_resolve_direction_signs_a_significant_flat_trend_and_only_that():
+    # The whole truth table for the post-FDR direction refinement, in isolation.
+    t = _trend_obj("flat", 0.8, significant=True)
+    analysis._resolve_direction(t)
+    assert t.direction == "increasing"  # significant + flat + tau>0 -> signed up
+
+    t = _trend_obj("flat", -0.8, significant=True)
+    analysis._resolve_direction(t)
+    assert t.direction == "decreasing"  # significant + flat + tau<0 -> signed down
+
+    t = _trend_obj("increasing", 0.9, significant=True)
+    analysis._resolve_direction(t)
+    assert t.direction == "increasing"  # already signed -> untouched
+
+    t = _trend_obj("flat", 0.8, significant=False)
+    analysis._resolve_direction(t)
+    assert (
+        t.direction == "flat"
+    )  # NOT significant -> the CI's abstention stands (no MK override)
+
+    t = _trend_obj("flat", 0.0, significant=True)
+    analysis._resolve_direction(t)
+    assert (
+        t.direction == "flat"
+    )  # tau==0 (S==0) -> no direction to sign (and never significant anyway)
+
+
+def test_significant_trend_flattened_by_a_tie_is_signed_by_mann_kendall():
+    # C11/E11: HbA1c 5.6 -> 5.9 with a repeated 5.7 — a zero-slope pair pins the Theil-Sen CI's lower
+    # bound at 0, so `_trend` alone calls it "flat" and the adverse trend is silently dropped. MK
+    # certifies the trend (p < alpha), so direction resolves to "increasing" and, being adverse-up and
+    # RCV-clearing, it escalates — the floor C11 was missing.
+    out = analysis.analyze(
+        _member("C11"),
+        _results("HbA1c", "%", [5.6, 5.7, 5.7, 5.8, 5.9]),
+        [_range("HbA1c", ref_high=5.6)],
+        age=61,
+        cfg=CFG,
+        data_version="d1",
+    )
+    hba1c = _marker(out, "HbA1c")
+    assert hba1c.trend.significant is True
+    lo, hi = hba1c.trend.slope_ci
+    assert (
+        lo <= 0 <= hi
+    )  # the Theil-Sen CI genuinely spans zero (the tie) — pre-fix this meant "flat"
+    assert hba1c.trend.direction == "increasing"  # ...yet MK signs it (Fix 1)
+    assert (
+        hba1c.trend.slope is None
+    )  # rate stays unasserted: the *magnitude* CI does span zero
+    assert hba1c.clinical_change.exceeds_rcv is True
+    assert (
+        hba1c.severity == "attention"
+    )  # adverse-up + RCV + now-signed -> counts toward the floor
+    assert out.overall_floor == "clinician_review"
+
+
+def test_resolved_direction_is_direction_only_not_a_new_escalation_path():
+    # Same tie-flattened significant shape, but *beneficial* (HbA1c falling, adverse_direction is "up").
+    # `_resolve_direction` signs it "decreasing" — yet it must NOT escalate: the adverse criterion still
+    # gates the floor. Proves Fix 1 only un-flattens direction; it never relaxes what escalates.
+    out = analysis.analyze(
+        _member("T-benign"),
+        _results("HbA1c", "%", [6.4, 6.3, 6.3, 6.2, 6.1]),
+        [
+            _range("HbA1c", ref_high=5.6)
+        ],  # above range (notable), but the move is the good direction
+        age=55,
+        cfg=CFG,
+        data_version="d1",
+    )
+    hba1c = _marker(out, "HbA1c")
+    assert hba1c.trend.significant is True
+    assert (
+        hba1c.trend.direction == "decreasing"
+    )  # signed by MK, just like the adverse case
+    assert (
+        hba1c.severity == "notable"
+    )  # ...but beneficial -> the trend adds nothing over the range flag
+    assert (
+        out.overall_floor == "none"
+    )  # no escalation: direction resolution is not an escalation path
 
 
 # --------------------------------------------------------------------------------------------------

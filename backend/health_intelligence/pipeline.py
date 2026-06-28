@@ -12,18 +12,23 @@ context to ``templates.suggest_prompts``, which returns each chip bound to a pre
 ``HealthIntelligenceResponse`` (no model call). The ask path (gate -> compose -> validate) is added in
 Phase 4 alongside the LLM layer.
 
-Determinism & idempotency: all persisted PKs key on an ``analysis_version`` (the hash of exactly the
-inputs ``analyze`` reads — db.compute_analysis_version), so a re-scan of unchanged analysis inputs
-UPSERTs the same rows and re-emits the same dedup_key (a no-op) rather than duplicating, and an edit
-that doesn't touch the analysis (e.g. a note) cannot mint a second escalation. "Replace, not append"
-across genuine data changes is delivered by the version-scoped observation read, not by deletes.
+Determinism & idempotency: the scan's observation/audit PKs key on ``data_version`` and the data_finding
+escalation dedup keys on a PER-MARKER hash (``db.compute_marker_version`` — exactly that marker's
+override-resolved inputs), so a re-scan of unchanged inputs UPSERTs the same rows and re-emits the same
+dedup_key (a no-op) rather than duplicating; an edit that doesn't touch a marker's analysis (a note, or
+an override to a DIFFERENT marker) cannot mint a second escalation for it. "Replace, not append"
+across genuine data changes is delivered by the version-scoped observation read, not by deletes — with
+one targeted exception (Phase 7): a ``/feedback`` override changes the analysis WITHOUT bumping
+``data_version``, so the scan also prunes a now-cleared marker's observation at the unchanged
+``data_version`` (``db.prune_observations`` — escalation-pinned rows kept, never a blanket delete).
 """
 
 from __future__ import annotations
 
 import sqlite3
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from statistics import median
 
 from health_intelligence import db, gate, llm, safety, templates
 
@@ -105,29 +110,30 @@ def scan(con: sqlite3.Connection, member_id: str) -> list[Observation]:
 
     Each raised marker becomes one finding persisted as its own ``interactions`` row (architecture §48),
     keyed by a deterministic data_version-scoped ``response_id`` so an identical re-scan is a no-op and a
-    genuine data change retains the prior audit row. The data_finding escalation dedup keys on
-    ``analysis_version`` instead (the §48 finding-stable resolution): a notes-/profile-only edit moves
-    data_version but not analysis_version, so it writes fresh audit rows without re-queuing a clinician
-    task. All writes for the scan run in ONE transaction (atomic — no partial interaction/observation/
-    escalation set on a crash)."""
+    genuine data change retains the prior audit row. The data_finding escalation dedup keys on the
+    PER-MARKER ``compute_marker_version`` (the §48 finding-stable resolution): a notes-/profile-only edit,
+    or an override to a DIFFERENT marker, leaves this marker's version unmoved, so it writes fresh audit
+    rows without re-queuing a clinician task. All writes for the scan run in ONE transaction (atomic — no
+    partial interaction/observation/escalation set on a crash)."""
     member, results, ranges, age, data_version = db.load_for_analysis(con, member_id)
     analysis = analyze(
         member, results, ranges, age, ANALYSIS_CONFIG, data_version=data_version
-    )
-    analysis_version = db.compute_analysis_version(
-        results=results, ranges=ranges, sex=member.sex, age=age
     )
     floor = safety.data_floor(analysis)
 
     # Which markers to surface, ranked highest-severity first then by marker name (shared with suggestions).
     raised = _raised_ranked(analysis)
 
+    kept_ids: set[str] = (
+        set()
+    )  # the observation rows this scan keeps (the rest are pruned below)
     with con:  # atomic: interaction + observation + escalation per finding commit (or roll back) together
         for traj in raised:
             response_id = db._det_id("scan:", member_id, traj.marker, data_version)
             obs_id = db._det_id(
                 "obs:", member_id, traj.marker, data_version
             )  # finding_id == observation_id
+            kept_ids.add(obs_id)
             rng = _range_for(traj.marker, member.sex, age, ranges)
             title, trigger_reason = templates.observation_summary(traj)  # computed once
             finding = templates.scan_finding(traj, rng, obs_id, title)
@@ -161,15 +167,33 @@ def scan(con: sqlite3.Connection, member_id: str) -> list[Observation]:
             if (
                 level is not None
             ):  # only attention/urgent reach the clinician-review queue
+                # dedup on THIS marker's own analysis state (compute_marker_version), not the whole-member
+                # analysis_version: an override/edit to another marker must not shift this key and re-fire a
+                # finding that never changed (§48, finding-stable per marker).
+                marker_version = db.compute_marker_version(
+                    marker=traj.marker,
+                    results=results,
+                    marker_range=rng,
+                    sex=member.sex,
+                    age=age,
+                )
                 db._insert_escalation(
                     con,
                     member_id=member_id,
                     kind="data_finding",
-                    dedup_key=f"data:{member_id}:{traj.marker}:{analysis_version}",
+                    dedup_key=f"data:{member_id}:{traj.marker}:{marker_version}",
                     level=level,
                     observation_id=obs_id,
                     trigger_reason=trigger_reason,
                 )
+
+        # Reconcile the set: drop observations at THIS data_version that are no longer raised. Normally
+        # a no-op (at a fixed data_version the raised set is constant), but a Phase-7 OVERRIDE changes the
+        # analysis WITHOUT bumping data_version (it keys on the raw record), so a re-scan after a /feedback
+        # override that cleared a flag would otherwise strand the prior observation. Escalation-referenced
+        # rows are kept (the RESTRICT FK + the durable clinician task), so this is the §48 targeted prune,
+        # never a blanket delete.
+        db.prune_observations(con, member_id, data_version, kept_ids)
 
     return db.get_observations(con, member_id, data_version=data_version)
 
@@ -229,6 +253,75 @@ def suggestions(
     return prompts
 
 
+def _theil_sen_line(series, slope: float | None) -> list[dict] | None:
+    """The two drawable endpoints of the marker's Theil–Sen line (architecture §751 "the already-computed
+    Theil–Sen line"), or ``None`` when the slope was too noisy to sign (no line is honest there). Reuses
+    the core's computed ``slope`` (per day) and pairs it with the standard Theil–Sen intercept
+    ``median(yᵢ − slope·xᵢ)`` — presentation geometry for the sparkline, NOT a re-derived trend verdict
+    (the verdict stays analysis.py's). ``x`` is the panel-date ordinal, matching ``analysis._theil_sen``."""
+    if slope is None or not series:
+        return None
+    xs = [date.fromisoformat(r.date).toordinal() for r in series]
+    ys = [r.value for r in series]
+    intercept = median(y - slope * x for x, y in zip(xs, ys, strict=True))
+    return [
+        {"date": series[0].date, "value": round(slope * xs[0] + intercept, 4)},
+        {"date": series[-1].date, "value": round(slope * xs[-1] + intercept, 4)},
+    ]
+
+
+def trajectory(
+    con: sqlite3.Connection, member_id: str, *, marker: str | None = None
+) -> list[dict]:
+    """Full per-marker series for inspection/plotting (architecture §13/§751) — a UI/operator READ.
+    Projects the member's ``lab_results`` + the analysis pass into ``{marker, unit, readings[], trend,
+    clinical_change, flags, severity, reference_range, theil_sen}``; optional ``marker`` narrows to one.
+    Raises ``KeyError`` if the member is absent.
+
+    Boundary-preserving by construction: this is the one place the RAW per-marker series is exposed, and
+    it is exposed ONLY to the UI/operator for charting + human verification of a finding — the **LLM still
+    consumes only the collapsed ``TrajectoryAnalysis`` verdict** (§4/§207), never this. Plain dicts, not a
+    model (architecture §13 keeps read projections off the contract surface, like ``list_member_summaries``)."""
+    member, results, ranges, age, data_version = db.load_for_analysis(con, member_id)
+    analysis = analyze(
+        member, results, ranges, age, ANALYSIS_CONFIG, data_version=data_version
+    )
+    out: list[dict] = []
+    for traj in analysis.markers:
+        if marker is not None and traj.marker != marker:
+            continue
+        series = _series(
+            results, traj.marker
+        )  # the same pure dated series the core uses
+        rng = _range_for(traj.marker, member.sex, age, ranges)
+        slope = traj.trend.slope if traj.trend else None
+        out.append(
+            {
+                "marker": traj.marker,
+                "unit": traj.unit,
+                "readings": [{"date": r.date, "value": r.value} for r in series],
+                "trend": traj.trend.model_dump() if traj.trend else None,
+                "clinical_change": (
+                    traj.clinical_change.model_dump() if traj.clinical_change else None
+                ),
+                "flags": list(traj.flags),
+                "severity": traj.severity,
+                "reference_range": (
+                    {
+                        "ref_low": rng.ref_low,
+                        "ref_high": rng.ref_high,
+                        "panic_low": rng.panic_low,
+                        "panic_high": rng.panic_high,
+                    }
+                    if rng is not None
+                    else None
+                ),
+                "theil_sen": _theil_sen_line(series, slope),
+            }
+        )
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Phase 4 — the ask path (Mode 2): the one pipeline that swaps a single step. retrieve -> analyze ->
 # floor -> render -> validate -> escalate is shared with the scan; only `render` differs (LLM compose
@@ -245,18 +338,21 @@ def _llm_metadata(
     model_version: str,
     usages: list[LLMUsage],
     latency_ms: int,
+    prompt_version: int = 0,
 ) -> ResponseMetadata:
     """The reproducibility tuple + cost/latency instrumentation for an /ask turn. ``model_version`` names
     the model that authored the PROSE (compose model when composed, gate model when a gate-routed
     template, ``deterministic`` when an LLM-down fallback templated it); ``tokens``/``cost_usd`` aggregate
     every LLM call the turn actually made (so a gate-routed template still shows the gate's cost).
-    ``prompt_version`` is 0 — the ``prompt_versions`` table is Phase 7; the composer runs a pinned prompt."""
+    ``prompt_version`` is the promoted ``prompt_versions.version`` the composer ran under (Phase 7), or 0
+    when the prose came from a template/fallback (no composer prompt produced it) or the v0 baseline
+    constant is in force — so the stamp tracks exactly which learned prompt, if any, authored the answer."""
     return ResponseMetadata(
         response_id=response_id,
         data_version=data_version,
         model_version=model_version,
         config_version=CONFIG_VERSION,
-        prompt_version=0,
+        prompt_version=prompt_version,
         latency_ms=latency_ms,
         tokens=sum(u.total_tokens for u in usages) if usages else None,
         cost_usd=round(sum(u.cost_usd for u in usages), 8) if usages else None,
@@ -390,6 +486,10 @@ def ask(
     usages: list[LLMUsage] = [g.usage] if g.usage is not None else []
     response_id = db._det_id("ask:", member_id, message, now_iso)
 
+    # The composer prompt_version the prose ran under — 0 unless the composer actually authors it under a
+    # promoted version (set in the compose branch below); a template/fallback answer carries 0.
+    prompt_version = 0
+
     # Render: compose only on the `none` route (the sole open generation); the safety branches and the
     # fail-closed couldnt_route are fixed templates (_SAFETY_TEMPLATES). compose() owns the one bounded
     # retry (via llm.call_structured); a parse failure that survives it, or a provider-down, degrades.
@@ -397,6 +497,16 @@ def ask(
     if g.route == "none":
         prose_model = (
             MODEL_VERSION_DETERMINISTIC  # set to COMPOSE_MODEL only if compose succeeds
+        )
+        # Resolve the active composer prompt ONLY here, the one path that uses it (Phase 7): the latest
+        # PROMOTED prompt_version, else the v0 baseline constant at version 0 (pipeline owns the fallback
+        # so db.py never imports llm). Read per request, never cached, so a promotion takes effect on the
+        # next turn and only on a promotion event (§7).
+        active_prompt = db.get_active_prompt(con)
+        active_version, prompt_text = (
+            (active_prompt[0], active_prompt[1])
+            if active_prompt is not None
+            else (0, llm.BASE_COMPOSE_SYSTEM)
         )
         try:
             ctx = llm.ComposeContext(
@@ -408,10 +518,14 @@ def ask(
                 ),
                 floor=floor,
                 message=message,
+                preferences=db.get_active_preferences(con, member_id),
             )
-            draft, compose_usage = llm.compose(ctx, provider=provider)
+            draft, compose_usage = llm.compose(
+                ctx, prompt_text=prompt_text, provider=provider
+            )
             usages.append(compose_usage)
             prose_model = COMPOSE_MODEL
+            prompt_version = active_version  # the prose ran under this promoted version
         except LLMParseError as e:
             # malformed/refused/truncated output that survived the retry -> grounded fallback below.
             # Count the tokens those attempts still billed so the cost stamp isn't an undercount.
@@ -434,12 +548,16 @@ def ask(
         prose_model = MODEL_VERSION_DETERMINISTIC
 
     latency_ms = int((time.perf_counter() - start) * 1000)
+    # ``prompt_version`` is the composer version that authored the prose, or 0 for a template/fallback
+    # (it is only set non-zero on a successful compose above) — parallel to how ``model_version`` already
+    # tracks the prose's true author.
     metadata = _llm_metadata(
         response_id,
         data_version,
         model_version=prose_model,
         usages=usages,
         latency_ms=latency_ms,
+        prompt_version=prompt_version,
     )
 
     if g.route == "none":

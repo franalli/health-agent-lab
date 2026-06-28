@@ -13,8 +13,8 @@ init-db:  ## create the SQLite schema (idempotent)
 seed:  ## ingest the active dataset (DATASET env; default training_data) — inits the schema first
 	uv run python -m preprocessing.ingest
 
-run: seed  ## init + seed + serve the API on :8000 (UI mounts here once frontend/ lands in Phase 6)
-	uv run uvicorn api:app --host 0.0.0.0 --port 8000
+run: seed  ## init + seed + serve the API + UI on :8000 (--reload: backend edits restart automatically)
+	uv run uvicorn api:app --host 0.0.0.0 --port 8000 --reload
 
 test:  ## unit tests
 	uv run pytest

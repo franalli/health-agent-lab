@@ -246,10 +246,14 @@ def test_resolve_overrides_returns_new_lists_without_mutating():
         )
     ]
 
-    out_results, out_ranges = db.resolve_overrides(con, "M5", results, ranges)
+    out_results, out_ranges = db.resolve_overrides(
+        con, "M5", results, ranges, sex="male"
+    )
     assert out_results is not results and out_ranges is not ranges  # new list objects
     assert len(results) == 1 and len(ranges) == 1  # inputs untouched
-    assert [r.marker for r in out_results] == ["HbA1c"]  # Phase-2 pass-through content
+    assert [r.marker for r in out_results] == [
+        "HbA1c"
+    ]  # no overrides -> pass-through content
 
 
 # ---- end-to-end safety floor: curated potassium panic reaches urgent over the DB -----------------
@@ -282,8 +286,9 @@ def test_real_member_c07_potassium_reaches_urgent():
 
 def test_all_supplied_members_analyze_over_the_db():
     # the phase's headline runnable: the pure core runs over EVERY persisted member, not just the two
-    # spot-checked ones — and the sparse member (C12, n=3) still abstains ("too short to call a
-    # trend") through persistence, exactly as Phase 1 proved it in memory.
+    # spot-checked ones. The sparse member (C12, n=3) still abstains on the *trend* ("too short to call"
+    # — no Mann-Kendall verdict), but its floor now escalates via the sub-n_min sparse rule (Fix 2:
+    # monotonic adverse change that clears RCV), exercised here through persistence.
     con = _con()
     ingest_dataset(con)
     floors = {}
@@ -298,7 +303,14 @@ def test_all_supplied_members_analyze_over_the_db():
     member, results, ranges, age, dv = db.load_for_analysis(con, "C12")
     c12 = analyze(member, results, ranges, age, ANALYSIS_CONFIG, data_version=dv)
     assert len({r.panel_id for r in results}) == 3  # the sparse member (n=3 < n_min=4)
-    assert all(mk.trend is None for mk in c12.markers)  # abstains on every marker
+    assert all(
+        mk.trend is None for mk in c12.markers
+    )  # no MK/Theil-Sen verdict at n=3 (trend abstains)
+    egfr = next(mk for mk in c12.markers if mk.marker == "eGFR")
+    assert (
+        egfr.severity == "attention"
+    )  # ...yet the monotonic RCV-clearing decline escalates (Fix 2)
+    assert c12.overall_floor == "clinician_review"  # matching eval E12
 
 
 def test_sex_split_panic_reaches_unknown_sex_member():

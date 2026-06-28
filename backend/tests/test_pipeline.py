@@ -211,6 +211,149 @@ def test_finding_text_and_evidence_describe_the_same_signal():
             )
 
 
+def test_observation_summary_surfaces_status_on_a_flagged_trending_marker():
+    """B1 regression: a marker that is BOTH significantly trending AND out-of-range / band-crossed must
+    have its current status stated in the title and trigger_reason, not be narrated by trend alone
+    (CLAUDE.md "every narrator surfaces the core flags"). This locks the ``observation_summary`` trend /
+    sparse-trend surfaces (scan trigger_reason, Mode-1 pivot, overview) — previously only
+    ``_change_narrative`` was covered, so a trend-only "X rising" on a flagged value slipped through."""
+    from health_intelligence.models import (
+        ClinicalChange,
+        MarkerTrajectory,
+        Reading,
+        TrendResult,
+    )
+
+    # counted adverse trend (severity 'attention') that has ALSO breached range and crossed a band
+    counted = MarkerTrajectory(
+        marker="HbA1c",
+        unit="%",
+        latest=Reading(value=6.1, date="2024-01-01"),
+        trend=TrendResult(
+            direction="increasing",
+            tau=0.9,
+            p_value=0.017,
+            slope=0.001,
+            n=5,
+            significant=True,
+        ),
+        clinical_change=ClinicalChange(rcv=0.3, net_change=0.8, exceeds_rcv=True),
+        flags=["above_range", "band_cross"],
+        severity="attention",
+        n_readings=5,
+    )
+    title, trigger = templates.observation_summary(counted)
+    assert "rising" in title and "above range" in title, (
+        title
+    )  # trend AND status, both stated
+    assert "above range" in trigger, trigger
+
+    # sub-n_min sparse adverse decline that is below range (the C12-eGFR shape)
+    sparse = MarkerTrajectory(
+        marker="eGFR",
+        unit="mL/min/1.73m2",
+        latest=Reading(value=61, date="2024-01-01"),
+        trend=None,  # no MK verdict at n<n_min
+        clinical_change=ClinicalChange(rcv=5.0, net_change=-22.0, exceeds_rcv=True),
+        flags=["below_range"],
+        severity="attention",
+        n_readings=3,
+    )
+    s_title, s_trigger = templates.observation_summary(sparse)
+    assert "falling" in s_title and "below range" in s_title, s_title
+    assert (
+        "limited history" in s_title and "significant" not in s_title
+    )  # honest, not overstated
+    assert "below range" in s_trigger, s_trigger
+
+    # an in-range trending marker (no value flag) is correctly NOT given a spurious status phrase
+    inrange = MarkerTrajectory(
+        marker="ALT",
+        unit="U/L",
+        latest=Reading(value=30, date="2024-01-01"),
+        trend=TrendResult(
+            direction="increasing",
+            tau=0.9,
+            p_value=0.02,
+            slope=0.01,
+            n=5,
+            significant=True,
+        ),
+        clinical_change=ClinicalChange(rcv=5.0, net_change=8.0, exceeds_rcv=True),
+        flags=[],
+        severity="attention",
+        n_readings=5,
+    )
+    i_title, _ = templates.observation_summary(inrange)
+    assert "range" not in i_title and "threshold" not in i_title, i_title
+
+
+def test_sparse_decline_escalates_with_grounded_limited_history_narration():
+    con = _con()
+    # 3 panels only (sub-n_min): eGFR 78 -> 70 -> 61, a strictly monotonic decline below the >=90 range
+    # that clears RCV. Fix 2 escalates it to clinician_review; the Finding's evidence stat must cite the
+    # SAME signal as its title (grounding contract), and the narration must convey the decline AND the
+    # limited base WITHOUT overstating certainty (E12 must_not). The render is the only place the
+    # surface-core-flags invariant is enforced, so it is asserted here, not just severity/floor.
+    dates = ["2023-01-01", "2023-07-01", "2024-01-01"]
+    egfr = [78, 70, 61]
+    panels = [
+        _panel(
+            f"S-P{i + 1}",
+            dates[i],
+            [
+                _r("eGFR", egfr[i], "mL/min/1.73m2", ">=90"),
+                _r("Potassium", 4.2, "mmol/L", "3.5-5.1"),
+            ],
+            vitals={"systolic_bp": 118, "diastolic_bp": 78, "bmi": 22.5},
+        )
+        for i in range(3)
+    ]
+    ingest_bundle(con, _bundle("S1", panels))
+    pipeline.scan(con, "S1")
+
+    # 1) the sparse monotonic decline reaches clinician_review (never urgent — panic only)
+    egfr_escs = con.execute(
+        "SELECT level FROM escalations WHERE member_id='S1' AND dedup_key LIKE '%eGFR%'"
+    ).fetchall()
+    assert len(egfr_escs) == 1 and egfr_escs[0]["level"] == "clinician_review"
+
+    # 2) grounding parity: the eGFR Finding's text and its evidence stat cite the SAME (sparse) signal —
+    #    not 'falling' text paired with a 'latest reading' / 'outside range' stat.
+    import json
+
+    findings = [
+        f
+        for r in con.execute(
+            "SELECT response_json FROM interactions WHERE member_id='S1'"
+        ).fetchall()
+        for f in json.loads(r["response_json"])["findings"]
+        if f["evidence"][0]["marker"] == "eGFR"
+    ]
+    assert findings, "expected an eGFR finding"
+    text, stat = findings[0]["text"], findings[0]["evidence"][0]["stat"]
+    assert (
+        "falling" in text and "limited history" in text
+    )  # title: decline + sparse base
+    assert "panels" in stat and "reference-change" in stat  # stat cites the SAME signal
+    assert (
+        "Mann-Kendall" not in stat
+    )  # there is no MK verdict at n=3 — must not fake one
+    assert "significant" not in text and "significant" not in stat  # no overstatement
+
+    # 3) the full change narrative surfaces the out-of-range status AND the limited-history caveat,
+    #    honestly (lowers, not overstates, certainty).
+    egfr_traj = next(t for t in _analysis(con, "S1").markers if t.marker == "eGFR")
+    narr = templates._change_narrative(egfr_traj)
+    assert (
+        "below the reference range" in narr
+    )  # surface-core-flags invariant (not trend-only)
+    assert (
+        "limited history" in narr and "panels" in narr
+    )  # honest about the sparse base
+    assert "lowers certainty" in narr  # does not overstate from a short series
+
+
 def test_scan_with_no_signal_writes_nothing():
     con = _con()
     ingest_bundle(

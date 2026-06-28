@@ -33,16 +33,17 @@ A single page: two **member** regions, plus an **operator** control panel held v
 | CONTROL PANEL    | CONVERSATION                 | OBSERVATIONS       |
 | (operator)       |                              |                    |
 | Data             | member: should I worry       | (•) Needs          |
-|  [Seed member]   |       about my ferritin?     |     follow-up      |
-|  [Upload bundle] |                              |     Ferritin       |
-|  [Clear member]  | +--------------------------+ |     below range    |
-| Proactive        | | Ferritin drifted down,   | |     [why?]         |
-|  [Run scan]      | | now just below normal.   | |                    |
-|  [Observations]  | | Worth raising with GP.   | | ( ) Vitamin D dip  |
-|  [Suggestions]   | | > why · v evidence       | |                    |
-|  [Clinician q]   | +--------------------------+ | .   LDL stable     |
+|  [Upload bundle] |       about my ferritin?     |     follow-up      |
+|  [Reseed]        |                              |     Ferritin       |
+| Proactive        | +--------------------------+ |     below range    |
+|  [Scan member]   | | Ferritin drifted down,   | |     [why?]         |
+|  [Observations]  | | now just below normal.   | |                    |
+|  [Suggestions]   | | Worth raising with GP.   | | ( ) Vitamin D dip  |
+|  [Clinician q]   | | > why · v evidence       | |                    |
+|  [Trajectory]    | +--------------------------+ | .   LDL stable     |
 | Learning         |                              |                    |
 |  [Run learn]     | [ Ask a question...      ^ ] |                    |
+|  [Submit fdbk]   |                              |                    |
 |  [Sample ovr]    |                              |                    |
 |  [Reset learn]   |                              |                    |
 | System           |                              |                    |
@@ -52,15 +53,15 @@ A single page: two **member** regions, plus an **operator** control panel held v
 +------------------+------------------------------+--------------------+
 ```
 
-The **sample-data notice** ("synthetic only — not medical advice") is a persistent warning glyph `(!)` in the header next to **Member**, rather than a standing banner — it stays out of the way but reveals the full text on hover/focus (and carries it as an `aria-label` for screen readers), so the header's one banner row is reserved for the escalation summary, which appears only when an escalation is active.
+The **sample-data notice** ("synthetic only — not medical advice") is a persistent warning glyph `(!)` in the header next to **Member**, rather than a standing banner — it stays out of the way but reveals the full text on hover/focus (and carries it as an `aria-label` for screen readers). The ambient escalation summary lives as a severity-coloured flag beside the **Observations** heading, appearing only when an escalation is active — so the header stays uncluttered.
 
 The two seams between these regions are **drag-resizable gutters**: the operator can widen the control panel, the member can give Observations more room, and the centre conversation flexes to fill what's left. Each side is clamped (never past 40% of the viewport, so the conversation is never squeezed out) and the chosen split is held in memory only — no storage, reset on reload (double-click a gutter, press Home, or just reload to restore the default). The gutters are keyboard-operable separators (focus, then ←/→). Below ~820px the three regions stack into one scrolling column and the gutters drop away. *(Build note, Phase 6.)*
 
-The member never configures, tunes, or sees system internals — the conversation and observations are the entire member experience. The **control panel** (top-left, labeled operator-only) is the demo surface: a button for every scaffolded route, grouped **Data** (seed · **upload bundle** · clear member), **Proactive** (run scan · observations · suggestions · clinician queue), **Learning** (run learn · sample clinician override · reset learning), and **System** (health) — each route's JSON response shown in a readout below, the two destructive actions (clear, reset) behind a confirm. It is deliberately *not* in the chat and adds no new behaviour: it only fires routes the API already exposes, so the whole system is exercisable end-to-end from the page (run a scan and watch observations update; post an override then reset it; gate a `/learn` candidate) without curl.
+The member never configures, tunes, or sees system internals — the conversation and observations are the entire member experience. The **control panel** (top-left, labeled operator-only) is the demo surface: a button for every scaffolded route, grouped **Data** (**upload bundle** · factory reseed), **Proactive** (scan member · scan all · observations · suggestions · clinician queue · trajectory), **Learning** (run learn · submit feedback · sample clinician override · reset learning), and **System** (health) — each route's JSON response shown in a readout below (the **trajectory** read and the **submit-feedback** form are the exceptions, drawn as inline UI in the readout instead of JSON). The **submit-feedback** button opens a small form over the full `/feedback` surface: pick a `kind` (the three correction kinds — `range_override` · `suppress_marker` · `preference` — or the four signal kinds), a `source`, and the kind-appropriate target/payload (the form encodes the per-kind contract the permissive `dict` payload schema does not, so a submission can never silently no-op on a stray key), then submit against the selected member. Every button fires its route DIRECTLY — no confirm, no client-side preconditions — an unrestricted operator API console; the two destructive actions (reset learning, reseed) keep only a red visual cue, not a gate. It is deliberately *not* in the chat and adds no new behaviour: it only fires routes the API already exposes, so the whole system is exercisable end-to-end from the page (run a scan and watch observations update; post an override then reset it; gate a `/learn` candidate) without curl.
 
-*(Build note, Phase 6: the panel is driven by a route registry — a button per **scaffolded** route — so the **Learning** group (`/learn` · `/feedback` · `/reset`) is a Phase-7 drop-in that appears unchanged once those routes land. The Phase-6 panel therefore ships **Data**/**Proactive**/**System** only, and **Clear member** is the single destructive action behind a confirm.)*
+*(Build note: the panel is driven by a route registry — a button per **scaffolded** route — so each phase's routes appear simply by being added to the registry. As of **Phase 7** the **Learning** group (`/learn` · `/feedback` · `/reset`) has landed alongside the **Trajectory** read (Proactive) and the **factory reseed** (`/admin/reseed`, Data); **Reset learning** and **Reseed** are destructive (red cue only — the panel fires every call directly, with no confirm, by design). The **Trajectory** button and the **Submit feedback** button are the non-JSON readouts — trajectory renders a minimal inline sparkline per marker (readings · the already-computed Theil–Sen line · flagged points; deliberately rough, no axes/legend), the operator's "verify a finding by eye" affordance.)*
 
-**Upload bundle** is the holdout path — how an unseen dataset is brought in at runtime. The holdout is data we've never seen, so it can't be a pre-baked option: the button reads a `MemberBundle` JSON file, `POST`s it to `/members` (the same route "Seed member" uses), and the server validates it against the Pydantic models — a malformed file returns a clear error in the same readout, so the upload *is* the format check. On success the header **member-picker** gains the uploaded member and switches to it, and the surface repopulates for the new data. So on the deployment, unseen data can be loaded and demoed immediately — no redeploy, no curl — and the picker selects among the 15 seeded members and anything uploaded. The same `POST /members` is documented in the README as a `curl` for a scriptable equivalent; the sample bundle ships in the repo as the format template.
+**Upload bundle** is the holdout path — how an unseen dataset is brought in at runtime. The holdout is data we've never seen, so it can't be a pre-baked option: the button reads a `MemberBundle` JSON file, `POST`s it to `/members`, and the server validates it against the Pydantic models — a malformed file returns a clear error in the same readout, so the upload *is* the format check. On success the header **member-picker** gains the uploaded member and switches to it, and the surface repopulates for the new data. So on the deployment, unseen data can be loaded and demoed immediately — no redeploy, no curl — and the picker selects among the 15 seeded members and anything uploaded. The same `POST /members` is documented in the README as a `curl` for a scriptable equivalent.
 
 A production member build simply omits this column — together with the header's member-picker and the per-answer trace (the stored `response_json` / logs) — as operator affordances, never member features.
 
@@ -107,10 +108,10 @@ The two `urgent` rows come from the gate's `acute_medical` vs `crisis` intents �
 An escalation is **loud exactly once**, then becomes ambient. The hard rule: **an escalation never lives inside every message bubble** — repeating it each turn is both annoying and dishonest (it implies a fresh event). It lives in the conversation chrome instead:
 
 1. **Side dropdown (detail).** The Observations panel (§5): standing severity items, persistent, expandable to their evidence. Where a member goes to see *what* is flagged.
-2. **Floating banner (ambient summary).** A calm, persistent one-liner whenever ≥1 escalation is active — *"Some results have been flagged for your care team."* This is the standing state; it's where "we've contacted your physician" lives, and it does **not** re-alarm.
-3. **Per-turn bubble (event, once).** Only the single *transition* turn — when an escalation first fires, or a concerning message arrives — gets the loud in-bubble takeover. Every later turn has a clean bubble; the banner carries the status and the validator keeps the prose honest.
+2. **Heading flag (ambient summary).** A calm severity-coloured flag glyph beside the **Observations** heading whenever ≥1 escalation is active; its hover/focus message is *"Some results have been flagged for your care team."* (also an `aria-label`). This is the standing state; it's where "we've contacted your physician" lives, and it does **not** re-alarm. Clicking it scrolls to and pulses the flagged items.
+3. **Per-turn bubble (event, once).** Only the single *transition* turn — when an escalation first fires, or a concerning message arrives — gets the loud in-bubble takeover. Every later turn has a clean bubble; the flag carries the status and the validator keeps the prose honest.
 
-Two sources feed the same chrome (see `architecture.md`): the **proactive scan** (standing data findings → dropdown + banner) and a **concerning chat message** (→ the transition-turn takeover, then banner). **Member-facing care is never deduped:** if a member sends ten distressed messages, each still gets a full, present reply — only the *clinician record* is created once. We never answer a repeated cry with "already logged."
+Two sources feed the same chrome (see `architecture.md`): the **proactive scan** (standing data findings → dropdown + flag) and a **concerning chat message** (→ the transition-turn takeover, then flag). **Member-facing care is never deduped:** if a member sends ten distressed messages, each still gets a full, present reply — only the *clinician record* is created once. We never answer a repeated cry with "already logged."
 
 ---
 
@@ -123,9 +124,9 @@ Severity drives visual weight, and that's the whole model — there is no dismis
 | `info` | Quiet feed item, low contrast. |
 | `notable` | Feed item, slightly emphasized. |
 | `attention` | Amber card, prominent; tied to a "raise with your GP" next step. |
-| `urgent` | Calm banner at top, immediate next step + clinician handoff. |
+| `urgent` | Red severity flag on the Observations heading, immediate next step + clinician handoff. |
 
-Each observation carries a **"why am I seeing this?"** expansion — its `trigger_reason` (which statistical signal fired) plus the evidence — so a proactive nudge is never a black box. *(Build note, Phase 6: the expansion renders the `trigger_reason` prose, which already names the signal, the value, and the threshold it crossed; the full evidence chips for that marker are one click away via its Mode-1 chip in the conversation, since the `Observation` projection carries no `evidence[]` and §13 adds no observation→interaction read route.)* The panel shows the member's current observations; a re-scan on new data replaces them, so the member isn't shown stale findings. This panel is the **detail layer** of the three-layer escalation rendering (§4); the floating banner is its ambient summary, and only a transition turn ever touches a chat bubble.
+Each observation carries a **"why am I seeing this?"** expansion — its `trigger_reason` (which statistical signal fired) plus the evidence — so a proactive nudge is never a black box. *(Build note, Phase 6: the expansion renders the `trigger_reason` prose, which already names the signal, the value, and the threshold it crossed; the full evidence chips for that marker are one click away via its Mode-1 chip in the conversation, since the `Observation` projection carries no `evidence[]` and §13 adds no observation→interaction read route.)* The panel shows the member's current observations; a re-scan on new data replaces them, so the member isn't shown stale findings. This panel is the **detail layer** of the three-layer escalation rendering (§4); the severity flag on its heading is the ambient summary, and only a transition turn ever touches a chat bubble.
 
 ---
 

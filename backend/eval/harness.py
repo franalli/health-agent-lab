@@ -12,18 +12,39 @@ calls, which is exactly what ``score_consistency`` measures). All judgement live
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from datetime import UTC, datetime
+from typing import Protocol
 
-from eval.client import ServiceClient
 from eval.report import CaseReport, RawCase, Report
 from eval.scorers import score_mode1, score_mode2, score_stats
 from eval.stats_fixtures import STATS_FIXTURES
 from eval.types import Case, CaseResponses, EvalConfig
 from health_intelligence.config import COMPOSE_MODEL, CONFIG_VERSION
+from health_intelligence.models import Escalation, HealthIntelligenceResponse
 from preprocessing.datasets import dataset_dir
 
 
-def _collect(case: Case, client: ServiceClient, cfg: EvalConfig) -> CaseResponses:
+class _Session(Protocol):
+    """The per-case session surface ``_collect`` drives — satisfied by both ``ServiceClient`` (HTTP, for
+    ``make eval``) and ``inprocess.InProcessClient`` (direct pipeline calls, for ``/learn``)."""
+
+    member_id: str
+
+    def ask(self, message: str) -> HealthIntelligenceResponse: ...
+    def overview(self) -> HealthIntelligenceResponse | None: ...
+    def escalations(self) -> list[Escalation]: ...
+    def marker_values(self) -> dict[str, float]: ...
+
+
+class EvalClient(Protocol):
+    """Structural type for the harness client — ``run_eval`` is duck-typed on ``case_session``, so the
+    HTTP ``ServiceClient`` and the in-process ``InProcessClient`` both satisfy it without a base class."""
+
+    def case_session(self, member_id: str) -> AbstractContextManager[_Session]: ...
+
+
+def _collect(case: Case, client: EvalClient, cfg: EvalConfig) -> CaseResponses:
     """Drive the live service for one case inside its own isolated DB. The N Mode-2 asks run first (they
     write the audit + escalation rows), then the DB snapshot and the Mode-1 overview are read back."""
 
@@ -83,7 +104,7 @@ def _build_case_report(case: Case, m2, m1) -> CaseReport:
     )
 
 
-def run_eval(cases: list[Case], client: ServiceClient, cfg: EvalConfig) -> Report:
+def run_eval(cases: list[Case], client: EvalClient, cfg: EvalConfig) -> Report:
     """Run the full case set through both modes and score every dimension; grade the pure core on the
     authored stats fixtures. Returns the ``Report`` (markdown + JSON, never-events first)."""
     case_reports: list[CaseReport] = []

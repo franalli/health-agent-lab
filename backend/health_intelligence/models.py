@@ -260,6 +260,9 @@ class MarkerTrajectory(BaseModel):
     clinical_change: ClinicalChange | None = None
     flags: list[Flag] = Field(default_factory=list)
     severity: Severity
+    n_readings: int | None = (
+        None  # series length — the only count available when trend is None (sparse)
+    )
 
 
 class TrajectoryAnalysis(BaseModel):

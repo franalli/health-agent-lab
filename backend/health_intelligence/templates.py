@@ -93,6 +93,22 @@ def _status_clause(traj: MarkerTrajectory) -> str:
     return ""
 
 
+def _status_phrase(traj: MarkerTrajectory) -> str:
+    """The terse value-status phrase (range > band priority) appended to a TREND narration, so a flagged
+    value's current standing is stated alongside its trend rather than replaced by it (CLAUDE.md "every
+    narrator surfaces the core flags"). Empty when the value carries no range/band flag — an in-range
+    trending marker has no current breach to surface. Panic is handled upstream (a panic value classifies
+    as ``panic_*`` and never reaches a trend branch), so it is omitted here."""
+    f = traj.flags
+    if "above_range" in f:
+        return "above range"
+    if "below_range" in f:
+        return "below range"
+    if "band_cross" in f:
+        return "past a clinical threshold"
+    return ""
+
+
 def _classify(traj: MarkerTrajectory) -> str:
     """Which signal drove this marker — the single source of truth all narration reads. A trend is the
     headline only when it was COUNTED toward the floor (severity 'attention': significant + adverse +
@@ -106,6 +122,9 @@ def _classify(traj: MarkerTrajectory) -> str:
     t = traj.trend
     if traj.severity == "attention" and t is not None and t.direction != "flat":
         return "trend"
+    if traj.severity == "attention" and t is None:
+        return "sparse_trend"  # sub-n_min monotonic adverse change cleared RCV (Fix 2): the escalation
+        # reason, so it leads over the range/band flag the value also carries
     if "above_range" in flags:
         return "above_range"
     if "below_range" in flags:
@@ -138,7 +157,34 @@ def observation_summary(traj: MarkerTrajectory) -> tuple[str, str]:
         rcv = "; clears reference-change value" if traj.severity == "attention" else ""
         p = f"{t.p_value:.3f}" if t else "n/a"
         n = t.n if t else 0
-        return f"{m} {word}", f"{m} {word} trend (Mann-Kendall p={p}, n={n}{rcv})"
+        # Surface the value's current standing alongside the trend: a marker that has already breached
+        # its range / crossed a band must not be narrated as a future-tense trend alone (the value is
+        # flagged NOW). CLAUDE.md "every narrator surfaces the core flags".
+        status = _status_phrase(traj)
+        title = f"{m} {word}, now {status}" if status else f"{m} {word}"
+        trigger = f"{m} {word} trend (Mann-Kendall p={p}, n={n}{rcv})"
+        return title, (f"{trigger}; latest {status}" if status else trigger)
+    if (
+        signal == "sparse_trend"
+    ):  # sub-n_min monotonic adverse change cleared RCV (Fix 2)
+        cc = traj.clinical_change
+        net = cc.net_change if cc is not None and cc.net_change is not None else 0.0
+        word = "rising" if net > 0 else "falling"
+        span = f"{traj.n_readings} panels" if traj.n_readings else "a short series"
+        status = _status_phrase(
+            traj
+        )  # state the value's standing alongside the sparse trend
+        title = (
+            f"{m} {word}, now {status} (limited history)"
+            if status
+            else f"{m} {word} (limited history)"
+        )
+        status_trig = f"; latest {status}" if status else ""
+        return (
+            title,
+            f"{m} {word} ~{abs(net):.0f}% across {span}, clearing its reference-change "
+            f"value{status_trig}; limited history — interpret with caution",
+        )
     if signal == "above_range":
         return f"{m} above range", f"{m} latest {val} above the reference range"
     if signal == "below_range":
@@ -173,6 +219,12 @@ def _stat_string(traj: MarkerTrajectory, rng: ReferenceRange | None) -> str:
         return f"below critical-low {rng.panic_low} {traj.unit}"
     if signal == "trend" and t is not None:
         return _trend_stat(t)
+    if (
+        signal == "sparse_trend"
+    ):  # sub-n_min: the same signal the title cites (Fix 2 grounding parity)
+        cc = traj.clinical_change
+        net = cc.net_change if cc is not None and cc.net_change is not None else 0.0
+        return f"~{abs(net):.0f}% over {traj.n_readings or 0} panels, clears reference-change value"
     if signal in ("above_range", "below_range"):
         return "outside reference range"
     if signal == "band_cross":
@@ -327,7 +379,16 @@ def _change_narrative(traj: MarkerTrajectory) -> str:
             f"That's {'up' if net > 0 else 'down'} about {abs(net):.0f}% from your first recorded reading."
         )
     t = traj.trend
-    if t is not None and t.direction != "flat" and t.significant:
+    if traj.severity == "attention" and t is None:
+        # Sub-n_min escalation (Fix 2): a monotonic adverse change cleared RCV but n is below n_min, so
+        # there is no Mann-Kendall verdict. State the consistent move AND the limited base — never
+        # overstate certainty from a short series (E12 must_not).
+        span = f"only {traj.n_readings} panels" if traj.n_readings else "a short series"
+        parts.append(
+            f"Across {span} this is a consistent move beyond normal variation; the limited history "
+            "lowers certainty, but it warrants a clinician's review."
+        )
+    elif t is not None and t.direction != "flat" and t.significant:
         word = _DIRECTION_WORD.get(t.direction, "changing")
         parts.append(
             f"Across {t.n} readings this is a {word} trend (Mann-Kendall p={t.p_value:.3f})."

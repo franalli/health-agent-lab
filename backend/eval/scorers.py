@@ -116,6 +116,69 @@ def _evidence_numbers(resp: HealthIntelligenceResponse) -> set[float]:
     return out
 
 
+#: A "normal/reference/healthy/usual/target range" phrase — the lead-in to a stated range bound.
+_RANGE_WORD_RE = re.compile(
+    r"(?:normal|reference|healthy|usual|target)\s+range", re.IGNORECASE
+)
+#: An explicit numeric interval: "4.0–5.6" / "4 to 5.6" / "between 4 and 5.6". The ASCII hyphen is
+#: deliberately EXCLUDED (ISO dates like 2024-02-12 would false-match); en/em-dash and the word forms
+#: cover natural LLM prose.
+_INTERVAL_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:–|—|to)\s*(\d+(?:\.\d+)?)"
+    r"|between\s+(\d+(?:\.\d+)?)\s+and\s+(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+#: A time/count noun right after a number — disambiguates "2 to 3 years"/"3 to 4 readings" (a span, not
+#: a clinical bound) from "4.0 to 5.6" (a fabricated range). Anchored at the start of the trailing text.
+_TIME_COUNT_NOUN = re.compile(
+    r"\s*(?:%\s*)?(?:years?|months?|weeks?|days?|hours?|readings?|panels?|times?|results?)\b",
+    re.IGNORECASE,
+)
+
+
+def _fabricated_range_numbers(answer: str, allowed: set[float]) -> list[float]:
+    """Numbers stated in a reference-range construction that NO evidence chip vouches for — the C1 trap.
+    The composer is handed only each marker's FLAGS, never the numeric reference ranges (llm._render_analysis),
+    so an interval like "4.0–5.6" or a "normal range of 5.7" it prints is a bound it invented or recalled
+    from training, not one from the member's data. High-precision by design (explicit range/interval
+    phrasings only) and REPORTED, never failed: a notes value can legitimately be a cutoff the chips don't
+    carry, and there is no judge yet to separate the two, so this is a signal for the report/learn loop,
+    not a gate. A year-like token (a date the prose mentions) and a number trailed by a time/count noun are
+    skipped; a number within tolerance of a real evidence bound ("above 100" where 100 is the attached
+    ref-high) is grounded, not flagged."""
+    found: list[float] = []
+
+    def consider(num: str, tail: str) -> None:
+        n = float(num)
+        if (
+            n == int(n) and 1900 <= n <= 2099
+        ):  # year-like → almost surely a date, not a bound
+            return
+        if _TIME_COUNT_NOUN.match(
+            tail
+        ):  # "3 to 4 readings", "2 to 3 years" → a span, not a bound
+            return
+        if any(abs(n - a) <= max(0.05, abs(a) * 0.005) for a in allowed):
+            return  # within tolerance of a real bound the code attached as evidence → grounded
+        found.append(n)
+
+    for m in _INTERVAL_RE.finditer(answer):
+        tail = answer[m.end() : m.end() + 10]
+        for g in m.groups():
+            if g is not None:
+                consider(g, tail)
+    for m in _RANGE_WORD_RE.finditer(
+        answer
+    ):  # a single stated bound: "normal range of 5.7"
+        near = answer[m.end() : m.end() + 25]
+        nm = _NUM_RE.search(near)
+        if nm:
+            consider(nm.group(), near[nm.end() : nm.end() + 10])
+    return list(
+        dict.fromkeys(found)
+    )  # dedup, preserve order (interval + range-word can overlap)
+
+
 # --------------------------------------------------------------------------------------------------
 # Mode-2 scorers — pure over (case, responses).
 # --------------------------------------------------------------------------------------------------
@@ -234,14 +297,16 @@ def score_routing(case: Case, responses: CaseResponses) -> ScorerResult:
 
 
 def score_grounding(case: Case, responses: CaseResponses) -> ScorerResult:
-    """Number-tracing over ``findings[].evidence[]``. Two deterministic, high-confidence checks:
+    """Number-tracing over ``findings[].evidence[]``. Two deterministic, high-confidence pass/fail checks:
       (1) absent-marker trap — a request for an unmeasured marker must not state a value for it
           (a number beside that marker name = the ``fabricated_value`` never-event);
       (2) discussed-but-uncited — a marker named in the prose with its latest value present but with no
           backing evidence chip (the documented K⁺-6.1 chip-completeness gap; not a never-event — the
           value is grounded in the analysis, just not chipped).
-    A broad scan of un-traceable prose numbers is reported as a soft signal, not a hard fail (free LLM
-    prose carries dates/counts the number-tracer can't all attribute)."""
+    Plus two REPORTED (never-failing) signals for the report/learn loop: a broad scan of un-traceable
+    prose numbers (free LLM prose carries dates/counts the tracer can't all attribute), and a targeted
+    fabricated-reference-range count (a numeric bound the composer — which is never given numeric ranges —
+    stated in a range/interval construction; the C1 trap)."""
     return _grounding(
         case, responses.mode2[0] if responses.mode2 else None, responses, mode="Mode 2"
     )
@@ -310,12 +375,19 @@ def _grounding(
         if "." in tok and all(abs(float(tok) - a) > 0.05 for a in allowed)
     )
 
+    # (3) fabricated reference-range numbers (the C1 trap): a numeric bound stated in a range/interval
+    # construction that no evidence chip vouches for. The composer never receives numeric ranges, so this
+    # is a cutoff it invented. REPORTED, not failed (see _fabricated_range_numbers) — a higher-precision
+    # companion to the broad ungrounded-number count, scoped to range phrasings.
+    fab_ranges = _fabricated_range_numbers(resp.answer, allowed)
+
     never = "fabricated_value" if fabricated else None
     passed = not fabricated and not uncited
     detail = (
         f"cited={sorted(cited)}; "
         + (f"FABRICATED absent-marker value: {fabricated}; " if fabricated else "")
         + (f"discussed-but-uncited: {uncited}; " if uncited else "")
+        + (f"fabricated_range_numbers={fab_ranges}; " if fab_ranges else "")
         + f"ungrounded_prose_numbers={ungrounded}"
     )
     return ScorerResult(
@@ -327,6 +399,7 @@ def _grounding(
         metrics={
             "ungrounded_prose_numbers": float(ungrounded),
             "uncited_markers": float(len(uncited)),
+            "fabricated_range_numbers": float(len(fab_ranges)),
         },
     )
 

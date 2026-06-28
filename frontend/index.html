@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Health Intelligence Service</title>
+<link rel="icon" href="data:," /><!-- silence the default /favicon.ico 404 (no asset pipeline) -->
 <!--
   Phase 6 — the thin consumer surface (docs/ui-ux.md). One static page, vanilla JS, NO build step,
   NO browser storage (state lives in memory only — CLAUDE.md). FastAPI serves this same-origin at /,
@@ -48,25 +49,42 @@
   .brand { font-size: 16px; font-weight: 700; margin-right: auto; }
   .picker-wrap, .mode-wrap { display: flex; align-items: center; gap: 8px; }
   .picker-wrap label, .mode-wrap > span { font-size: 12.5px; color: var(--muted); }
-  select { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+  /* custom member dropdown — replaces a native <select> whose macOS popup anchors the *selected* option
+     over the button (so the menu floats up for lower members). This list is always anchored UNDER the
+     button (top:100%), button-width, regardless of which member is selected. */
+  .dropdown { position: relative; }
+  .dd-btn {
+    font: inherit; display: inline-flex; align-items: center; justify-content: space-between; gap: 10px;
+    min-width: 150px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px;
+    background: #fff; color: var(--ink); cursor: pointer;
+  }
+  .dd-btn:hover { border-color: var(--accent); }
+  .dd-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .dd-caret { font-size: 10px; color: var(--muted); }
+  .dd-list {
+    position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 60; margin: 0; padding: 4px;
+    list-style: none; background: #fff; border: 1px solid var(--line); border-radius: 8px;
+    box-shadow: 0 6px 20px rgba(0,0,0,.14); max-height: 280px; overflow-y: auto;
+  }
+  .dd-list[hidden] { display: none; }
+  .dd-opt { padding: 6px 8px; border-radius: 6px; font-size: 13px; white-space: nowrap; cursor: pointer; }
+  .dd-opt:hover, .dd-opt.active { background: var(--bg); }
+  .dd-opt[aria-selected="true"] { font-weight: 600; color: var(--accent); }
 
   /* mode toggle */
   .mode-toggle { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
   .mode-toggle button { border: 0; background: #fff; color: var(--muted); padding: 6px 14px; font-size: 13px; }
   .mode-toggle button[aria-checked="true"] { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
 
-  /* ambient escalation banner (§4 layer 2) */
-  #escalation-banner {
-    display: flex; align-items: center; gap: 10px; padding: 9px 16px;
-    background: var(--amber-bg); border-bottom: 1px solid var(--amber-line); color: var(--amber-ink); font-size: 13.5px;
+  /* ambient escalation flag — sits beside the Observations heading, coloured by severity (§4 layer 2).
+     Replaces the old top-of-page banner: same "loud once → ambient" status, less chrome. */
+  .obs-flag {
+    border: 0; background: transparent; padding: 0; margin-left: 6px; cursor: help;
+    font-size: 15px; line-height: 1; vertical-align: middle;
   }
-  #escalation-banner.urgent { background: var(--red-bg); border-bottom-color: var(--red-line); color: var(--red-ink); }
-  #escalation-banner[hidden] { display: none; }
-  #escalation-banner .esc-icon { font-size: 16px; }
-  #escalation-banner button {
-    margin-left: auto; border: 1px solid currentColor; background: transparent; color: inherit;
-    border-radius: 7px; padding: 3px 10px; font-size: 12.5px;
-  }
+  .obs-flag.attention { color: var(--amber-ink); }
+  .obs-flag.urgent { color: var(--red-ink); }
+  .obs-flag[hidden] { display: none; }
 
   /* ---- layout ---------------------------------------------------------------------------------- */
   /* Three regions on a grid; the two side columns are drag-resizable via the .resizer gutters below.
@@ -92,15 +110,20 @@
     grid-template-columns: 0 0 minmax(0, 1fr) var(--gutter) clamp(220px, var(--obs-w), 40vw);
   }
   aside, .center { min-height: 0; overflow: auto; }
-  /* the control panel keeps overflow:visible so button hover-tooltips can escape the narrow column to
-     the right (you can't have overflow-x:visible + overflow-y:auto — one non-visible axis forces both
-     to auto). So instead of scrolling the panel, it is a flex column: the buttons/labels hold their
-     natural height and ONLY the readout flexes + scrolls to absorb leftover space, so a long route
-     response can never push the panel below the bottom of the page. */
-  .control { display: flex; flex-direction: column; background: #fbfcfd; padding: 12px; overflow: visible; }
+  /* the control panel scrolls vertically when its routes + readout exceed the viewport. overflow-y:auto
+     forces overflow-x to auto too (you can't pair overflow-x:visible with overflow-y:auto), so the route
+     tooltips can no longer escape sideways — they open full-width BELOW their button instead (see
+     .cp-btn[data-tip] below). Children don't shrink, so the panel scrolls as one rather than collapsing
+     the readout first. */
+  .control { display: flex; flex-direction: column; background: #fbfcfd; padding: 12px; overflow-y: auto; }
   .control > * { flex-shrink: 0; }
   .center { display: flex; flex-direction: column; }
-  .observations { background: var(--panel); padding: 14px; }
+  /* Like .control, the observations panel keeps overflow:visible so the heading flag's tooltip can
+     escape the column instead of being clipped (overflow-y:auto would clip it). The panel is a flex
+     column: the heading + sub hold natural height and ONLY the list flexes + scrolls. */
+  .observations { display: flex; flex-direction: column; background: var(--panel); padding: 14px; overflow: visible; }
+  .observations > h2, .observations > .obs-sub { flex-shrink: 0; }
+  #observations-list { flex: 1 1 auto; min-height: 0; overflow: auto; }
 
   /* drag gutter — a transparent col-resize track whose centred 1px ::before is the resting divider
      (it replaces the panels' old side borders, so the seam looks identical at rest). Keyboard-operable:
@@ -149,19 +172,45 @@
   }
   /* tooltips for elements where right-side would overflow the viewport flip below-left */
   .tip-below:hover::after, .tip-below:focus-visible::after { left: auto; right: 0; top: calc(100% + 6px); }
+  /* route-button tooltips open full-width BELOW the button: the panel scrolls (overflow-x:auto), so a
+     right-escaping tooltip would clip — a column-width tooltip that wraps never overflows sideways. */
+  .cp-btn[data-tip]:hover::after, .cp-btn[data-tip]:focus-visible::after {
+    left: 0; right: 0; top: calc(100% + 4px); width: auto;
+  }
 
   .readout-label { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 14px 0 5px; }
   #cp-readout {
     background: #0f172a; color: #cbd5e1; border-radius: 8px; padding: 9px; font-size: 11.5px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    /* flex:0 1 auto — don't grow (short output stays a small box), but shrink to fit the panel's
-       height when output is long; min-height:0 lets it shrink below content so overflow:auto scrolls. */
-    flex: 0 1 auto; min-height: 0; max-height: 260px; overflow: auto;
+    /* flex:0 0 auto — natural height (capped at max-height with its own scroll for long JSON); it does
+       NOT shrink, so when routes + readout exceed the panel the whole .control scrolls rather than the
+       readout collapsing first. */
+    flex: 0 0 auto; max-height: 260px; overflow: auto;
   }
+
+  /* ---- feedback form (rendered into #cp-readout: styled for the dark background) ----------------- */
+  .cp-form { display: flex; flex-direction: column; gap: 7px; font-family: inherit; color: #e2e8f0; }
+  .cp-form label { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: #94a3b8; margin-bottom: 2px; display: block; }
+  .cp-form select, .cp-form input, .cp-form textarea {
+    width: 100%; box-sizing: border-box; background: #1e293b; color: #e2e8f0;
+    border: 1px solid #334155; border-radius: 6px; padding: 5px 7px; font: inherit; font-size: 12px;
+  }
+  .cp-form textarea { resize: vertical; min-height: 44px; }
+  .cp-form .cp-form-row { display: flex; gap: 7px; }
+  .cp-form .cp-form-row > div { flex: 1; }
+  .cp-form button {
+    background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 6px 9px;
+    font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; margin-top: 2px;
+  }
+  .cp-form button:disabled { opacity: .5; cursor: default; }
+  .cp-form-hint { font-size: 10.5px; color: #94a3b8; line-height: 1.4; }
+  .cp-form-status { font-size: 11px; line-height: 1.4; white-space: pre-wrap; }
+  .cp-form-status.ok { color: #6ee7b7; }
+  .cp-form-status.err { color: #fca5a5; }
 
   /* ---- conversation ---------------------------------------------------------------------------- */
   #conversation-log { flex: 1; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
-  .empty-hint { color: var(--muted); font-size: 13.5px; text-align: center; margin: 32px 12px; }
+  .empty-hint { color: var(--muted); font-size: 13.5px; text-align: center; margin: auto 12px; }
   .member-bubble {
     align-self: flex-end; max-width: 78%; background: var(--accent); color: #fff;
     padding: 8px 12px; border-radius: 14px 14px 4px 14px; font-size: 14px;
@@ -235,12 +284,12 @@
   .obs-item { border: 1px solid var(--line); border-radius: var(--radius); padding: 10px; margin-bottom: 9px; background: #fff; }
   /* the header "view" button pulses the flagged items so the action has a visible effect even when the
      panel is already on-screen (a plain scrollIntoView is a no-op on desktop). */
-  .obs-item.flash { animation: obs-flash 1.2s ease-out 2; }
+  .obs-item.flash, .answer-card.flash { animation: obs-flash 1.2s ease-out 2; }
   @keyframes obs-flash {
     0%, 100% { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0); }
     25%      { box-shadow: 0 0 0 4px rgba(37, 99, 235, .38); }
   }
-  @media (prefers-reduced-motion: reduce) { .obs-item.flash { animation: none; } }
+  @media (prefers-reduced-motion: reduce) { .obs-item.flash, .answer-card.flash { animation: none; } }
   .obs-item.attention { background: var(--amber-bg); border-color: var(--amber-line); }
   .obs-item.urgent { background: var(--red-bg); border-color: var(--red-line); }
   .obs-kicker { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }
@@ -251,25 +300,19 @@
   .obs-item details > summary { cursor: pointer; font-size: 12px; color: var(--accent); list-style: none; }
   .obs-why { font-size: 12px; color: var(--ink); margin-top: 5px; }
 
-  /* ---- confirm modal --------------------------------------------------------------------------- */
-  .modal-scrim { position: fixed; inset: 0; background: rgba(15,23,42,.4); display: flex; align-items: center; justify-content: center; z-index: 100; }
-  .modal { background: #fff; border-radius: 12px; padding: 18px; width: 340px; box-shadow: 0 12px 40px rgba(0,0,0,.25); }
-  .modal h3 { margin-bottom: 8px; }
-  .modal p { font-size: 13.5px; color: var(--muted); margin: 0 0 16px; }
-  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
-  .modal-actions button { border-radius: 8px; padding: 8px 14px; border: 1px solid var(--line); background: #fff; }
-  .modal-actions .danger { background: var(--red-line); color: #fff; border-color: var(--red-line); }
+  /* ---- trajectory sparklines (Phase 7 — the only non-JSON readout; rendered on the dark readout) -- */
+  .spark-wrap { display: flex; flex-direction: column; gap: 11px; }
+  .spark-card { display: flex; flex-direction: column; gap: 3px; }
+  .spark-head { display: flex; align-items: baseline; gap: 8px; }
+  .spark-name { font-weight: 600; color: #e2e8f0; }
+  .spark-flag { font-size: 10.5px; color: #fbbf24; }   /* amber out-of-range — icon+TEXT, never colour alone (a11y) */
+  .spark-flag.panic { color: #f87171; }                /* red panic */
+  .spark-sub { color: #94a3b8; font-size: 10.5px; }
+  svg.spark { display: block; background: #0b1220; border-radius: 5px; }
 </style>
 </head>
 <body>
   <header>
-    <div id="escalation-banner" role="status" aria-live="polite" hidden>
-      <span class="esc-icon" aria-hidden="true">⚑</span>
-      <span class="esc-text"></span>
-      <button id="esc-view-btn" data-tip="Jump to the Observations panel to see what's flagged."
-              aria-label="View the flagged results in the Observations panel" class="tip-below">view</button>
-    </div>
-
     <div class="topbar">
       <span class="brand">Health Intelligence</span>
 
@@ -278,8 +321,15 @@
             aria-label="Sample data — synthetic only. This does not constitute medical advice, diagnosis, or treatment.">&#9888;&#65038;</span>
 
       <div class="picker-wrap" id="picker-wrap">
-        <label for="member-picker">Member</label>
-        <select id="member-picker" aria-label="Select member"></select>
+        <label id="picker-label-txt">Member</label>
+        <div class="dropdown" id="member-dd">
+          <button type="button" id="member-picker-btn" class="dd-btn" aria-haspopup="listbox"
+                  aria-expanded="false" aria-labelledby="picker-label-txt member-picker-label">
+            <span id="member-picker-label">Select member</span>
+            <span class="dd-caret" aria-hidden="true">▾</span>
+          </button>
+          <ul id="member-picker-list" class="dd-list" role="listbox" aria-label="Members" hidden></ul>
+        </div>
       </div>
 
       <div class="mode-wrap">
@@ -329,13 +379,11 @@
 
     <!-- RIGHT · proactive observations -->
     <aside class="observations" aria-label="Observations">
-      <h2>Observations</h2>
+      <h2>Observations<button id="obs-flag" type="button" class="obs-flag tip-below" hidden>⚑</button></h2>
       <div class="obs-sub">Raised proactively from your trajectory, ranked by what's worth knowing.</div>
       <div id="observations-list"></div>
     </aside>
   </main>
-
-  <div id="confirm-host"></div>
 
 <script>
 "use strict";
@@ -371,18 +419,28 @@
   const ROUTES = [
     { group: "Data", label: "Upload bundle", verb: "POST", handler: () => $("#upload-file").click(),
       tip: "POST /members · pick a MemberBundle JSON file and ingest it now. A malformed file shows the validation error here — the upload is the format check." },
-    { group: "Data", label: "Seed sample", verb: "POST", handler: seedSample,
-      tip: "POST /members · ingest the shipped sample bundle (member C13). Upsert: re-ingesting refreshes facts and preserves the audit/learning trail." },
-    { group: "Data", label: "Clear member", verb: "DELETE", destructive: true, handler: confirmClear,
-      tip: "DELETE /members/{id} · remove the selected member and all their data. Asks to confirm." },
-    { group: "Proactive", label: "Run scan", verb: "POST", handler: () => withMember(async (m) => { await runScan(m, true); await refreshEscalations(m); }),
+    { group: "Data", label: "Reseed (factory)", verb: "POST", destructive: true, handler: reseed,
+      tip: "POST /admin/reseed · TRUNCATE all tables and re-ingest the original training_data members. Drops uploads + all learning/audit history. Fires immediately — red cue only, no confirm." },
+    { group: "Proactive", label: "Scan member", verb: "POST", handler: () => withMember(async (m) => { await runScan(m, true); await refreshEscalations(m); }),
       tip: "POST /members/{id}/scan · run the proactive drift scan now and refresh the Observations panel." },
+    { group: "Proactive", label: "Scan all", verb: "POST", handler: scanAll,
+      tip: "POST /members/{id}/scan for every member in turn · run the proactive drift scan across all members and summarise the per-member result here." },
     { group: "Proactive", label: "Observations", verb: "GET", handler: () => readoutRoute((m) => `/members/${enc(m)}/observations`),
       tip: "GET /members/{id}/observations · the member's current proactive findings (raw JSON)." },
     { group: "Proactive", label: "Suggestions", verb: "GET", handler: () => readoutRoute((m) => `/members/${enc(m)}/suggestions`),
       tip: "GET /members/{id}/suggestions · the Mode-1 preset chips + pre-computed answers (raw JSON)." },
     { group: "Proactive", label: "Clinician queue", verb: "GET", handler: () => readoutRoute((m) => `/members/${enc(m)}/escalations`),
       tip: "GET /members/{id}/escalations · the clinician-review hand-off queue (raw JSON)." },
+    { group: "Proactive", label: "Trajectory", verb: "GET", handler: showTrajectory,
+      tip: "GET /members/{id}/trajectory · each marker's series with its Theil–Sen line + flagged points, drawn as sparklines (human verification of a finding). The LLM never sees this raw series." },
+    { group: "Learning", label: "Run learn", verb: "POST", handler: runLearn,
+      tip: "POST /learn · rule-assemble a candidate composer prompt from feedback signals and gate it through the eval harness; promote iff nothing regresses. Needs ANTHROPIC_API_KEY; can take a minute." },
+    { group: "Learning", label: "Submit feedback", verb: "POST", handler: feedbackForm,
+      tip: "POST /members/{id}/feedback · open a form to record a correction (range_override · suppress_marker · preference) or a signal (helpful · incorrect · escalation_accept|reject) on the selected member. Corrections re-resolve into the core on the next scan/ask; revert with Reset learning." },
+    { group: "Learning", label: "Sample override", verb: "POST", handler: sampleOverride,
+      tip: "POST /members/{id}/feedback · one-click demo: apply a sample clinician range-override to the selected member's first flagged marker; then run Scan member to see its out-of-range flag clear. Revert with Reset learning." },
+    { group: "Learning", label: "Reset learning", verb: "POST", destructive: true, handler: resetLearning,
+      tip: "POST /reset · deactivate all feedback overrides and revert the composer prompt to v0. Not a data wipe. Fires immediately — red cue only, no confirm." },
     { group: "System", label: "Health", verb: "GET", handler: () => readoutRoute(() => `/health`),
       tip: "GET /health · liveness check." },
   ];
@@ -395,6 +453,7 @@
     loading: false,             // member-load in flight: blocks asks until the safety state is loaded
     loadError: false,           // a member-load fetch failed → surface honestly, never a false all-clear
     observations: [], activeEscalations: [],
+    readoutKey: null,           // path currently shown in the route readout; a repeat click toggles it back to default
     transitionShown: new Map(), // escalation_id -> level already shown loud (so it never re-alarms)
     reqToken: 0,                // bumped on every member switch; stale async results are dropped
   };
@@ -468,14 +527,14 @@
   function clearMemberView() {
     flushMemberState();
     state.currentMember = null;
-    $("#member-picker").value = "";
-    renderConversation(); renderObservations(); renderEscalationBanner(); renderChips(); updateAskDisabled();
+    syncPicker();
+    renderConversation(); renderObservations(); renderEscalationFlag(); renderChips(); updateAskDisabled();
   }
 
   // ---- boot -------------------------------------------------------------------------------------
   async function boot() {
     // a production member build (operatorView=false) drops the WHOLE operator column, not just the
-    // picker/trace/gutter — so the panel (incl. the destructive Clear button) can't reach a member (#5).
+    // picker/trace/gutter — so the operator panel can't reach a member (#5).
     if (!operatorView) document.body.classList.add("member-only");
     renderControlPanel();
     wireStaticHandlers();
@@ -493,39 +552,63 @@
     else clearMemberView();   // roster empty (last member cleared) → don't leave a stale surface (#3)
   }
 
-  // member-load sequence: scan → escalations → suggestions (scan-on-ingest isn't wired server-side,
-  // so the UI scans on select — which keeps "findings exist before chat" true for the flow).
+  // member-load sequence: load EXISTING state only (observations + escalations + suggestions) — all
+  // READS, never a scan. A member scan is only ever triggered manually via the "Run scan" button, so
+  // selecting a member shows whatever the last scan left (nothing until the operator runs one).
   async function selectMember(id) {
     flushMemberState();
     state.currentMember = id;
     state.loading = true;        // block asks until the member's safety state is loaded (#2)
-    $("#member-picker").value = id;
-    renderConversation(); renderObservations(); renderEscalationBanner(); renderChips(); updateAskDisabled();
+    syncPicker();
+    renderConversation(); renderObservations(); renderEscalationFlag(); renderChips(); updateAskDisabled();
 
     const token = state.reqToken;
-    const scanR = await runScan(id, false);   // runScan no longer refreshes escalations itself (#9)
-    if (token !== state.reqToken) return;
-    // escalations + suggestions both depend only on the completed scan, not each other → parallel (#12)
-    const [escR] = await Promise.all([refreshEscalations(id), refreshSuggestions(id)]);
+    // all three are READS (GET observations / escalations / suggestions); none triggers a scan.
+    const [obsR, escR] = await Promise.all([loadObservations(id), refreshEscalations(id), refreshSuggestions(id)]);
     if (token !== state.reqToken) return;
     state.loading = false;
     // honest surface: if a safety-critical load fetch failed, don't render a falsely-calm all-clear (#4)
-    state.loadError = !(scanR.ok && escR.ok);
-    renderObservations(); renderEscalationBanner(); updateAskDisabled();
+    state.loadError = !(obsR.ok && escR.ok);
+    renderObservations(); renderEscalationFlag(); updateAskDisabled();
   }
 
+  // GET the member's current observations (a READ of the last scan's output — never triggers a scan).
+  async function loadObservations(id) {
+    const r = await api("GET", `/members/${enc(id)}/observations`);
+    if (r.ok && id === state.currentMember) { state.observations = r.data; renderObservations(); }
+    return r;
+  }
+
+  // The ONLY scan trigger — wired solely to the operator "Run scan" button (a member scan is manual-only).
   async function runScan(id, toReadout) {
     const r = await api("POST", `/members/${enc(id)}/scan`);
     if (toReadout) renderReadout(r.data);
     if (r.ok && id === state.currentMember) { state.observations = r.data; renderObservations(); }
-    // NOTE: callers refresh escalations after a scan (selectMember in parallel with suggestions; the
-    // operator "Run scan" handler right after) — runScan no longer double-fetches them (#9).
     return r;
+  }
+
+  // Operator "Scan all": fire the existing per-member scan route for every member in turn (the panel
+  // adds no new route — it only drives ones the API already exposes), then summarise per-member in the
+  // readout. The on-screen member's panel + escalation flag are refreshed from its own fresh scan.
+  async function scanAll() {
+    const members = state.members;
+    if (!members.length) return renderReadout({ error: "No members to scan." });
+    renderReadout(`Scanning ${members.length} members…`);
+    const results = [];
+    for (const m of members) {
+      const r = await api("POST", `/members/${enc(m.member_id)}/scan`);
+      results.push(r.ok ? { member_id: m.member_id, observations: r.data.length }
+                        : { member_id: m.member_id, error: r.status });
+      if (r.ok && m.member_id === state.currentMember) { state.observations = r.data; renderObservations(); }
+    }
+    if (state.currentMember) await refreshEscalations(state.currentMember);
+    const failed = results.filter((x) => x.error != null).length;
+    renderReadout({ scanned: results.length, failed, results });
   }
 
   async function refreshEscalations(id) {
     const r = await api("GET", `/members/${enc(id)}/escalations`);
-    if (r.ok && id === state.currentMember) { state.activeEscalations = r.data; renderEscalationBanner(); }
+    if (r.ok && id === state.currentMember) { state.activeEscalations = r.data; renderEscalationFlag(); }
     return r;
   }
 
@@ -540,14 +623,27 @@
 
   // ---- Mode 1: a chip click is a pure read; render its pre-computed answer, then regenerate chips -
   async function onChipClick(sp) {
+    // a chip's answer is a pure pre-computed read; clicking the same question again must not duplicate
+    // the exchange — find the existing answer already in the log and flash it instead (re-render is moot).
+    const prior = state.log.find((t) => t.kind === "assistant" && t.askedPrompt === sp.prompt);
+    if (prior) { flashTurn(prior); return; }
     state.log.push({ kind: "member", text: sp.prompt });
-    state.log.push({ kind: "assistant", resp: sp.response, isTransition: false });
+    state.log.push({ kind: "assistant", resp: sp.response, isTransition: false, askedPrompt: sp.prompt });
     // derive the focus marker (first cited) and remember it as visited; imperfect focus can't dead-end
     // the loop because the anchors are always present (architecture §2).
     const marker = sp.response.findings?.[0]?.evidence?.[0]?.marker || null;
     if (marker) { state.focus = marker; if (!state.asked.includes(marker)) state.asked.push(marker); }
     renderConversation();
     await refreshSuggestions(state.currentMember);
+  }
+
+  // scroll the existing answer for a turn into view and pulse it — the affordance for "you already
+  // asked this; here's the answer" (mirrors the Observations panel's view-flash).
+  function flashTurn(turn) {
+    const cached = _turnNodes.get(turn);
+    if (!cached) return;
+    cached.node.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    cached.node.classList.remove("flash"); void cached.node.offsetWidth; cached.node.classList.add("flash");
   }
 
   // ---- Mode 2: free-form ask → pending bubble → /ask → card → escalation diff → maybe loud once ---
@@ -605,23 +701,20 @@
 
   async function readoutRoute(pathFn) {
     if (pathFn.length && !state.currentMember) return renderReadout({ error: "No member selected." });
-    const r = await api("GET", pathFn(state.currentMember));
+    const path = pathFn(state.currentMember);
+    if (state.readoutKey === path) { renderReadout("—"); return; } // second click on the same route → back to default
+    const r = await api("GET", path);
     renderReadout(r.data);
+    state.readoutKey = path;
   }
 
-  // POST a bundle dict, surface the result, and on success reload the picker onto it — the shared tail
-  // of both ingest entry points (Seed sample, Upload bundle) (#11). A 422 shows the field error in the
-  // readout (the upload is the format check, ui-ux §2).
+  // POST a bundle dict, surface the result, and on success reload the picker onto it — the ingest tail
+  // for Upload bundle (#11). A 422 shows the field error in the readout (the upload is the format
+  // check, ui-ux §2).
   async function postBundle(bundle) {
     const r = await api("POST", "/members", bundle);
     renderReadout(r.data);
     if (r.ok) await loadMembers(r.data.member_id);
-  }
-
-  async function seedSample() {
-    const f = await api("GET", "/sample_member_bundle.json");
-    if (!f.ok) return renderReadout({ error: "sample bundle not found" });
-    await postBundle(f.data);
   }
 
   async function onUploadFile(file) {
@@ -631,16 +724,222 @@
     await postBundle(parsed);
   }
 
-  function confirmClear() {
-    withMember((m) => openConfirm(
-      "Clear this member?",
-      `This permanently removes ${m} and all of their data (labs, notes, observations, escalations). This can't be undone.`,
-      async () => {
-        const r = await api("DELETE", `/members/${enc(m)}`);
-        renderReadout(r.data);
-        if (r.ok) { clearMemberView(); await loadMembers(); }  // wipe first → a failed reload can't leave it stale (#3)
+  // ---- Phase 7 control-panel handlers (Learning group + Trajectory) -----------------------------
+  async function runLearn() {
+    renderReadout("Running /learn — rule-assembling a candidate prompt and gating it through the eval harness. This calls the real LLM and can take a minute…");
+    const r = await api("POST", "/learn");
+    renderReadout(r.data);  // {version, status, reason, report} — or a 409/503 detail
+  }
+
+  // Demonstrate a clinician range-override: widen a marker's range. Fires directly and always — it
+  // prefers a non-panic out-of-range marker (so a later scan visibly clears its flag), else just takes
+  // the first marker so the POST goes through regardless. Does NOT scan — run "Scan member" to see the
+  // effect. Reverted by "Reset learning".
+  async function sampleOverride() {
+    if (!state.currentMember) return renderReadout({ error: "No member selected." });
+    const m = state.currentMember;
+    const traj = await api("GET", `/members/${enc(m)}/trajectory`);
+    if (!traj.ok) return renderReadout(traj.data);
+    const markers = traj.data || [];
+    if (!markers.length) return renderReadout({ note: `${m} has no markers to override.` });
+    const flagged = markers.find((t) =>
+      !t.flags.some((f) => f.startsWith("panic")) &&
+      (t.flags.includes("above_range") || t.flags.includes("below_range")));
+    const t = flagged || markers[0];
+    const latest = t.readings[t.readings.length - 1].value;
+    const payload = t.flags.includes("below_range")
+      ? { ref_low: Math.floor(latest * 0.5) }
+      : { ref_high: Math.ceil(latest * 1.5) };
+    const fb = { kind: "range_override", target: t.marker, payload, source: "clinician" };
+    const r = await api("POST", `/members/${enc(m)}/feedback`, fb);
+    renderReadout(r.ok ? { applied_override: fb, feedback_id: r.data.feedback_id,
+      note: `Override applied to ${t.marker} on ${m}. Run "Scan member" to see its flag change; revert with "Reset learning".` } : r.data);
+  }
+
+  // ---- /feedback form: the full Feedback surface (correction kinds + signal kinds), rendered into the
+  // readout. The route's payload is dict[str, Any] (permissive) but db.py reads ONLY specific keys per
+  // kind, so a wrong key is silently inert — this client encodes the real per-kind contract instead of
+  // trusting the schema. Each kind declares which input it needs; a marker/finding target and a typed
+  // payload are assembled deterministically, never free-form, so the POST can't no-op on a typo'd key.
+  const FEEDBACK_KINDS = [
+    { kind: "range_override", group: "Correction", target: "marker", payload: "range",
+      hint: "Re-bound a marker. Set ref_low and/or ref_high (one-sided OK). Re-resolves into analysis on the next scan." },
+    { kind: "suppress_marker", group: "Correction", target: "marker", payload: "none",
+      hint: "Drop a marker entirely so the core never analyzes it. Inert against a panic floor (db.py)." },
+    { kind: "preference", group: "Correction", target: "none", payload: "text",
+      hint: "A composer tone hint joined to the Mode-2 prompt — never a number or the escalation floor." },
+    { kind: "helpful", group: "Signal", target: "finding", payload: "none", hint: "Positive signal on a finding; feeds /learn." },
+    { kind: "incorrect", group: "Signal", target: "finding", payload: "none", hint: "Negative signal on a finding; feeds /learn." },
+    { kind: "escalation_accept", group: "Signal", target: "finding", payload: "none", hint: "Confirm an escalation was warranted; feeds /learn." },
+    { kind: "escalation_reject", group: "Signal", target: "finding", payload: "none", hint: "Mark an escalation as a false alarm; feeds /learn." },
+  ];
+
+  function feedbackForm() {
+    if (!state.currentMember) return renderReadout({ error: "No member selected." });
+    const m = state.currentMember;
+    const host = $("#cp-readout"); host.textContent = ""; state.readoutKey = null;
+    const form = el("form", "cp-form"); form.setAttribute("autocomplete", "off");
+
+    const sel = (label, opts, val) => {
+      const wrap = el("div"); wrap.appendChild(el("label", null, label));
+      const s = el("select");
+      for (const o of opts) { const op = el("option", null, o.text); op.value = o.value; if (o.value === val) op.selected = true; s.appendChild(op); }
+      wrap.appendChild(s); return { wrap, s };
+    };
+    const field = (label, node) => { const w = el("div"); w.appendChild(el("label", null, label)); w.appendChild(node); return w; };
+
+    form.appendChild(el("div", "cp-form-hint", `Member: ${m}`));
+    const kind = sel("Kind", FEEDBACK_KINDS.map((k) => ({ value: k.kind, text: `${k.kind} (${k.group})` })), "range_override");
+    form.appendChild(kind.wrap);
+    const source = sel("Source", [{ value: "clinician", text: "clinician" }, { value: "member", text: "member" }, { value: "system", text: "system" }], "clinician");
+    form.appendChild(source.wrap);
+
+    // payload/target inputs, shown/hidden per kind
+    const targetInput = el("input"); targetInput.placeholder = "marker key (e.g. HbA1c)";
+    const targetField = field("Target", targetInput);
+    const refLow = el("input"); refLow.type = "number"; refLow.step = "any"; refLow.placeholder = "ref_low";
+    const refHigh = el("input"); refHigh.type = "number"; refHigh.step = "any"; refHigh.placeholder = "ref_high";
+    const rangeRow = el("div", "cp-form-row");
+    rangeRow.appendChild(field("Ref low", refLow)); rangeRow.appendChild(field("Ref high", refHigh));
+    const prefText = el("textarea"); prefText.placeholder = "preference hint (tone only — never numbers)";
+    const prefField = field("Preference text", prefText);
+    const hint = el("div", "cp-form-hint");
+    const status = el("div", "cp-form-status");
+    const submit = el("button", null, "Submit feedback"); submit.type = "submit";
+
+    form.appendChild(targetField); form.appendChild(rangeRow); form.appendChild(prefField);
+    form.appendChild(hint); form.appendChild(submit); form.appendChild(status);
+
+    const spec = () => FEEDBACK_KINDS.find((k) => k.kind === kind.s.value);
+    function syncFields() {
+      const k = spec();
+      targetField.hidden = k.target === "none";
+      targetInput.placeholder = k.target === "finding" ? "finding_id" : "marker key (e.g. HbA1c)";
+      rangeRow.hidden = k.payload !== "range";
+      prefField.hidden = k.payload !== "text";
+      hint.textContent = k.hint;
+      status.textContent = ""; status.className = "cp-form-status";
+    }
+    kind.s.addEventListener("change", syncFields);
+    syncFields();
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const k = spec();
+      const target = targetInput.value.trim();
+      let payload = null;
+      if (k.target !== "none" && !target)
+        return setStatus(status, "err", `${k.kind} needs a ${k.target === "finding" ? "finding_id" : "marker"} target — without it the feedback matches nothing and silently no-ops.`);
+      if (k.payload === "range") {
+        const lo = refLow.value.trim(), hi = refHigh.value.trim();
+        if (!lo && !hi) return setStatus(status, "err", "range_override needs at least one of ref_low / ref_high.");
+        payload = {}; if (lo) payload.ref_low = Number(lo); if (hi) payload.ref_high = Number(hi);
+      } else if (k.payload === "text") {
+        const t = prefText.value.trim();
+        if (!t) return setStatus(status, "err", "preference needs some text.");
+        payload = { text: t };
       }
-    ));
+      const fb = { kind: k.kind, target: k.target === "none" ? null : target, payload, source: source.s.value };
+      submit.disabled = true; setStatus(status, "", "Submitting…");
+      const r = await api("POST", `/members/${enc(m)}/feedback`, fb);
+      submit.disabled = false;
+      if (r.ok) {
+        const note = k.payload === "range" || k.kind === "suppress_marker"
+          ? ' Run "Scan member" to see the flag change; revert with "Reset learning".'
+          : ' Feeds the next "Run learn" gate.';
+        setStatus(status, "ok", `Recorded ${k.kind} (feedback_id ${r.data.feedback_id}).${note}`);
+      } else {
+        setStatus(status, "err", typeof r.data === "string" ? r.data : JSON.stringify(r.data));
+      }
+    });
+    host.appendChild(form);
+  }
+
+  function setStatus(node, cls, msg) { node.className = "cp-form-status" + (cls ? " " + cls : ""); node.textContent = msg; }
+
+  // Reset learning + factory reseed fire DIRECTLY (no confirm) — the operator panel is an unrestricted
+  // API console; whatever the route returns is shown in the readout.
+  async function resetLearning() {
+    const r = await api("POST", "/reset");
+    renderReadout(r.data);
+    if (state.currentMember) await refreshEscalations(state.currentMember);  // a READ; no scan (run one to see flag changes)
+  }
+
+  async function reseed() {
+    const r = await api("POST", "/admin/reseed");
+    renderReadout(r.data);
+    clearMemberView(); await loadMembers();  // picker repopulates with the restored 15
+  }
+
+  // ---- trajectory sparklines -------------------------------------------------------------------
+  const SVGNS = "http://www.w3.org/2000/svg";
+  const svg = (tag, attrs) => { const n = document.createElementNS(SVGNS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); return n; };
+
+  async function showTrajectory() {
+    if (!state.currentMember) return renderReadout({ error: "No member selected." });
+    const path = `/members/${enc(state.currentMember)}/trajectory`;
+    if (state.readoutKey === path) { renderReadout("—"); return; }  // second click toggles back to default
+    const r = await api("GET", path);
+    if (!r.ok) return renderReadout(r.data);
+    renderTrajectory(r.data);
+    state.readoutKey = path;  // toggle armed, like readoutRoute (renderReadout disarms it on any other write)
+  }
+
+  function renderTrajectory(markers) {
+    const host = $("#cp-readout");
+    host.textContent = "";
+    if (!markers || !markers.length) { host.textContent = "No markers."; return; }
+    const wrap = el("div", "spark-wrap");
+    for (const t of markers) wrap.appendChild(sparkCard(t));
+    host.appendChild(wrap);
+  }
+
+  function sparkCard(t) {
+    const card = el("div", "spark-card");
+    const vals = t.readings.map((r) => r.value);
+    const panic = t.flags.find((f) => f.startsWith("panic"));
+    const flag = panic || t.flags.find((f) => f === "above_range" || f === "below_range");
+    const head = el("div", "spark-head");
+    head.appendChild(el("span", "spark-name", t.marker));
+    if (flag) {
+      const lab = el("span", "spark-flag" + (panic ? " panic" : ""));
+      lab.textContent = `${panic ? "‼" : "⚑"} ${flag.replace("_", " ")}`;  // icon + TEXT (never colour alone)
+      head.appendChild(lab);
+    }
+    card.appendChild(head);
+    card.appendChild(sparkSvg(t, vals, !!panic, !!flag));
+    const last = t.readings[t.readings.length - 1];
+    // show the Theil–Sen direction where one is asserted; for a sub-n_min series (no MK verdict) say so
+    // explicitly, so the absent trend line reads as an honest abstention rather than a missing element.
+    const dir = t.trend
+      ? (t.trend.slope != null ? ` · ${t.trend.direction}` : "")
+      : " · trend not computed (short series)";
+    card.appendChild(el("div", "spark-sub", `${vals.length} readings · latest ${last ? last.value : "—"} ${t.unit || ""}${dir}`));
+    return card;
+  }
+
+  function sparkSvg(t, vals, panic, flagged) {
+    const W = 240, H = 46, pad = 5, n = vals.length;
+    const rr = t.reference_range || {};
+    const domain = [...vals];
+    if (t.theil_sen) for (const p of t.theil_sen) domain.push(p.value);
+    if (rr.ref_low != null) domain.push(rr.ref_low);
+    if (rr.ref_high != null) domain.push(rr.ref_high);
+    let lo = Math.min(...domain), hi = Math.max(...domain);
+    if (hi === lo) { hi += 1; lo -= 1; }
+    const x = (i) => (n <= 1 ? W / 2 : pad + (i / (n - 1)) * (W - 2 * pad));
+    const y = (v) => H - pad - ((v - lo) / (hi - lo)) * (H - 2 * pad);
+    const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, class: "spark", width: W, height: H, role: "img", "aria-label": `${t.marker} trend over ${n} readings` });
+    if (rr.ref_low != null && rr.ref_high != null)  // the normal band, faint
+      s.appendChild(svg("rect", { x: 0, y: y(rr.ref_high), width: W, height: Math.max(1, y(rr.ref_low) - y(rr.ref_high)), fill: "#1e293b" }));
+    if (t.theil_sen && t.theil_sen.length === 2)  // the already-computed Theil–Sen line, dashed
+      s.appendChild(svg("line", { x1: x(0), y1: y(t.theil_sen[0].value), x2: x(n - 1), y2: y(t.theil_sen[1].value), stroke: "#94a3b8", "stroke-width": 1, "stroke-dasharray": "3 3" }));
+    s.appendChild(svg("polyline", { points: vals.map((v, i) => `${x(i)},${y(v)}`).join(" "), fill: "none", stroke: "#60a5fa", "stroke-width": 1.5 }));
+    vals.forEach((v, i) => {
+      const isLast = i === n - 1, mark = isLast && flagged;
+      s.appendChild(svg("circle", { cx: x(i), cy: y(v), r: mark ? 3.5 : 2, fill: mark ? (panic ? "#f87171" : "#fbbf24") : "#60a5fa" }));
+    });
+    return s;
   }
 
   // ============================== RENDER ==========================================================
@@ -663,15 +962,83 @@
     }
   }
 
+  // ---- custom member dropdown (see .dropdown CSS for why it isn't a native <select>) ---------------
+  const memberLabel = (m) => `${m.member_id} · ${m.sex}${m.age != null ? ", " + m.age : ""}`;
+
   function renderMemberPicker() {
-    const sel = $("#member-picker"); sel.innerHTML = "";
+    const list = $("#member-picker-list"); list.innerHTML = "";
     $("#picker-wrap").hidden = !operatorView;
     for (const m of state.members) {
-      const o = el("option", null, `${m.member_id} · ${m.sex}${m.age != null ? ", " + m.age : ""}`);
-      o.value = m.member_id;
-      sel.appendChild(o);
+      const li = el("li", "dd-opt", memberLabel(m));
+      li.setAttribute("role", "option");
+      li.dataset.value = m.member_id;
+      li.addEventListener("click", () => commitPicker(m.member_id));
+      list.appendChild(li);
     }
-    if (state.currentMember) sel.value = state.currentMember;
+    syncPicker();
+  }
+
+  // reflect state.currentMember in the button label + the selected-row marker (replaces select.value = id)
+  function syncPicker() {
+    const m = state.members.find((x) => x.member_id === state.currentMember);
+    $("#member-picker-label").textContent = m ? memberLabel(m) : "Select member";
+    for (const li of $("#member-picker-list").children)
+      li.setAttribute("aria-selected", String(li.dataset.value === state.currentMember));
+  }
+
+  const pickerOpen = () => !$("#member-picker-list").hidden;
+
+  function openPicker() {
+    if (!state.members.length) return;
+    $("#member-picker-list").hidden = false;
+    $("#member-picker-btn").setAttribute("aria-expanded", "true");
+    setPickerActive([...$("#member-picker-list").children]
+      .findIndex((li) => li.dataset.value === state.currentMember));
+  }
+
+  function closePicker() {
+    $("#member-picker-list").hidden = true;
+    $("#member-picker-btn").setAttribute("aria-expanded", "false");
+  }
+
+  function setPickerActive(i) {
+    const opts = [...$("#member-picker-list").children];
+    if (!opts.length) return;
+    const idx = (i + opts.length) % opts.length;
+    opts.forEach((li, k) => li.classList.toggle("active", k === idx));
+    opts[idx].scrollIntoView({ block: "nearest" });
+  }
+
+  function movePickerActive(delta) {
+    const opts = [...$("#member-picker-list").children];
+    const cur = opts.findIndex((li) => li.classList.contains("active"));
+    setPickerActive((cur < 0 ? 0 : cur) + delta);
+  }
+
+  // commit a selection: close, restore focus, and switch member only on an actual change (a native
+  // <select> fires no `change` when re-picking the current value — match that, incl. the stale-readout clear).
+  function commitPicker(id) {
+    closePicker();
+    $("#member-picker-btn").focus();
+    if (id && id !== state.currentMember) {
+      renderReadout("—");   // the prior member's route response is stale on switch (#3)
+      selectMember(id);
+    }
+  }
+
+  function onPickerKey(e) {
+    if (e.key === "Escape") { if (pickerOpen()) { e.preventDefault(); closePicker(); } return; }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!pickerOpen()) { openPicker(); return; }
+      movePickerActive(e.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+    if ((e.key === "Enter" || e.key === " ") && pickerOpen()) {
+      e.preventDefault();
+      const active = $("#member-picker-list").querySelector(".dd-opt.active");
+      if (active) commitPicker(active.dataset.value);
+    }
   }
 
   function renderModeToggle() {
@@ -681,26 +1048,27 @@
     $("#ask-form").hidden = state.mode !== 2;
   }
 
-  function renderEscalationBanner() {
-    const banner = $("#escalation-banner");
-    if (state.loadError) {  // a load fetch failed → say so; never a silent all-clear (#4)
-      banner.hidden = false; banner.classList.remove("urgent");
-      banner.querySelector(".esc-icon").textContent = "⚠";
-      banner.querySelector(".esc-text").textContent =
-        "Couldn't load your latest results — tap Retry in the Observations panel.";
-      return;
-    }
-    const active = state.activeEscalations;
-    if (!active.length) { banner.hidden = true; return; }
+  // The ambient escalation flag beside the Observations heading. A load failure is NOT shown here — it
+  // surfaces in the panel body with a Retry (renderObservations), so the flag stays a pure all-clear/flagged
+  // signal and a failed load is never mistaken for an escalation (#4). Coloured by severity, never colour
+  // alone: it carries a hover/focus message and an aria-label (§8).
+  function renderEscalationFlag() {
+    const flag = $("#obs-flag");
+    const active = state.loadError ? [] : state.activeEscalations;
+    if (!active.length) { flag.hidden = true; return; }
     const anyUrgent = active.some((e) => e.level === "urgent");
-    banner.hidden = false;
-    banner.classList.toggle("urgent", anyUrgent);
-    banner.querySelector(".esc-icon").textContent = anyUrgent ? "‼" : "⚑";
-    // No count: the banner ambiently summarises BOTH scan findings and chat escalations (ui-ux §107/§110),
+    // No count: the flag ambiently summarises BOTH scan findings and chat escalations (ui-ux §107/§110),
     // but the Observations panel only renders scan findings — so any number is unverifiable against what
-    // the member can "view". The documented copy has none; the banner shows on active.length >= 1.
-    banner.querySelector(".esc-text").textContent =
-      "Some results have been flagged for your care team.";
+    // the member can "view". The flag shows on active.length >= 1. Glyph + message differ by tier so the
+    // urgent/attention distinction is never colour alone (§8): ‼ vs ⚑, matching ESCALATION_META.
+    const msg = anyUrgent
+      ? "Urgent: some results have been flagged for your care team."
+      : "Some results have been flagged for your care team.";
+    flag.hidden = false;
+    flag.textContent = anyUrgent ? "‼" : "⚑";
+    flag.className = `obs-flag tip-below ${anyUrgent ? "urgent" : "attention"}`;
+    flag.setAttribute("data-tip", msg);
+    flag.setAttribute("aria-label", msg);
   }
 
   function renderConversation() {
@@ -859,6 +1227,7 @@
   }
 
   function renderReadout(data) {
+    state.readoutKey = null;  // any non-toggle write disarms the toggle, so the next route click shows output
     $("#cp-readout").textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2);
   }
 
@@ -867,25 +1236,6 @@
     const blocked = state.asking || state.loading;  // also blocked while the member loads (#2)
     if (btn) btn.disabled = blocked;
     if (inp) inp.disabled = blocked;
-  }
-
-  // ---- confirm modal (destructive actions behind a confirm — ui-ux §2) --------------------------
-  function openConfirm(title, body, onYes) {
-    const host = $("#confirm-host");
-    const scrim = el("div", "modal-scrim");
-    const modal = el("div", "modal");
-    modal.setAttribute("role", "dialog"); modal.setAttribute("aria-modal", "true");
-    modal.appendChild(el("h3", null, title));
-    modal.appendChild(el("p", null, body));
-    const actions = el("div", "modal-actions");
-    const cancel = el("button", null, "Cancel");
-    const yes = el("button", "danger", "Clear member");
-    cancel.addEventListener("click", () => host.innerHTML = "");
-    yes.addEventListener("click", async () => { host.innerHTML = ""; await onYes(); });
-    actions.appendChild(cancel); actions.appendChild(yes);
-    modal.appendChild(actions); scrim.appendChild(modal);
-    scrim.addEventListener("click", (e) => { if (e.target === scrim) host.innerHTML = ""; });
-    host.appendChild(scrim);
   }
 
   // ---- resizable side panels (drag the gutters; widths held in memory only — no storage, CLAUDE.md) -
@@ -964,7 +1314,7 @@
   // ---- static handlers --------------------------------------------------------------------------
   function setMode(m) { state.mode = m; renderModeToggle(); renderChips(); }
 
-  // the banner "view" button: bring the flagged observations into view AND pulse them, so the action
+  // clicking the Observations flag: bring the flagged observations into view AND pulse them, so the action
   // is visible even on desktop where the panel is already on-screen (scrollIntoView alone is a no-op).
   function viewFlagged() {
     const obs = $(".observations");
@@ -975,13 +1325,17 @@
   }
 
   function wireStaticHandlers() {
-    $("#member-picker").addEventListener("change", (e) => {
-      renderReadout("—");                 // the prior member's route response is stale on switch — clear it
-      selectMember(e.target.value);
+    // member dropdown: toggle on the button, navigate with keyboard, close on outside-click (the
+    // stale-readout clear + member switch happen in commitPicker on an option choice).
+    $("#member-picker-btn").addEventListener("click", () => (pickerOpen() ? closePicker() : openPicker()));
+    $("#member-picker-btn").addEventListener("keydown", onPickerKey);
+    $("#member-picker-list").addEventListener("keydown", onPickerKey);
+    document.addEventListener("click", (e) => {
+      if (pickerOpen() && !$("#member-dd").contains(e.target)) closePicker();
     });
     $("#mode1-btn").addEventListener("click", () => setMode(1));
     $("#mode2-btn").addEventListener("click", () => setMode(2));
-    $("#esc-view-btn").addEventListener("click", viewFlagged);
+    $("#obs-flag").addEventListener("click", viewFlagged);
     $("#upload-file").addEventListener("change", (e) => { if (e.target.files[0]) onUploadFile(e.target.files[0]); e.target.value = ""; });
     $("#ask-form").addEventListener("submit", (e) => {
       e.preventDefault();

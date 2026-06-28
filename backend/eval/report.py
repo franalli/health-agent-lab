@@ -4,8 +4,9 @@
 safety failures), then per-dimension aggregates, the routing & escalation confusion matrices,
 latency/cost percentiles, consistency flip-rates, the acceptable-set audit (Card-4 — the tolerance is
 visible), the supplied-vs-added and Mode-1-vs-Mode-2 splits, and the per-case pass/fail table. The header
-stamps ``model_version + config_version + data_version`` so two runs are comparable and the JSON is the
-regression-gate artifact.
+stamps ``dataset + model_version + config_version`` so two runs are comparable and the JSON is the
+regression-gate artifact. (Per-case ``data_version`` — a per-member full-record hash, so not a single
+run-level value — is preserved in each response's ``metadata``, not the header.)
 
 The run is RED iff any never-event fired; ordinary dimension failures (a labeled under-call like E12, the
 K⁺ chip-completeness gap on E07) are *expected* and reported, not blocking — that asymmetry is the whole
@@ -16,7 +17,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from eval.types import Case, CaseResponses, ScorerResult
+from eval.types import GATE_DIMENSIONS, Case, CaseResponses, ScorerResult
 from health_intelligence.models import FLOOR_ORDER, FloorLevel
 
 _FLOORS = ["none", "clinician_review", "urgent"]
@@ -106,9 +107,12 @@ class Report(BaseModel):
     def is_red(self) -> bool:
         return bool(self.never_events()) or bool(self.no_response_cases())
 
-    def _dimension_rate(
+    def dimension_rate(
         self, dimension: str, *, tag: str | None = None
     ) -> tuple[int, int]:
+        """(passed, total) for one Mode-2 dimension, optionally scoped to a tag. PUBLIC: the /learn gate
+        (health_intelligence.learn) consumes it to compare a candidate against the baseline, so it is the
+        report's contract surface, not a to_markdown internal."""
         rs = [
             s
             for c in self.cases
@@ -136,8 +140,9 @@ class Report(BaseModel):
             mat[c.expected_route][c.observed_route] += 1
         return mat
 
-    def _safety_recall(self) -> tuple[int, int]:
-        """Of cases whose expected route is acute_medical/crisis, the fraction routed there (recall)."""
+    def safety_recall(self) -> tuple[int, int]:
+        """Of cases whose expected route is acute_medical/crisis, the fraction routed there (recall).
+        PUBLIC: the /learn gate compares candidate vs baseline recall through this accessor."""
         hit = tot = 0
         for c in self.cases:
             if c.expected_route in ("acute_medical", "crisis"):
@@ -191,10 +196,10 @@ class Report(BaseModel):
         L.append("")
         L.append("| dimension | supplied | added | all |")
         L.append("|---|---|---|---|")
-        for dim in ("escalation", "routing", "grounding", "consistency"):
-            sp, spt = self._dimension_rate(dim, tag="supplied")
-            ad, adt = self._dimension_rate(dim, tag="added")
-            al, alt = self._dimension_rate(dim)
+        for dim in GATE_DIMENSIONS:
+            sp, spt = self.dimension_rate(dim, tag="supplied")
+            ad, adt = self.dimension_rate(dim, tag="added")
+            al, alt = self.dimension_rate(dim)
             L.append(f"| {dim} | {sp}/{spt} | {ad}/{adt} | {al}/{alt} |")
         L.append("")
 
@@ -220,7 +225,7 @@ class Report(BaseModel):
         rm = self._routing_matrix()
         for e in _ROUTES:
             L.append(f"| {e} | " + " | ".join(str(rm[e][o]) for o in _ROUTES) + " |")
-        hit, tot = self._safety_recall()
+        hit, tot = self.safety_recall()
         L.append("")
         L.append(
             f"**Recall on acute/crisis**: {hit}/{tot}"

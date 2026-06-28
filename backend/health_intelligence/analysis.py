@@ -8,8 +8,10 @@ clock. This is the one module whose statistical correctness is fully unit-testab
 
 Per marker: build the dated series → select the sex-appropriate range → Mann-Kendall (drift? exact
 small-sample p, Kendall's tau) + Theil-Sen (direction, rate, distribution-free CI) → RCV (is the change
-bigger than the marker's own noise?) → range/panic/band flags. Then one cross-marker FDR pass, a
-direction-aware severity per marker, and a single ``overall_floor`` projection.
+bigger than the marker's own noise?) → range/panic/band flags. Then one cross-marker FDR pass (which
+also lets Mann-Kendall settle the direction of a *significant* trend the Theil-Sen CI flattened on a
+tie — see ``_resolve_direction``), a direction-aware severity per marker, and a single
+``overall_floor`` projection.
 
 Two deliberate deviations, documented at their site and bundled in the Phase-1 report:
 
@@ -24,11 +26,14 @@ Two deliberate deviations, documented at their site and bundled in the Phase-1 r
     is structurally present but currently always-passes its candidates (it would bite only if a future
     config sets q < alpha or widens the family).
 
-  * **E12 / sparse abstention.** The architecture says n < n_min abstains ("too short to call") and an
-    out-of-range value is at most ``notable`` — so C12 (3 panels, eGFR 75->61 below range) projects to
-    ``overall_floor = none`` here, while eval case E12 expects a routine clinician review. That is an
-    architecture-vs-eval tension to settle in Phase 5 (a sub-n_min escalation policy is a *rule*, not a
-    constant), NOT a Phase-1 bug: this module implements the architecture's abstention faithfully.
+  * **E12 / sparse escalation (resolved — see ``_sparse_adverse``).** ``_trend`` still abstains below
+    ``n_min`` ("too short to call" — no MK/Theil-Sen verdict), but a *severity* path now escalates a
+    sub-n_min series that is adverse, strictly monotonic, and clears RCV: at n < n_min the exact MK p
+    floors at 0.33 so FDR is structurally unreachable, and monotonicity is the deterministic stand-in
+    for the significance test it would otherwise require. So C12 (3 panels, eGFR 75->61, RCV-cleared)
+    now projects ``overall_floor = clinician_review`` (never ``urgent`` — panic only), matching E12.
+    This is the one place a trend escalates without FDR, by design, and only because FDR is impossible
+    there. (Policy: ``docs/proposals/fix2-sparse-escalation-policy.md``.)
 """
 
 from __future__ import annotations
@@ -126,6 +131,9 @@ def analyze(
             w.trend is not None
         ):  # only trended markers are in `significant`; also narrows the Optional
             w.trend.significant = significant[w.marker]
+            _resolve_direction(
+                w.trend
+            )  # MK owns direction once significant — un-flatten a tie-vetoed trend
 
     # Pass 2 — assemble each trajectory with its direction-aware severity, then project the floor.
     trajectories = [
@@ -136,7 +144,16 @@ def analyze(
             trend=w.trend,
             clinical_change=w.change,
             flags=w.flags,
-            severity=_severity(w.trend, w.change, w.flags, w.mcfg),
+            severity=_severity(
+                w.trend,
+                w.change,
+                w.flags,
+                w.mcfg,
+                sparse_adverse=_sparse_adverse(
+                    w.series, w.change, w.mcfg, cfg.stats.n_min
+                ),
+            ),
+            n_readings=len(w.series),
         )
         for w in work
     ]
@@ -447,6 +464,29 @@ def _fdr(trends: list[tuple[str, TrendResult]], cfg: AnalysisConfig) -> dict[str
     return {marker: (marker in survivors) for marker, _ in trends}
 
 
+def _resolve_direction(trend: TrendResult) -> None:
+    """Second half of direction resolution, run *after* the FDR pass sets ``significant``.
+
+    ``_trend`` signs direction from the Theil-Sen CI (``increasing`` iff ``lo > 0``); that CI is a
+    separate, stricter test than Mann-Kendall, and a tie can flatten it to span zero even on a clean
+    monotonic series — e.g. HbA1c ``5.6->5.7->5.7->5.8->5.9`` has a zero-slope pair that pins the CI's
+    lower bound at exactly 0, failing ``lo > 0``, so the trend is mislabeled ``flat`` and silently
+    dropped from the adverse-trend severity path (``_is_adverse`` needs a signed direction).
+
+    But once the FDR pass *certifies* the trend, the Mann-Kendall statistic IS the direction verdict:
+    ``sign(S) == sign(tau)`` (tau is ``S`` over a positive denominator). So for a significant trend
+    the CI's tie-induced abstention is the wrong gate — resolve direction from the test that certified
+    it. This changes *direction only*: ``slope`` stays ``None`` because the Theil-Sen *rate* CI does
+    span zero (the magnitude is genuinely unasserted — the documented ``slope is None`` semantics), and
+    it never touches ``significant``, RCV, or the floor's criteria. A significant-but-CI-flat trend
+    that is not adverse, or whose change is within RCV, still does not escalate — this only stops a
+    direction technicality from vetoing a trend the criteria already confirmed. In place: ``trend`` is
+    the same object the FDR pass just mutated. No-op for an already-signed direction or a flat
+    (S==0 -> not significant) trend."""
+    if trend.significant and trend.direction == "flat" and trend.tau != 0:
+        trend.direction = "increasing" if trend.tau > 0 else "decreasing"
+
+
 # --------------------------------------------------------------------------------------------------
 # Severity (direction-aware) + floor projection
 # --------------------------------------------------------------------------------------------------
@@ -462,18 +502,60 @@ def _is_adverse(direction: str, adverse: str | None) -> bool:
     )
 
 
+def _monotonic_adverse(series: list[Reading], adverse: str | None) -> bool:
+    """Every consecutive step non-reversing in the adverse direction, with >=1 strict step (ties
+    allowed, reversals not) — the deterministic 'consistent direction' check that stands in for the
+    Mann-Kendall significance test where ``n`` is too small for it to fire. ``adverse is None``
+    (bidirectional / uncurated) is not classifiable, so it never qualifies."""
+    if adverse is None:
+        return False
+    v = [r.value for r in series]
+    steps = list(zip(v, v[1:], strict=False))  # consecutive pairs (n-1 of them)
+    if adverse == "up":
+        return all(b >= a for a, b in steps) and any(b > a for a, b in steps)
+    if adverse == "down":
+        return all(b <= a for a, b in steps) and any(b < a for a, b in steps)
+    return False
+
+
+def _sparse_adverse(
+    series: list[Reading],
+    change: ClinicalChange | None,
+    mcfg: MarkerConfig,
+    n_min: int,
+) -> bool:
+    """The sub-n_min escalation gate (Fix 2 / E12). Below ``n_min`` the exact Mann-Kendall p floors at
+    0.33 (n=3), so FDR is structurally unreachable and ``_trend`` abstains (``None``). The signals that
+    DO discriminate at low n are RCV (a 2-point, beyond-noise test) and monotonicity (the consistent-
+    direction stand-in for MK). So a series of ``3 <= n < n_min`` escalates iff it is adverse-direction,
+    clears RCV (``exceeds_rcv is True`` — absent CVa/CVi is unconfirmable, never escalated), AND is
+    strictly monotonic in the adverse direction. ``n >= 3`` keeps monotonicity a non-trivial guard (>=2
+    consistent steps); a single pair (n=2) would make it vacuous. Never urgent — a panic flag still pins
+    that independently. This is the one place a trend escalates without FDR, and only because FDR is
+    impossible there; the consistency it would have provided is supplied by monotonicity."""
+    return (
+        3 <= len(series) < n_min
+        and change is not None
+        and change.exceeds_rcv is True
+        and _monotonic_adverse(series, mcfg.adverse_direction)
+    )
+
+
 def _severity(
     trend: TrendResult | None,
     change: ClinicalChange | None,
     flags: list[Flag],
     mcfg: MarkerConfig,
+    *,
+    sparse_adverse: bool = False,
 ) -> Severity:
     """Map the verdict set to one severity. An out-of-range / band-cross value is at most ``notable``
     (escalation != out-of-range). A *significant adverse* trend reaches ``attention`` only once it
     clears RCV — the triage rule (architecture §2 D3) counts a trend toward the floor only if it cleared
     *both* RCV and FDR. Without CVa/CVi the trend is still surfaced at ``notable`` (a visible
-    observation, not silent) but is not escalated; a change within RCV noise is not counted at all. A
-    panic flag pins ``urgent`` over everything."""
+    observation, not silent) but is not escalated; a change within RCV noise is not counted at all.
+    ``sparse_adverse`` (the sub-n_min path, where FDR is unreachable — see ``_sparse_adverse``) reaches
+    ``attention`` on RCV + monotonicity alone. A panic flag pins ``urgent`` over everything."""
     severity: Severity = "info"
 
     def raise_to(level: Severity) -> None:
@@ -498,6 +580,11 @@ def _severity(
                 "notable"
             )  # no CVa/CVi -> surfaced on MK + CI, not escalated without RCV
         # change.exceeds_rcv is False -> net change within biological noise (RCV) -> not a counted trend
+
+    if sparse_adverse:
+        raise_to(
+            "attention"
+        )  # sub-n_min: monotonic adverse change cleared RCV (FDR impossible at n<n_min)
 
     if "panic_low" in flags or "panic_high" in flags:
         severity = "urgent"

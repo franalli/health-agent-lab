@@ -53,9 +53,18 @@ Trend detection is classical, not machine-learned:
 
 Escalation is reserved for panic thresholds and significant adverse trajectories — a value merely outside its range is an observation, not an alarm, and a managed condition's expected-high marker isn't treated as new.
 
+## How it learns
+
+Self-improvement is **additive, versioned, inspectable data the system consumes — never an autonomous edit of its own safety logic.** Two forms:
+
+- **Deterministic correction.** A clinician override (`POST .../feedback`) — re-bound a marker's range, suppress an expected-abnormal marker, or set a tone preference — is resolved into the analytical core's *inputs*, so re-scanning or re-asking shows the changed flag in **both** modes. It changes what the system *knows*, not its rules; `POST /reset` reverts it cleanly.
+- **Harness-gated prompt promotion.** `POST /learn` rule-assembles a candidate answer-composer prompt from accumulated feedback (a pure function of the feedback set), then gates it through the **same evaluation harness** that grades the system — promoting it only if it trips no never-event and regresses no measured dimension. No model rewrites the prompt, and the deterministic safety floor is enforced under *whatever* prompt is active, so a promoted prompt can never lower a real escalation. Guarded against cost/abuse (single-flight, debounce, structural pre-check, daily cap), and reverted by `/reset`.
+
+A read-only **trajectory** view (`GET .../trajectory`, rendered as inline sparklines) lets an operator eyeball a marker's series, its Theil–Sen line, and the flagged points to verify a finding by hand — while the LLM still sees only the collapsed verdict, never the raw series.
+
 ## Try it on your own data
 
-The demo's operator panel (left rail, kept out of the member experience) drives every endpoint with one click, and **Upload bundle** ingests a held-out member at runtime — no redeploy. The expected format is one `MemberBundle`; a ready single-member template ships at [`frontend/sample_member_bundle.json`](frontend/sample_member_bundle.json) (and **Seed sample** ingests it in one click). A malformed file returns a clear error in the operator readout, so the upload doubles as the format check. The same ingest runs as a CLI (`uv run python -m preprocessing.ingest <bundle>`); `POST /members` is its live equivalent — the Phase-6 surface.
+The demo's operator panel (left rail, kept out of the member experience) drives every endpoint with one click, and **Upload bundle** ingests a held-out member at runtime — no redeploy. The expected format is one `MemberBundle`. A malformed file returns a clear error in the operator readout, so the upload doubles as the format check. The same ingest runs as a CLI (`uv run python -m preprocessing.ingest <bundle>`); `POST /members` is its live equivalent — the Phase-6 surface.
 
 ## Evaluation
 

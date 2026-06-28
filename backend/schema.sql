@@ -112,10 +112,11 @@ CREATE INDEX idx_obs_member ON observations(member_id, severity);
 
 -- Clinician-review queue: the subset of findings/events that crossed the escalation
 -- threshold, from BOTH owners. dedup_key is UNIQUE, so "fire once" is a DB guarantee, not
--- application logic. Data-finding key = member·marker·analysis_version (scan owns it, writes via
--- INSERT OR IGNORE), where analysis_version hashes ONLY the inputs analyze() reads (results,
--- ranges, sex, age) — not notes/profile — so a notes-only edit cannot re-fire a finding whose
--- analysis never moved (architecture §48; db.compute_analysis_version); chat key = member·day
+-- application logic. Data-finding key = member·marker·marker_version (scan owns it, writes via
+-- INSERT OR IGNORE), where marker_version hashes ONLY that marker's analyze() inputs (its readings,
+-- its resolved range, sex, age) — not notes/profile, and not other markers — so a notes-only edit
+-- (or a /feedback override to a DIFFERENT marker) cannot re-fire a finding whose own analysis never
+-- moved (architecture §48; db.compute_marker_version); chat key = member·day
 -- (assistant owns it — one open escalation per member per day; there is no conversation concept
 -- in v1). Member-facing care is never
 -- deduped; only this record is. observation_id is set for data findings, interaction_id for
@@ -138,12 +139,15 @@ CREATE INDEX idx_escalations_member ON escalations(member_id, created_at);
 -- ---- learning: feedback signals + prompt versions (self-improvement) -------
 
 -- Feedback drives self-improvement. ONE kind-typed store, consumed two ways:
---   deterministic overrides (range_override, suppress_marker, preference) are resolved by db.py
---   into analysis inputs (the core stays pure) — they change what the bot KNOWS, not its rules;
+--   deterministic overrides (range_override, suppress_marker = analysis inputs; preference = a compose
+--   hint) are resolved by db.py — they change what the bot KNOWS, not its rules;
 --   signals (helpful, incorrect, escalation_accept/reject) feed the prompt-scan and the evals.
 -- target = marker (for overrides) or finding_id (for signals on a specific output).
--- active=0 is how /reset wipes learning without losing the trail; on conflict the latest active
--- row per target wins, with clinician source outranking member (source drives precedence + provenance).
+-- active=0 is how /reset wipes learning without losing the trail. The ANALYSIS overrides
+-- (range_override/suppress_marker) are honored ONLY from clinician/system sources — a member must not be
+-- able to change what is flagged (ui-ux §7); a member-sourced one is stored but inert for analysis. Among
+-- the honored rows the latest active per marker wins (clinician outranking system), so source drives
+-- precedence + provenance. (preference hints accept any source — they shape tone only, never the floor.)
 CREATE TABLE feedback (
     feedback_id  TEXT PRIMARY KEY,
     member_id    TEXT NOT NULL REFERENCES members(member_id),

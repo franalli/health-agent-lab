@@ -101,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
     nes = report.never_events()
     nr = report.no_response_cases()
     red = report.is_red()
-    hit, tot = report._safety_recall()
+    hit, tot = report.safety_recall()
     print()
     print(
         f"=== {'🔴 RED' if red else '🟢 GREEN'} · {len(report.cases)} cases · N={cfg.n_runs} ==="

@@ -24,7 +24,7 @@ from builders import fresh_con  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 import api  # noqa: E402
-from health_intelligence import db  # noqa: E402
+from health_intelligence import db, learn  # noqa: E402
 from preprocessing.ingest import ingest_dataset  # noqa: E402
 
 # Every member-scoped child table — the cascade must leave none of these behind on a delete.
@@ -166,3 +166,125 @@ def test_delete_twice_second_is_404(client):
     assert (
         client.delete("/members/C01").status_code == 404
     )  # not present the second time
+
+
+# ---- POST /members/{id}/feedback (Phase 7) --------------------------------------------------------
+
+
+def test_post_feedback_records_an_override(client):
+    r = client.post(
+        "/members/C01/feedback",
+        json={
+            "kind": "range_override",
+            "target": "LDL cholesterol",
+            "payload": {"ref_high": 250.0},
+            "source": "clinician",
+        },
+    )
+    assert r.status_code == 200 and r.json()["feedback_id"]
+
+
+def test_post_feedback_unknown_member_404(client):
+    r = client.post(
+        "/members/NOPE/feedback",
+        json={"kind": "preference", "payload": {"text": "brief"}, "source": "member"},
+    )
+    assert r.status_code == 404
+
+
+# ---- GET /members/{id}/trajectory (Phase 7) -------------------------------------------------------
+
+
+def test_get_trajectory_returns_series(client):
+    r = client.get("/members/C01/trajectory")
+    assert r.status_code == 200
+    body = r.json()
+    assert isinstance(body, list) and body
+    keys = {
+        "marker",
+        "unit",
+        "readings",
+        "trend",
+        "flags",
+        "severity",
+        "reference_range",
+        "theil_sen",
+    }
+    assert keys <= set(body[0].keys())
+
+
+def test_get_trajectory_marker_filter(client):
+    r = client.get("/members/C01/trajectory", params={"marker": "HbA1c"})
+    assert r.status_code == 200
+    assert [t["marker"] for t in r.json()] == ["HbA1c"]
+
+
+def test_get_trajectory_unknown_member_404(client):
+    assert client.get("/members/NOPE/trajectory").status_code == 404
+
+
+# ---- POST /reset (Phase 7) ------------------------------------------------------------------------
+
+
+def test_reset_deactivates_feedback(client):
+    client.post(
+        "/members/C01/feedback",
+        json={
+            "kind": "suppress_marker",
+            "target": "LDL cholesterol",
+            "source": "clinician",
+        },
+    )
+    r = client.post("/reset")
+    assert r.status_code == 200 and r.json()["learning_reset"] is True
+    con = db.connect(_DB_FILE)
+    try:
+        active = con.execute("SELECT COUNT(*) FROM feedback WHERE active=1").fetchone()[
+            0
+        ]
+    finally:
+        con.close()
+    assert active == 0
+
+
+# ---- POST /learn (Phase 7 — route wiring only; the gate logic is covered in test_learn.py) ---------
+
+
+def test_learn_route_returns_run_result(client, monkeypatch):
+    monkeypatch.setattr(
+        learn,
+        "run_learn",
+        lambda con: {"status": "noop", "version": None, "reason": "x", "report": None},
+    )
+    r = client.post("/learn")
+    assert r.status_code == 200 and r.json()["status"] == "noop"
+
+
+def test_learn_route_maps_busy_to_409(client, monkeypatch):
+    def _busy(con):
+        raise learn.LearnBusy("busy")
+
+    monkeypatch.setattr(learn, "run_learn", _busy)
+    assert client.post("/learn").status_code == 409
+
+
+def test_learn_route_maps_unavailable_to_503(client, monkeypatch):
+    def _down(con):
+        raise learn.LearnUnavailable("no key")
+
+    monkeypatch.setattr(learn, "run_learn", _down)
+    assert client.post("/learn").status_code == 503
+
+
+# ---- POST /admin/reseed (Phase 7) -----------------------------------------------------------------
+
+
+def test_reseed_restores_initial_members_and_drops_holdouts(client):
+    client.delete("/members/C01")  # remove a seeded member
+    client.post("/members", json=_bundle("T99"))  # add an uploaded holdout
+    r = client.post("/admin/reseed")
+    assert r.status_code == 200 and r.json()["reseeded"] is True
+    ids = [m["member_id"] for m in client.get("/members").json()]
+    assert "C01" in ids  # the deleted seeded member is back
+    assert "T99" not in ids  # the uploaded holdout is dropped
+    assert len(ids) == 15  # back to the initial state

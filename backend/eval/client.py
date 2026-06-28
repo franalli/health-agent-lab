@@ -34,7 +34,6 @@ from health_intelligence.config import ANALYSIS_CONFIG
 from health_intelligence.models import (
     Escalation,
     HealthIntelligenceResponse,
-    Observation,
     SuggestedPrompt,
 )
 from preprocessing.ingest import ingest_dataset
@@ -55,6 +54,31 @@ def build_seeded_template(workdir: Path, dataset: str | None = None) -> Path:
     finally:
         con.close()
     return template
+
+
+def ground_truth_markers(con, member_id: str) -> dict[str, float]:
+    """The member's latest value per canonical marker (in-process ``analyze`` — the number-tracer's
+    ground truth, not a measured service call); empty if the member is absent. The ONE definition both
+    eval clients share (the HTTP ``ServiceClient`` and the in-process ``InProcessClient``), so the
+    ground-truth read can't drift between ``make eval`` and the ``/learn`` gate."""
+    try:
+        member, results, ranges, age, data_version = db.load_for_analysis(
+            con, member_id
+        )
+    except KeyError:
+        return {}
+    out = analyze(
+        member, results, ranges, age, ANALYSIS_CONFIG, data_version=data_version
+    )
+    return {m.marker: m.latest.value for m in out.markers}
+
+
+def overview_response(
+    prompts: list[SuggestedPrompt],
+) -> HealthIntelligenceResponse | None:
+    """The Mode-1 "what's changed" overview from a list of suggested prompts, or ``None`` if absent — the
+    one filter both clients use to pick Mode 1's scored anchor (matched on :data:`OVERVIEW_PROMPT`)."""
+    return next((sp.response for sp in prompts if sp.prompt == OVERVIEW_PROMPT), None)
 
 
 class _CaseSession:
@@ -86,42 +110,21 @@ class _CaseSession:
 
     def overview(self) -> HealthIntelligenceResponse | None:
         """The Mode-1 "what's changed" overview response, or ``None`` if absent (e.g. an unknown member)."""
-        for sp in self.suggestions():
-            if sp.prompt == OVERVIEW_PROMPT:
-                return sp.response
-        return None
-
-    def scan(self) -> list[Observation]:
-        r = self._http.post(f"/members/{self.member_id}/scan")
-        r.raise_for_status()
-        return [Observation.model_validate(x) for x in r.json()]
+        return overview_response(self.suggestions())
 
     def escalations(self) -> list[Escalation]:
         r = self._http.get(f"/members/{self.member_id}/escalations")
         r.raise_for_status()
         return [Escalation.model_validate(x) for x in r.json()]
 
-    def observations(self) -> list[Observation]:
-        r = self._http.get(f"/members/{self.member_id}/observations")
-        r.raise_for_status()
-        return [Observation.model_validate(x) for x in r.json()]
-
     def marker_values(self) -> dict[str, float]:
-        """The member's latest value per canonical marker, read straight off the per-case DB (in-process
-        ``analyze`` — ground truth for the number-tracer, not a measured service call). Empty if absent."""
+        """The member's latest value per canonical marker, read straight off the per-case DB (the shared
+        :func:`ground_truth_markers` — ground truth for the number-tracer, not a measured service call)."""
         con = db.connect(str(self._case_db))
         try:
-            member, results, ranges, age, data_version = db.load_for_analysis(
-                con, self.member_id
-            )
-        except KeyError:
-            return {}
+            return ground_truth_markers(con, self.member_id)
         finally:
             con.close()
-        out = analyze(
-            member, results, ranges, age, ANALYSIS_CONFIG, data_version=data_version
-        )
-        return {m.marker: m.latest.value for m in out.markers}
 
 
 class ServiceClient:

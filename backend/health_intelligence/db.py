@@ -87,7 +87,7 @@ def _canon_results(results: list[LabResult]) -> list[list]:
 
 def _hash_canon(canon: dict) -> str:
     """The shared serialize+digest tail: compact, key-sorted JSON → 16 hex of sha256. The one place the
-    serialization convention lives, so compute_data_version and compute_analysis_version stay in lockstep."""
+    serialization convention lives, so compute_data_version and compute_marker_version stay in lockstep."""
     blob = json.dumps(canon, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -315,41 +315,41 @@ def compute_data_version(
     return _hash_canon(canon)
 
 
-def compute_analysis_version(
+def compute_marker_version(
     *,
+    marker: str,
     results: list[LabResult],
-    ranges: list[ReferenceRange],
+    marker_range: ReferenceRange | None,
     sex: str,
     age: int | None,
 ) -> str:
-    """A content fingerprint of *only* the inputs ``analysis.analyze`` actually reads — the
-    override-resolved results, the reference ranges, and the member's sex/age. Pure (no DB).
+    """A content fingerprint of ONLY one marker's analysis inputs — that marker's (override-resolved)
+    readings, its resolved reference range, and the member's sex/age. Pure (no DB).
 
-    This is the §48 "finding-stable dedup_key" resolution: ``data_version`` hashes the WHOLE record
-    (incl. notes + conditions/medications), but ``analyze`` reads none of those, so keying a
-    ``data_finding`` escalation on raw ``data_version`` would mint a new key — and re-fire the
-    escalation — on a notes-only edit that never moved the analysis. The data-finding dedup_key keys on
-    THIS hash instead (``data:{member}:{marker}:{analysis_version}``), so "fire once" tracks the actual
-    finding; ``data_version`` stays the full audit snapshot everywhere else (interactions/observations).
-    Mirrors :func:`compute_data_version`'s canonicalization so the two are read the same way."""
+    The §48 "finding-stable dedup_key" resolution: ``data_version`` hashes the WHOLE record (incl. notes +
+    conditions/medications), which ``analyze`` never reads, so keying a ``data_finding`` escalation on it
+    would re-fire on a notes-only edit. Keying on the whole-member analysis inputs would still re-fire
+    marker B when marker A's range is overridden. So the dedup_key keys on THIS per-marker hash
+    (``data:{member}:{marker}:{marker_version}``): a ``/feedback`` override (or new data) for marker A
+    shifts A's hash but not B's, so it cannot re-fire marker B's already-queued clinician escalation — each
+    finding fires once and re-fires only when ITS OWN inputs move. Mirrors :func:`compute_data_version`'s
+    canonicalization (the range collapsed to its bounds, the marker's results order-independent)."""
     canon = {
+        "marker": marker,
         "sex": sex,
         "age": age,
-        "results": _canon_results(results),
-        "ranges": sorted(
+        "results": _canon_results([r for r in results if r.marker == marker]),
+        "range": (
             [
-                [
-                    rg.marker,
-                    rg.sex,
-                    rg.unit,
-                    rg.ref_low,
-                    rg.ref_high,
-                    rg.panic_low,
-                    rg.panic_high,
-                    rg.config_version,
-                ]
-                for rg in ranges
+                marker_range.ref_low,
+                marker_range.ref_high,
+                marker_range.panic_low,
+                marker_range.panic_high,
+                marker_range.unit,
+                marker_range.config_version,
             ]
+            if marker_range is not None
+            else None
         ),
     }
     return _hash_canon(canon)
@@ -671,6 +671,41 @@ def write_observation(con: sqlite3.Connection, obs: Observation) -> None:
     )
 
 
+def prune_observations(
+    con: sqlite3.Connection,
+    member_id: str,
+    data_version: str,
+    keep_ids: set[str],
+) -> None:
+    """Delete the member's observations at ``data_version`` whose ``observation_id`` is NOT in
+    ``keep_ids`` and is NOT referenced by an escalation — the scan's set-reconciliation step. Does NOT
+    commit (runs inside the scan transaction).
+
+    Why this exists (Phase 7): the §48 replace-discipline keys the observation set on ``data_version``,
+    which a re-INGEST bumps — but a ``/feedback`` OVERRIDE changes ``analyze``'s inputs WITHOUT bumping
+    ``data_version`` (it fingerprints the raw record), so a re-scan after an override that *cleared* a
+    marker's flag would strand the prior observation (the write loop only UPSERTs raised markers, it
+    never removes one that stopped being raised). This prunes exactly those orphans. Escalation-pinned
+    rows are KEPT: ``escalations.observation_id`` is a RESTRICT FK and the queued clinician task is
+    durable, so a cleared-but-escalated finding's observation stays (a deliberately rare edge — the
+    sample-override path targets non-escalated ``notable`` markers). Targeted, never a blanket DELETE.
+
+    One set-based DELETE (not an N+1 SELECT-then-per-row loop). The escalations subquery MUST keep
+    ``observation_id IS NOT NULL`` — that column is a NULLABLE FK (NULL for chat escalations), and SQL
+    ``NOT IN`` against a set containing NULL matches zero rows, which would silently prune nothing."""
+    params: list = [member_id, data_version]
+    sql = (
+        "DELETE FROM observations WHERE member_id = ? AND data_version = ? "
+        "AND observation_id NOT IN "
+        "(SELECT observation_id FROM escalations WHERE observation_id IS NOT NULL)"
+    )
+    keep = list(keep_ids)
+    if keep:  # NOT IN () is a syntax error, so only add the clause when there's something to keep
+        sql += f" AND observation_id NOT IN ({','.join('?' * len(keep))})"
+        params += keep
+    con.execute(sql, params)
+
+
 def get_observations(
     con: sqlite3.Connection, member_id: str, *, data_version: str | None = None
 ) -> list[Observation]:
@@ -736,15 +771,66 @@ def _apply_overrides(
     results: list[LabResult],
     ranges: list[ReferenceRange],
     overrides: list[Feedback],
+    *,
+    sex: str,
 ) -> tuple[list[LabResult], list[ReferenceRange]]:
-    """Pure: apply active overrides to NEW lists. Phase 7 will implement ``range_override`` (swap a
-    ReferenceRange), ``suppress_marker`` (drop a marker's results+ranges), and ``preference`` (a
-    composer hint, not an analysis input) here. Phase 2 applies none — returns shallow copies so the
-    new-lists contract holds even with an empty override set."""
-    del (
-        overrides
-    )  # reserved (Phase 7 applies them); Phase 2 has no active overrides to fold in
-    return list(results), list(ranges)
+    """Pure: fold the active overrides into NEW lists (never mutate the caller's inputs) — the
+    deterministic half of self-improvement (architecture §9, the §3 boundary row "apply a learned
+    correction"). It changes what the core *knows*, not its rules: the floor, validator, and prompt are
+    untouched; only ``analyze``'s typed inputs move, so a correction lands identically in BOTH modes.
+
+    Two analysis-affecting kinds (applied in caller order, so the last override per marker wins):
+
+    * ``range_override`` — a clinician re-bounds a marker. Replace ALL of that marker's range rows with a
+      single ``sex='any'`` row carrying the new bounds (per-member resolution already scoped this to one
+      member, and ``_range_for`` falls back to ``'any'`` for any sex), so a managed-condition marker can
+      be widened out of an out-of-range flag. ``payload`` keys (``ref_low``/``ref_high``/``panic_low``/
+      ``panic_high``/``unit``) fall back to the marker's EXISTING band when omitted, so a one-sided widen
+      need not restate the other bound. The existing band is resolved by the member's ``sex`` (then the
+      ``any`` row) — mirroring ``analysis._range_for`` so a one-sided override on a sex-split marker
+      (e.g. Hemoglobin/HDL/Ferritin/Creatinine) inherits the member's OWN band, not an arbitrary sex's.
+      (Resolved inline rather than calling ``analysis._range_for`` to keep db.py's no-``analysis`` purity.)
+    * ``suppress_marker`` — drop the marker's results AND ranges, so the core never analyzes it (it
+      vanishes from the trajectory): quiets an expected-abnormal marker without touching the safety rule.
+
+    ``preference`` and the signal kinds never reach here — they are filtered out at the SQL in
+    :func:`resolve_overrides` (preference is a compose hint via :func:`get_active_preferences`; signals
+    feed ``learn.py``). Because the data-finding dedup keys on the marker's own analysis state
+    (``compute_marker_version``), an override that moves a flag re-fires/clears only THAT finding."""
+    out_results = list(results)
+    out_ranges = list(ranges)
+    for fb in overrides:
+        if not fb.target:
+            continue  # overrides target a marker; a signal (helpful/incorrect/...) has no analysis effect
+        if fb.kind == "suppress_marker":
+            out_results = [r for r in out_results if r.marker != fb.target]
+            out_ranges = [rg for rg in out_ranges if rg.marker != fb.target]
+        elif fb.kind == "range_override" and fb.payload:
+            # Inherit omitted bounds from the member's ACTUAL band: the (marker, sex) row, then the
+            # (marker, 'any') fallback — the same resolution analysis._range_for uses, replicated here so
+            # db.py never imports analysis (the documented purity edge).
+            cands = [rg for rg in out_ranges if rg.marker == fb.target]
+            existing = next((rg for rg in cands if rg.sex == sex), None) or next(
+                (rg for rg in cands if rg.sex == "any"), None
+            )
+            p = fb.payload
+            # ``p.get(key, fallback)`` returns the supplied value even when it is explicitly None (a
+            # one-sided override), and falls back to the existing bound only when the key is omitted.
+            new_rg = ReferenceRange(
+                marker=fb.target,
+                sex="any",  # per-member override; '_range_for' resolves 'any' for every member sex
+                unit=p.get("unit", existing.unit if existing else ""),
+                ref_low=p.get("ref_low", existing.ref_low if existing else None),
+                ref_high=p.get("ref_high", existing.ref_high if existing else None),
+                panic_low=p.get("panic_low", existing.panic_low if existing else None),
+                panic_high=p.get(
+                    "panic_high", existing.panic_high if existing else None
+                ),
+                config_version=existing.config_version if existing else CONFIG_VERSION,
+            )
+            out_ranges = [rg for rg in out_ranges if rg.marker != fb.target]
+            out_ranges.append(new_rg)
+    return out_results, out_ranges
 
 
 def resolve_overrides(
@@ -752,10 +838,26 @@ def resolve_overrides(
     member_id: str,
     results: list[LabResult],
     ranges: list[ReferenceRange],
+    *,
+    sex: str,
 ) -> tuple[list[LabResult], list[ReferenceRange]]:
+    """Resolve the member's active ANALYSIS overrides into ``analyze``'s inputs. ``sex`` is the member's
+    sex (so a one-sided range_override inherits the member's own band).
+
+    Honored only from ``clinician``/``system`` sources — a member must not be able to change what is
+    flagged (``ui-ux.md`` §7: "the member experience cannot lobby the safety logic"); a member-sourced
+    range_override/suppress is stored but INERT for analysis, so it can never suppress a panic floor.
+    Ordered so the highest-precedence, latest override per marker is applied last (and wins):
+    ``source`` rank (clinician > system), then ``created_at``, then ``feedback_id`` — the trailing
+    ``feedback_id`` makes "latest per target wins" deterministic when two rows share a timestamp
+    (matching :func:`get_active_signals`'s tiebreak). ``schema.sql``: "clinician source outranking member"."""
     rows = con.execute(
         "SELECT kind, target, payload_json, source FROM feedback "
-        "WHERE member_id = ? AND active = 1 ORDER BY created_at",
+        "WHERE member_id = ? AND active = 1 "
+        "AND kind IN ('range_override', 'suppress_marker') "
+        "AND source IN ('clinician', 'system') "
+        "ORDER BY CASE source WHEN 'clinician' THEN 2 WHEN 'system' THEN 1 ELSE 0 END, "
+        "created_at, feedback_id",
         (member_id,),
     ).fetchall()
     overrides = [
@@ -767,7 +869,256 @@ def resolve_overrides(
         )
         for r in rows
     ]
-    return _apply_overrides(results, ranges, overrides)
+    return _apply_overrides(results, ranges, overrides, sex=sex)
+
+
+# --------------------------------------------------------------------------------------------------
+# Feedback writes (Phase 7) — the input side of self-improvement. ``insert_feedback`` records one
+# correction/signal row; ``get_active_preferences`` resolves the composer-hint kind (not an analysis
+# input, so it bypasses _apply_overrides); ``reset_learning`` is the /reset revert. The override KINDS
+# are read back by resolve_overrides above; the SIGNAL kinds (helpful/incorrect/escalation_*) are read
+# by learn.py. db.py only stores + resolves them — it never decides anything safety-relevant.
+# --------------------------------------------------------------------------------------------------
+
+
+def insert_feedback(
+    con: sqlite3.Connection,
+    member_id: str,
+    fb: Feedback,
+    *,
+    created_at: str | None = None,
+) -> str:
+    """Record one ``feedback`` row (a correction or a signal) and commit; returns the synthesized
+    ``feedback_id``. ``active`` defaults to 1; ``created_at`` defaults to UTC now and drives recency
+    (latest active override per target wins in :func:`resolve_overrides`).
+
+    ``feedback_id`` only needs to be UNIQUE (each post is a distinct event, unlike the idempotent
+    escalation write — it is never re-derived), so on the rare same-``(member,kind,target,created_at)``
+    collision (two same-microsecond duplicate posts, or a caller passing an explicit ``created_at``) the
+    id is salted and retried rather than 500-ing on the PRIMARY KEY."""
+    if created_at is None:
+        created_at = datetime.now(UTC).isoformat()
+    payload_json = json.dumps(fb.payload) if fb.payload is not None else None
+    for salt in range(1000):  # salt 0 is the common path; >0 only on a PK collision
+        feedback_id = _det_id(
+            "fb:", member_id, fb.kind, fb.target or "", created_at, str(salt)
+        )
+        try:
+            with con:  # atomic single-row write; commits on success, rolls back + re-raises on conflict
+                con.execute(
+                    "INSERT INTO feedback "
+                    "(feedback_id, member_id, kind, target, payload_json, source, active, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+                    (
+                        feedback_id,
+                        member_id,
+                        fb.kind,
+                        fb.target,
+                        payload_json,
+                        fb.source,
+                        created_at,
+                    ),
+                )
+            return feedback_id
+        except sqlite3.IntegrityError as e:
+            # ONLY retry the feedback_id PK collision (the salt is the only thing a retry changes). A
+            # FOREIGN KEY (unknown member) or CHECK (bad kind/source) violation would fail identically on
+            # every salt, so surface it immediately instead of spinning 1000× and masking it behind a
+            # "couldn't synthesize an id" error.
+            if "feedback.feedback_id" not in str(e):
+                raise
+            continue  # PK collision — bump the salt and retry
+    raise RuntimeError("could not synthesize a unique feedback_id after 1000 attempts")
+
+
+#: Bounds on the member-authored ``preference`` hints injected into the compose prompt. CAPPED because
+#: this is the one persistent member-controlled free-text channel into the LLM context: without a cap,
+#: many/long preferences would inflate every ``/ask``'s tokens unboundedly (a cost-amplification vector).
+#: The hard rules in the system prompt + the always-on validator already bound what a preference can DO
+#: (tone only, never the floor); this bounds how much it can COST. Newest-first, so the latest hints win.
+_MAX_ACTIVE_PREFERENCES = 5
+_MAX_PREFERENCE_CHARS = 240
+
+
+def get_active_preferences(con: sqlite3.Connection, member_id: str) -> list[str]:
+    """Active ``preference`` hints for the compose context (architecture §9: a preference 'joins the
+    composer context'). NOT an analysis input — read here, not in _apply_overrides — so it can only shape
+    tone, never a number or the floor. Reads ``payload.text`` (or ``preference``). Bounded to the newest
+    ``_MAX_ACTIVE_PREFERENCES``, each truncated to ``_MAX_PREFERENCE_CHARS`` (cost-amplification guard)."""
+    rows = con.execute(
+        "SELECT payload_json FROM feedback "
+        "WHERE member_id = ? AND kind = 'preference' AND active = 1 "
+        "ORDER BY created_at DESC, feedback_id DESC LIMIT ?",
+        (member_id, _MAX_ACTIVE_PREFERENCES),
+    ).fetchall()
+    out: list[str] = []
+    for r in rows:
+        if r["payload_json"]:
+            p = json.loads(r["payload_json"])
+            text = p.get("text") or p.get("preference")
+            if text:
+                out.append(str(text)[:_MAX_PREFERENCE_CHARS])
+    return out
+
+
+def get_active_signals(con: sqlite3.Connection) -> list[Feedback]:
+    """All active SIGNAL feedback across members (helpful/incorrect/escalation_accept/reject) — the
+    input ``learn.py`` rule-assembles a candidate prompt from. Ordered by ``created_at`` so the assembly
+    is a pure, order-stable function of the signal set (identical signals -> byte-identical candidate)."""
+    rows = con.execute(
+        "SELECT kind, target, payload_json, source FROM feedback "
+        "WHERE active = 1 AND kind IN ('helpful','incorrect','escalation_accept','escalation_reject') "
+        "ORDER BY created_at, feedback_id",
+    ).fetchall()
+    return [
+        Feedback(
+            kind=r["kind"],
+            target=r["target"],
+            payload=json.loads(r["payload_json"]) if r["payload_json"] else None,
+            source=r["source"],
+        )
+        for r in rows
+    ]
+
+
+def reset_learning(con: sqlite3.Connection) -> dict[str, int]:
+    """The ``POST /reset`` revert (architecture §9/§688): deactivate ALL feedback (``active=0``) and
+    revert every learned prompt above the v0 baseline (``promoted`` OR ``rejected``) to
+    ``status='reverted'`` — so the composer falls back to the latest remaining promoted version (v0, or
+    the constant when none was ever seeded). Reverting the ``rejected`` rows too matters: a gate verdict
+    is BASELINE-relative, and /reset changes the active baseline, so a candidate rejected against the old
+    baseline must be re-gateable (not stuck cached as 'rejected') if its feedback is re-posted — the
+    symmetric case to a reverted promotion. This is the learning-revert, NOT a data wipe: the feedback
+    rows and prompt history are preserved (the trail stays), every member and the dataset untouched. The
+    factory reset is the separate :func:`nuke_all` (``POST /admin/reseed``). Returns affected-row counts."""
+    with con:
+        fb = con.execute("UPDATE feedback SET active = 0 WHERE active = 1").rowcount
+        pv = con.execute(
+            "UPDATE prompt_versions SET status = 'reverted' "
+            "WHERE version > 0 AND status IN ('promoted', 'rejected')"
+        ).rowcount
+    return {"feedback_deactivated": fb, "prompts_reverted": pv}
+
+
+# --------------------------------------------------------------------------------------------------
+# Prompt versions (Phase 7) — the self-improvement promotion store. The composer reads the latest
+# ``status='promoted'`` row (``get_active_prompt``); ``learn.py`` assembles a candidate, gates it
+# through the harness, and writes it ``promoted`` or ``rejected`` with its eval report. db.py only
+# persists + reads versions — the gate DECISION is learn.py's, the prompt TEXT is rule-assembled there.
+# --------------------------------------------------------------------------------------------------
+
+
+def get_active_prompt(
+    con: sqlite3.Connection,
+) -> tuple[int, str, str | None] | None:
+    """The active composer prompt: ``(version, prompt_text, eval_report_json)`` of the latest
+    ``status='promoted'`` row, or ``None`` when none was ever promoted (the pipeline then falls back to
+    ``llm.BASE_COMPOSE_SYSTEM`` at version 0 — keeping this module free of an ``llm`` import). ``learn.py``
+    uses ``eval_report_json`` as the regression baseline; the pipeline uses only the first two."""
+    row = con.execute(
+        "SELECT version, prompt_text, eval_report_json FROM prompt_versions "
+        "WHERE status = 'promoted' ORDER BY version DESC LIMIT 1"
+    ).fetchone()
+    return (
+        (row["version"], row["prompt_text"], row["eval_report_json"]) if row else None
+    )
+
+
+def find_prompt_by_text(
+    con: sqlite3.Connection, prompt_text: str
+) -> tuple[int, str, str | None] | None:
+    """The newest prompt_version whose ``prompt_text`` is byte-identical to ``prompt_text`` AND whose
+    ``status`` is a GATE VERDICT (``promoted``/``rejected``), as ``(version, status, eval_report_json)``
+    — or ``None``. The ``learn`` debounce: because the candidate is a pure function of the feedback set,
+    an unchanged signal set re-assembles identical text, which short-circuits to this cached *verdict*
+    with ZERO model calls (architecture §9: naive spam is free).
+
+    Crucially it ignores ``reverted``/``proposed`` rows: ``/reset`` flips a promoted prompt to
+    ``reverted``, and that is an OPERATOR action, not a gate verdict — conflating the two would make a
+    post-reset re-learn of identical feedback short-circuit to ``reverted`` and never re-promote (the
+    composer stuck on v0). Excluding them lets the same feedback re-gate and re-promote after a reset."""
+    row = con.execute(
+        "SELECT version, status, eval_report_json FROM prompt_versions "
+        "WHERE prompt_text = ? AND status IN ('promoted', 'rejected') "
+        "ORDER BY version DESC LIMIT 1",
+        (prompt_text,),
+    ).fetchone()
+    return (row["version"], row["status"], row["eval_report_json"]) if row else None
+
+
+def next_prompt_version(con: sqlite3.Connection) -> int:
+    """The next version integer (max + 1; 1 when the table is empty — v0 is the constant baseline)."""
+    row = con.execute("SELECT MAX(version) AS m FROM prompt_versions").fetchone()
+    return (row["m"] + 1) if row and row["m"] is not None else 1
+
+
+def count_prompt_versions_on(con: sqlite3.Connection, date_prefix: str) -> int:
+    """How many prompt_versions rows carry ``created_at`` on ``date_prefix`` (``YYYY-MM-DD``) — the
+    learn DAILY-CAP backstop. Debounced short-circuits write no row, so they don't count (free)."""
+    return con.execute(
+        "SELECT COUNT(*) AS c FROM prompt_versions WHERE substr(created_at, 1, 10) = ?",
+        (date_prefix,),
+    ).fetchone()["c"]
+
+
+def insert_prompt_version(
+    con: sqlite3.Connection,
+    *,
+    version: int,
+    prompt_text: str,
+    status: str,
+    eval_report_json: str | None = None,
+    created_at: str | None = None,
+) -> None:
+    """Persist one ``prompt_versions`` row (commits). ``status`` is one of proposed/promoted/rejected/
+    reverted; a promoted candidate carries the harness ``eval_report_json`` that gated it."""
+    if created_at is None:
+        created_at = datetime.now(UTC).isoformat()
+    with con:
+        con.execute(
+            "INSERT INTO prompt_versions (version, prompt_text, status, eval_report_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (version, prompt_text, status, eval_report_json, created_at),
+        )
+
+
+# --------------------------------------------------------------------------------------------------
+# Factory reset (Phase 7) — the destructive clean-slate behind ``POST /admin/reseed`` (architecture
+# §688/§756), DISTINCT from reset_learning's learning-only revert. A full NUKE: drop every table, then
+# recreate the canonical schema; the route then re-ingests the training_data bundle (the back-edge to
+# preprocessing stays in api.py, not here).
+# --------------------------------------------------------------------------------------------------
+
+
+def nuke_all(con: sqlite3.Connection) -> None:
+    """Full factory NUKE — DROP every table, then recreate the canonical schema from ``schema.sql``.
+
+    Stronger than a row-level truncate: it removes the tables themselves (and their rowid sequences and
+    indexes), returning the DB to a pristine, freshly-initialised state, and it is robust to ANY table
+    that exists — including a stray/renamed one a hardcoded delete-list would miss. FK enforcement is
+    toggled OFF around the drops (set outside a transaction, where the PRAGMA takes effect) so drop order
+    is irrelevant; :func:`init_db` then rebuilds every table. The caller (``POST /admin/reseed``)
+    re-ingests ``training_data`` afterwards, so the DB ends as a clean 15-member factory state."""
+    con.execute(
+        "PRAGMA foreign_keys = OFF"
+    )  # must be set with NO active transaction to take effect
+    try:
+        tables = [
+            r[0]
+            for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        ]
+        for t in tables:
+            con.execute(f'DROP TABLE IF EXISTS "{t}"')  # noqa: S608 — names from sqlite_master, not input
+        con.commit()
+    finally:
+        con.execute(
+            "PRAGMA foreign_keys = ON"
+        )  # restore the per-connection invariant connect() sets
+    init_db(
+        con
+    )  # recreate every table from the canonical schema.sql (none exist -> full rebuild)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -791,5 +1142,5 @@ def load_for_analysis(
     # reuse the already-loaded member+results (still the raw, pre-override rows) so the hash doesn't
     # re-query them; compute_data_version fetches only notes itself.
     data_version = compute_data_version(con, member_id, member=member, results=results)
-    results, ranges = resolve_overrides(con, member_id, results, ranges)
+    results, ranges = resolve_overrides(con, member_id, results, ranges, sex=member.sex)
     return member, results, ranges, member.age, data_version
