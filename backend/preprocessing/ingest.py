@@ -246,12 +246,20 @@ def _require_unit(marker: str) -> str:
 
 def ingest_dataset(con, dataset: str | None = None) -> dict:
     """Load ``members.json`` for the active dataset, validate every bundle (the firewall check —
-    ``extra='forbid'`` makes a malformed bundle fail loudly), and write each. Returns summary counts."""
+    ``extra='forbid'`` makes a malformed bundle fail loudly), and write each. Returns summary counts.
+
+    Bundles are validated IN FULL before any write: a malformed bundle raises here while the DB is still
+    untouched, rather than after some members have already been committed (``db.replace_member`` is
+    per-member-atomic, so an interleaved validate→write loop would strand a partial set on a bad entry).
+    This makes the dominant failure mode (malformed data) leave no partial state; ``seed_if_empty`` adds
+    the rollback for the rarer write-phase failure on the unattended startup path."""
     raw = json.loads(members_path(dataset).read_text())
+    bundles = [
+        MemberBundle.model_validate(entry) for entry in raw
+    ]  # firewall: validate ALL up front
     members = 0
     total_results = 0
-    for entry in raw:
-        bundle = MemberBundle.model_validate(entry)
+    for bundle in bundles:
         summary = ingest_bundle(con, bundle)
         members += 1
         total_results += summary["results"]
@@ -259,6 +267,30 @@ def ingest_dataset(con, dataset: str | None = None) -> dict:
         db.get_ranges(con)
     )  # via db.py (the one SQLite seam), scoped to the active config
     return {"members": members, "results": total_results, "ranges": n_ranges}
+
+
+def seed_if_empty(con) -> dict:
+    """Ingest the active dataset IFF the DB has no members — the idempotent startup path (the api.py
+    lifespan / a fresh ephemeral deploy). Returns ``{"seeded": bool, ...counts}``; a no-op
+    (``seeded=False``) when members already exist, so a warm restart or a prior ``make seed`` never
+    re-ingests, and a deliberately ``DELETE``d member is never resurrected.
+
+    The guard fires only on a TRULY empty DB, which is what makes a clean rollback safe: ``ingest_dataset``
+    commits per member, so a mid-loop write failure would otherwise strand a partial set that the
+    empty-check then reads as 'seeded' — never re-healing. Instead, on failure we delete the partial
+    prefix (every member present is from this attempt, since the DB was empty) and re-raise, so the DB
+    returns to empty and the next boot retries cleanly. This rollback is startup-only policy;
+    ``ingest_dataset`` itself stays per-member-atomic for the CLI and ``/admin/reseed`` (force-ingest)."""
+    if db.list_members(con):
+        return {"seeded": False}
+    try:
+        return {"seeded": True, **ingest_dataset(con)}
+    except Exception:
+        for mid in db.list_members(
+            con
+        ):  # all from this failed attempt — the DB was empty before it
+            db.delete_member(con, mid)
+        raise
 
 
 def _verify(con) -> None:

@@ -1,8 +1,11 @@
 # Health Intelligence Service — the intended interface (CLAUDE.md "Commands"). Run from backend/.
 # uv owns the venv + dependency resolution; every target runs inside it.
 
-.PHONY: init-db seed run test eval lint hooks help
+.PHONY: init-db seed run serve test eval lint hooks help
 .DEFAULT_GOAL := help
+
+# Shared uvicorn invocation; `run` (dev) and `serve` (prod-mode) differ only in port/reload/workers.
+UVICORN := uv run uvicorn api:app --host 0.0.0.0
 
 help:  ## list targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sort | awk 'BEGIN{FS=":.*##"}{printf "  %-10s %s\n", $$1, $$2}'
@@ -14,7 +17,10 @@ seed:  ## ingest the active dataset (DATASET env; default training_data) — ini
 	uv run python -m preprocessing.ingest
 
 run: seed  ## init + seed + serve the API + UI on :8000 (--reload: backend edits restart automatically)
-	uv run uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+	$(UVICORN) --port 8000 --reload
+
+serve:  ## production-mode serve (no reload; --workers 1; binds $PORT or 8000) — mirrors the Render start command
+	$(UVICORN) --port $${PORT:-8000} --workers 1
 
 test:  ## unit tests
 	uv run pytest

@@ -89,7 +89,18 @@ A thin `backend/api.py` exposes the routes and serves the static page; `analysis
 
 ## Deployment
 
-A single [Render](https://render.com/) Web Service: FastAPI serves both the API and the static page, with SQLite on a persistent disk so live ingest survives deploys. SQLite is used in development and production deliberately — one engine, so the evaluation harness certifies the stack that actually ships. The local one-command run stays primary.
+A single [Render](https://render.com/) Web Service serves both the API and the static page same-origin, deployed straight from this repo via the committed **`render.yaml`** Blueprint. SQLite runs in development and production deliberately — one engine, so the evaluation harness certifies the stack that actually ships. The local one-command run stays primary.
+
+**Deploy (one-click Blueprint):**
+
+1. Push this repo to GitHub.
+2. Render → **New** → **Blueprint** → connect the repo; it reads `render.yaml` (a `web` service, `uv sync` build, `uvicorn api:app` on `$PORT`, health check `/health`).
+3. Set **`ANTHROPIC_API_KEY`** as a secret when prompted (`render.yaml` marks it `sync: false`, so it's never committed). Mode 1 works without it; Mode 2 + the gate need it.
+4. **Create** → on first boot the app inits the schema and **seeds the 15 training members** (the build can't see the runtime filesystem, so both run at startup). Hit `<url>/health`, then open `<url>/`.
+
+**Free tier (the shipped default): the database is ephemeral.** The free plan has no persistent disk and spins down when idle, so the SQLite file is wiped on a cold start — the app re-seeds `training_data` automatically, but `POST /members` uploads and `feedback` do **not** survive a spin-down. For durable storage, upgrade in `render.yaml`: switch `plan: free` → `plan: starter`, uncomment the `disk` block (mounted at `/data`), and set `HEALTH_DB_PATH=/data/health.db` — then uploads and learning persist across deploys (~$8/mo).
+
+Locally, `make serve` runs the exact production command (no `--reload`, binds `$PORT` or 8000, seeds on startup if empty); `make run` stays the primary dev command.
 
 ## Built with AI tools
 

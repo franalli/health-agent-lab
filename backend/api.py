@@ -13,6 +13,7 @@ path is ``HEALTH_DB_PATH`` when set (the Phase-8 Render disk + the test seam), e
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 from collections.abc import Iterator
@@ -34,7 +35,7 @@ from health_intelligence.models import (
     SuggestedPrompt,
 )
 from preprocessing.datasets import DEFAULT_DATASET
-from preprocessing.ingest import ingest_bundle, ingest_dataset
+from preprocessing.ingest import ingest_bundle, ingest_dataset, seed_if_empty
 
 # Load backend/.env into the process env at import (before any LLM provider is constructed) so the
 # Mode-2 path sees ANTHROPIC_API_KEY however the app is launched. A no-op when no .env is present (the
@@ -43,6 +44,9 @@ load_dotenv()
 
 _DB_PATH = os.environ.get("HEALTH_DB_PATH")  # None -> db.DEFAULT_DB_PATH
 _FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+logger = logging.getLogger(
+    __name__
+)  # propagates to uvicorn's handlers → visible in the deploy logs
 
 
 def get_con() -> Iterator[sqlite3.Connection]:
@@ -69,7 +73,27 @@ async def lifespan(app: FastAPI):
     # no cross-process init race.
     con = db.connect(_DB_PATH)
     try:
-        db.init_db(con)
+        db.init_db(
+            con
+        )  # FATAL on failure: the app cannot serve a request without a schema
+        # Seed-if-empty: a fresh container/disk boots with an empty DB (the build can't see the runtime
+        # FS — the same reason init_db runs here). `seed_if_empty` is a no-op locally (make seed ran
+        # first) and on any restart where data persisted; on the free/ephemeral tier it self-heals the
+        # 15 training members on every cold start (active DATASET, matching `make seed`). It is NON-fatal
+        # and logged: a seed failure rolls back to empty (next restart retries) and leaves the
+        # deterministic spine (Mode 1, /health) up, rather than aborting the whole app on a bad dataset.
+        try:
+            outcome = seed_if_empty(con)
+        except Exception:
+            logger.exception(
+                "startup seed failed; serving with the current DB (the next restart retries)"
+            )
+        else:
+            if outcome["seeded"]:
+                logger.info(
+                    "startup: seeded %d members from the active dataset",
+                    outcome["members"],
+                )
     finally:
         con.close()
     yield

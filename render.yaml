@@ -1,0 +1,38 @@
+# Render Blueprint — one web service: FastAPI serves the API and the static UI same-origin.
+# Deploy: Render → New → Blueprint → connect this repo (it reads this file). See README "Deployment".
+#
+# Shipped on the FREE / EPHEMERAL tier: no persistent disk, and the instance spins down when idle, so
+# the SQLite file is wiped on a cold start. That is fine by construction — the app's lifespan runs
+# init_db + seed-if-empty on startup (the build can't see the runtime filesystem), so a fresh instance
+# self-heals its schema and the 15 training members. The trade-off: POST /members uploads and feedback
+# do NOT survive a spin-down. The paid-disk upgrade for durable storage is the commented block below.
+services:
+  - type: web
+    name: health-intelligence
+    runtime: python
+    plan: free
+    rootDir: backend                                    # pyproject.toml + uv.lock live here; build/start run here
+    buildCommand: "pip install uv==0.11.14 && uv sync --frozen"  # uv pinned so the build stays reproducible
+    startCommand: "uv run uvicorn api:app --host 0.0.0.0 --port $PORT --workers 1"  # $PORT injected; --workers 1 enforces the §15 single-worker invariant
+    healthCheckPath: /health  # served once the lifespan completes; the startup seed is sub-second, so no cold-start health-check timeout
+    # Python is pinned to 3.12 by the repo-root .python-version file: Render reads it from the repository
+    # root and auto-selects the latest 3.12 patch. (The env-var PYTHON_VERSION method is NOT used — it
+    # requires a fully-qualified patch, e.g. 3.12.7; the file form may omit it. Without a pin, new Render
+    # services default to a much newer Python than this project's uv.lock was resolved against.)
+    envVars:
+      - key: ANTHROPIC_API_KEY                          # SECRET — set in the dashboard; sync:false keeps it out of the repo.
+        sync: false                                     # Mode 1 runs without it; Mode 2 + the gate need it.
+      - key: DATASET
+        value: training_data
+      # HEALTH_DB_PATH is left unset -> the app uses backend/data/health.db on the ephemeral container FS.
+
+# ---- Paid-disk upgrade (durable uploads + feedback across deploys, ~$8/mo) ---------------------------
+# 1. change `plan: free` above to `plan: starter`
+# 2. add this env var under envVars:
+#      - key: HEALTH_DB_PATH
+#        value: /data/health.db
+# 3. add this disk block under the service (a sibling of envVars):
+#    disk:
+#      name: health-data
+#      mountPath: /data
+#      sizeGB: 1
