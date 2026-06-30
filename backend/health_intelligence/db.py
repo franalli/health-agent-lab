@@ -639,7 +639,8 @@ def write_observation(con: sqlite3.Connection, obs: Observation) -> None:
     """Write one observation as an OVERWRITE-on-conflict (UPSERT) on its deterministic
     (data_version-keyed) ``observation_id``. This is the observation set's *replace* discipline
     (architecture §48): a re-scan at the same ``data_version`` refreshes the derived projection
-    (severity/title/trigger_reason/response_id) **in place** rather than keeping the first write — so a
+    (severity/title/trigger_reason/response_id) **in place** rather than keeping the
+    first write — so a
     narration change (e.g. a ``templates`` / display-name edit) self-heals on the next scan instead of
     stranding stale prose at a fixed ``data_version``.
 
@@ -716,10 +717,13 @@ def get_observations(
     if data_version is None:
         data_version = compute_data_version(con, member_id)
     rows = con.execute(
-        "SELECT observation_id, member_id, response_id, severity, title, trigger_reason, data_version "
+        "SELECT observation_id, member_id, response_id, severity, title, trigger_reason, "
+        "data_version "
         "FROM observations WHERE member_id = ? AND data_version = ?",
         (member_id, data_version),
     ).fetchall()
+    # member_explanation is NOT stored — it is derived at the /observations projection
+    # (pipeline.observations); the Observation defaults it to "" here, filled in there.
     obs = [
         Observation(
             observation_id=r["observation_id"],

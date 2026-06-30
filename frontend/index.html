@@ -85,8 +85,9 @@
   .mode-toggle button:hover { color: var(--ink); }
   .mode-toggle button[aria-checked="true"] { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
 
-  /* ambient escalation flag beside the Observations heading (§4 layer 2) — coloured + icon, never colour alone */
-  .obs-flag { border: 0; background: transparent; padding: 0; margin-left: 7px; cursor: help; font-size: 15px; line-height: 1; vertical-align: middle; }
+  /* ambient escalation flag — a badge on the Observations tab label (§4 layer 2), so it stays visible even
+     on the Trajectory tab. A non-interactive span inside the tab <button>; clicks bubble to the tab. */
+  .obs-flag { border: 0; background: transparent; padding: 0; margin-left: 6px; cursor: inherit; font-size: 13.5px; line-height: 1; vertical-align: middle; }
   .obs-flag.attention { color: var(--amber-line); }
   .obs-flag.urgent { color: var(--red-line); }
   .obs-flag[hidden] { display: none; }
@@ -116,10 +117,11 @@
   .control { display: flex; flex-direction: column; background: var(--panel-3); padding: 16px 14px; overflow-y: auto; }
   .control > * { flex-shrink: 0; }
   .center { display: flex; flex-direction: column; background: var(--bg); }
-  /* observations keeps overflow:visible so the heading-flag tooltip can escape; only the list scrolls. */
+  /* observations keeps overflow:visible so the tab-flag tooltip can escape; the tab bar is fixed, each body scrolls. */
   .observations { display: flex; flex-direction: column; background: var(--panel); padding: 18px 17px; overflow: visible; }
-  .observations > h2, .observations > .obs-sub { flex-shrink: 0; }
-  #observations-list { flex: 1 1 auto; min-height: 0; overflow: auto; }
+  .observations > .rp-tabs { flex-shrink: 0; }
+  .rp-body { flex: 1 1 auto; min-height: 0; overflow: auto; }
+  .rp-body[hidden] { display: none; }
 
   /* drag gutter — transparent col-resize track; centred 1px ::before is the resting divider. */
   .resizer { position: relative; background: transparent; cursor: col-resize; touch-action: none; user-select: none; }
@@ -269,7 +271,14 @@
   [hidden] { display: none !important; }
 
   /* ---- observations ---------------------------------------------------------------------------- */
-  .observations h2 { font-size: 15px; font-weight: 600; margin-bottom: 5px; display: flex; align-items: center; }
+  /* right-panel tab bar — fixed above the scrolling bodies; the selected tab is underlined in accent */
+  .rp-tabs { display: flex; gap: 18px; border-bottom: 1px solid var(--line); margin-bottom: 14px; }
+  .rp-tab { appearance: none; border: 0; background: transparent; padding: 2px 1px 9px; margin-bottom: -1px;
+            font-size: 15px; font-weight: 600; letter-spacing: -.012em; color: var(--muted);
+            border-bottom: 2px solid transparent; display: inline-flex; align-items: center; }
+  .rp-tab:hover { color: var(--ink); }
+  .rp-tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
+  .rp-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 5px; }
   .obs-sub { font-size: 12px; line-height: 1.5; color: var(--muted); margin-bottom: 16px; }
   .obs-item { border: 1px solid var(--line-soft); border-radius: 14px; padding: 13px 14px; margin-bottom: 10px; background: var(--panel-2); }
   .obs-item.flash, .answer-card.flash { animation: obs-flash 1.2s ease-out 2; }
@@ -288,7 +297,8 @@
   .obs-item details > summary { cursor: pointer; font-size: 12px; font-weight: 500; color: var(--accent); list-style: none; }
   .obs-why { font-size: 12px; line-height: 1.5; color: var(--ink); margin-top: 6px; }
 
-  /* ---- trajectory sparklines (operator-only; rendered on the dark readout) ----------------------- */
+  /* ---- trajectory sparklines (shared rendering: the dark operator readout + the light Trajectory tab) -
+     base = dark operator readout; .traj-card re-skins the SAME markup for the right panel (see below). */
   .spark-wrap { display: flex; flex-direction: column; gap: 12px; }
   .spark-card { display: flex; flex-direction: column; gap: 4px; }
   .spark-head { display: flex; align-items: baseline; gap: 8px; }
@@ -297,6 +307,16 @@
   .spark-flag.panic { color: #E8957A; }                /* coral panic */
   .spark-sub { color: #A59C8C; font-size: 10.5px; }
   svg.spark { display: block; background: #191613; border-radius: 7px; }
+
+  /* right-panel Trajectory tab: .obs-item card chrome + light text over the SAME .spark-* markup; only the
+     svg background flips to light here (the operator readout keeps the dark svg.spark bg above). The spark
+     stroke/fill colours come from the JS palette (SPARK_LIGHT), so the drawing path stays shared. */
+  .traj-card { gap: 7px; border: 1px solid var(--line-soft); border-radius: 14px; padding: 13px 14px; margin-bottom: 10px; background: var(--panel-2); }
+  .traj-card .spark-name { color: var(--ink); font-size: 13.5px; }
+  .traj-card .spark-sub { color: var(--muted); font-size: 11.5px; }
+  .traj-card .spark-flag { color: var(--amber-ink); }
+  .traj-card .spark-flag.panic { color: var(--red-ink); }
+  .traj-card svg.spark { width: 100%; height: auto; background: #FBFAF7; }
 </style>
 </head>
 <body>
@@ -341,7 +361,7 @@
     <aside class="control" aria-label="Operator control panel">
       <p class="operator-tag">Operator only — not part of the member view</p>
       <div id="cp-groups"></div>
-      <input id="upload-file" type="file" accept="application/json,.json" hidden />
+      <input id="upload-file" type="file" accept=".zip,application/zip,application/json,.json" hidden />
       <div class="readout-label">Route response</div>
       <pre id="cp-readout" aria-live="polite">—</pre>
     </aside>
@@ -365,11 +385,21 @@
     <div class="resizer" data-resize="obs" role="separator" aria-orientation="vertical" tabindex="0"
          aria-label="Resize observations panel" title="Drag to resize · double-click to reset"></div>
 
-    <!-- RIGHT · proactive observations -->
-    <aside class="observations" aria-label="Observations">
-      <h2>Observations<button id="obs-flag" type="button" class="obs-flag tip-below" hidden>⚑</button></h2>
-      <div class="obs-sub">Raised proactively from your trajectory, ranked by what's worth knowing.</div>
-      <div id="observations-list"></div>
+    <!-- RIGHT · proactive observations + per-marker trajectory (two member-facing tabs over the same member) -->
+    <aside class="observations" aria-label="Observations and trajectory">
+      <div class="rp-tabs" role="tablist" aria-label="Observations and trajectory">
+        <button id="tab-obs" type="button" role="tab" class="rp-tab" aria-selected="true" aria-controls="rp-body-obs"
+        >Observations<span id="obs-flag" class="obs-flag" hidden aria-hidden="true">⚑</span></button>
+        <button id="tab-traj" type="button" role="tab" class="rp-tab" aria-selected="false" aria-controls="rp-body-traj" tabindex="-1">Trajectory</button>
+      </div>
+      <div id="rp-body-obs" class="rp-body" role="tabpanel" aria-labelledby="tab-obs" tabindex="0">
+        <div class="obs-sub">Raised proactively from your trajectory, ranked by what's worth knowing.</div>
+        <div id="observations-list"></div>
+      </div>
+      <div id="rp-body-traj" class="rp-body" role="tabpanel" aria-labelledby="tab-traj" tabindex="0" hidden>
+        <div class="obs-sub">Your per-marker trends over time.</div>
+        <div id="trajectory-list"></div>
+      </div>
     </aside>
   </main>
 
@@ -407,7 +437,7 @@
   // routes scaffold; the panel is a projection of the routes that exist (architecture §56).
   const ROUTES = [
     { group: "Data", label: "Upload bundle", verb: "POST", handler: () => $("#upload-file").click(),
-      tip: "POST /members · pick a MemberBundle JSON file and ingest it now. A malformed file shows the validation error here — the upload is the format check." },
+      tip: "POST /members/upload · upload a .zip of a dataset folder shaped like backend/data/training_data/ — a lab-panels CSV + a members JSON + an optional eval JSON. Files are matched by type/content, NOT filename (the members file is the JSON whose records carry profile/panels), so the hold-out's names may differ. Effect: the whole bundle is saved as a NEW dataset folder under backend/data/ (named after the zip; files normalized to canonical names), its members are added to the existing data (no reseed; a re-used id refreshes that member), and the new members are auto-scanned so their Observations show immediately. A bare members JSON is also accepted. A malformed/unresolvable file or a name that already exists shows the error here — the upload is the format check." },
     { group: "Data", label: "Reseed (factory)", verb: "POST", destructive: true, handler: reseed,
       tip: "POST /admin/reseed · TRUNCATE all tables and re-ingest the original training_data members. Drops uploads + all learning/audit history. Fires immediately — red cue only, no confirm." },
     { group: "Proactive", label: "Scan member", verb: "POST", handler: () => withMember(async (m) => { await runScan(m, true); await refreshEscalations(m); }),
@@ -442,6 +472,10 @@
     loading: false,             // member-load in flight: blocks asks until the safety state is loaded
     loadError: false,           // a member-load fetch failed → surface honestly, never a false all-clear
     observations: [], activeEscalations: [],
+    rightTab: "observations",   // which right-panel tab is shown ("observations" | "trajectory"); kept across member switches
+    trajectory: null,           // GET /trajectory cache for the current member: null = not fetched yet, [] = fetched-empty
+    trajLoading: false, trajError: false,
+    trajToken: 0,               // bumped on member switch AND scan-invalidation; an in-flight trajectory fetch with a stale token is dropped
     readoutKey: null,           // path currently shown in the route readout; a repeat click toggles it back to default
     transitionShown: new Map(), // escalation_id -> level already shown loud (so it never re-alarms)
     reqToken: 0,                // bumped on every member switch; stale async results are dropped
@@ -507,8 +541,9 @@
     state.focus = null; state.asked = []; state.chips = [];
     state.log = []; state.asking = false; state.loading = false; state.loadError = false;
     state.observations = []; state.activeEscalations = [];
+    state.trajectory = null; state.trajLoading = false; state.trajError = false;  // invalidate the per-member trajectory cache
     state.transitionShown = new Map();
-    state.reqToken++;
+    state.reqToken++; state.trajToken++;  // drop any in-flight member-load AND trajectory fetch from the old member
   }
 
   // wipe the member surface when no member is selected (e.g. the last member was just cleared) so a
@@ -517,7 +552,7 @@
     flushMemberState();
     state.currentMember = null;
     syncPicker();
-    renderConversation(); renderObservations(); renderEscalationFlag(); renderChips(); updateAskDisabled();
+    renderConversation(); renderRightTabs(); renderObservations(); renderTrajectoryTab(); renderEscalationFlag(); renderChips(); updateAskDisabled();
   }
 
   // ---- boot -------------------------------------------------------------------------------------
@@ -549,7 +584,9 @@
     state.currentMember = id;
     state.loading = true;        // block asks until the member's safety state is loaded (#2)
     syncPicker();
-    renderConversation(); renderObservations(); renderEscalationFlag(); renderChips(); updateAskDisabled();
+    renderConversation(); renderRightTabs(); renderObservations(); renderTrajectoryTab(); renderEscalationFlag(); renderChips(); updateAskDisabled();
+    // (the Trajectory tab can't load until observations are in — both tabs gate on isAnalyzed() — so the
+    // trajectory fetch waits for the post-load block below, not here.)
 
     const token = state.reqToken;
     // all three are READS (GET observations / escalations / suggestions); none triggers a scan.
@@ -559,6 +596,10 @@
     // honest surface: if a safety-critical load fetch failed, don't render a falsely-calm all-clear (#4)
     state.loadError = !(obsR.ok && escR.ok);
     renderObservations(); renderEscalationFlag(); updateAskDisabled();
+    // observations are now loaded → isAnalyzed() is accurate; keep-tab-and-refetch. ensureTrajectory paints the
+    // trajectory body itself, so call ONE or the other — never both (#11 double-paint). ensureTrajectory bails
+    // to the empty state if the member isn't analyzed.
+    if (state.rightTab === "trajectory") ensureTrajectory(); else renderTrajectoryTab();
   }
 
   // GET the member's current observations (a READ of the last scan's output — never triggers a scan).
@@ -572,7 +613,7 @@
   async function runScan(id, toReadout) {
     const r = await api("POST", `/members/${enc(id)}/scan`);
     if (toReadout) renderReadout(r.data);
-    if (r.ok && id === state.currentMember) { state.observations = r.data; renderObservations(); }
+    if (r.ok && id === state.currentMember) { state.observations = r.data; renderObservations(); invalidateTrajectory(); }
     return r;
   }
 
@@ -588,7 +629,7 @@
       const r = await api("POST", `/members/${enc(m.member_id)}/scan`);
       results.push(r.ok ? { member_id: m.member_id, observations: r.data.length }
                         : { member_id: m.member_id, error: r.status });
-      if (r.ok && m.member_id === state.currentMember) { state.observations = r.data; renderObservations(); }
+      if (r.ok && m.member_id === state.currentMember) { state.observations = r.data; renderObservations(); invalidateTrajectory(); }
     }
     if (state.currentMember) await refreshEscalations(state.currentMember);
     const failed = results.filter((x) => x.error != null).length;
@@ -697,20 +738,22 @@
     state.readoutKey = path;
   }
 
-  // POST a bundle dict, surface the result, and on success reload the picker onto it — the ingest tail
-  // for Upload bundle (#11). A 422 shows the field error in the readout (the upload is the format
-  // check, ui-ux §2).
-  async function postBundle(bundle) {
-    const r = await api("POST", "/members", bundle);
-    renderReadout(r.data);
-    if (r.ok) await loadMembers(r.data.member_id);
-  }
-
+  // Upload a dataset bundle (a .zip of a training_data-shaped folder, or a bare members.json array) as
+  // multipart to POST /members/upload, surface the {members, results, ranges, member_ids} summary, and
+  // on success reload the picker onto the last ingested member. A 422 shows the validation error here
+  // (the upload is the format check, ui-ux §2). Multipart can't go through api() (which forces a JSON
+  // body), so this fetches directly; the browser sets the multipart boundary Content-Type itself.
   async function onUploadFile(file) {
-    let parsed;
-    try { parsed = JSON.parse(await file.text()); }
-    catch (e) { return renderReadout({ error: "File is not valid JSON", detail: String(e) }); }
-    await postBundle(parsed);
+    const fd = new FormData();
+    fd.append("file", file, file.name);
+    let res, data;
+    try { res = await fetch("/members/upload", { method: "POST", body: fd }); }
+    catch (e) { return renderReadout({ error: "Upload failed to reach the server", detail: String(e) }); }
+    const raw = await res.text();
+    try { data = raw ? JSON.parse(raw) : null; } catch { data = raw; }
+    renderReadout(data);
+    const ids = data && data.member_ids;
+    if (res.ok && ids && ids.length) await loadMembers(ids[ids.length - 1]);
   }
 
   // ---- Phase 7 control-panel handlers (Learning group + Trajectory) -----------------------------
@@ -860,9 +903,33 @@
     clearMemberView(); await loadMembers();  // picker repopulates with the restored 15
   }
 
-  // ---- trajectory sparklines -------------------------------------------------------------------
+  // ---- trajectory sparklines (shared by the dark operator readout AND the light Trajectory tab) -------
   const SVGNS = "http://www.w3.org/2000/svg";
   const svg = (tag, attrs) => { const n = document.createElementNS(SVGNS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); return n; };
+  // the only thing that differs between the two surfaces is the colour palette (svg stroke/fill attrs) — the
+  // geometry is identical. DARK = the existing operator-readout colours (byte-identical to before); LIGHT =
+  // right-panel colours (the svg *background* is handled by CSS: svg.spark vs .traj-card svg.spark).
+  const SPARK_DARK  = { band: "#2C2823", trend: "#8A8276", line: "#9FBBE9", point: "#9FBBE9", flagAmber: "#E0B86A", flagPanic: "#E8957A" };
+  const SPARK_LIGHT = { band: "#ECE7DD", trend: "#B7B1A6", line: "#5E7BB0", point: "#5E7BB0", flagAmber: "#D9A53E", flagPanic: "#E06A45" };
+  const SEV_RANK = { urgent: 3, attention: 2, notable: 1, info: 0 };  // Trajectory-tab ordering: flagged markers first
+
+  // A member is "analyzed" once a scan has produced observations. BOTH right-panel tabs gate on this one
+  // condition so they wait for the scan together — never trajectory-full while observations-empty. Until
+  // then both show the same empty state. (A member with any flagged marker WILL raise an observation when
+  // scanned, so this also means the Trajectory tab never asserts a flag the Observations tab doesn't.)
+  // Copy note: deliberately NOT "Not analyzed yet" — that would be false for a scanned-clean member (a calm
+  // member's scan correctly writes zero observations), and would contradict an active care-team flag. This
+  // wording is honest whether the member is unscanned OR scanned-with-nothing-notable.
+  const NO_RESULTS_MSG = "No results to show yet — run a scan to refresh.";
+  function isAnalyzed() { return state.observations.length > 0; }
+
+  // shared 'message + Retry chip' empty-state builder (#10) — used by the load-error and trajectory-error paths.
+  function appendRetry(host, msg, onRetry) {
+    host.appendChild(el("div", "obs-sub", msg));
+    const retry = el("button", "suggest-chip", "Retry");
+    retry.addEventListener("click", onRetry);
+    host.appendChild(retry);
+  }
 
   async function showTrajectory() {
     if (!state.currentMember) return renderReadout({ error: "No member selected." });
@@ -879,35 +946,42 @@
     host.textContent = "";
     if (!markers || !markers.length) { host.textContent = "No markers."; return; }
     const wrap = el("div", "spark-wrap");
-    for (const t of markers) wrap.appendChild(sparkCard(t));
+    for (const t of markers) wrap.appendChild(sparkCard(t, SPARK_DARK, false));
     host.appendChild(wrap);
   }
 
-  function sparkCard(t) {
-    const card = el("div", "spark-card");
+  // one card for one marker's series. `palette` colours the svg; `light` swaps in right-panel card chrome
+  // (.traj-card) and the spec caption (no trend suffix). The dark/operator path passes (SPARK_DARK, false).
+  function sparkCard(t, palette, light) {
+    const card = el("div", light ? "spark-card traj-card" : "spark-card");
     const vals = t.readings.map((r) => r.value);
     const panic = t.flags.find((f) => f.startsWith("panic"));
     const flag = panic || t.flags.find((f) => f === "above_range" || f === "below_range");
     const head = el("div", "spark-head");
     head.appendChild(el("span", "spark-name", t.marker));
-    if (flag) {
+    if (flag) {  // surface out-of-range/panic status as icon+TEXT, not colour alone — and not trend-only
       const lab = el("span", "spark-flag" + (panic ? " panic" : ""));
-      lab.textContent = `${panic ? "‼" : "⚑"} ${flag.replace("_", " ")}`;  // icon + TEXT (never colour alone)
+      lab.textContent = `${panic ? "‼" : "⚑"} ${flag.replace("_", " ")}`;
       head.appendChild(lab);
     }
     card.appendChild(head);
-    card.appendChild(sparkSvg(t, vals, !!panic, !!flag));
+    card.appendChild(sparkSvg(t, vals, !!panic, !!flag, palette));
     const last = t.readings[t.readings.length - 1];
-    // show the Theil–Sen direction where one is asserted; for a sub-n_min series (no MK verdict) say so
-    // explicitly, so the absent trend line reads as an honest abstention rather than a missing element.
-    const dir = t.trend
-      ? (t.trend.slope != null ? ` · ${t.trend.direction}` : "")
-      : " · trend not computed (short series)";
-    card.appendChild(el("div", "spark-sub", `${vals.length} readings · latest ${last ? last.value : "—"} ${t.unit || ""}${dir}`));
+    const lastVal = last ? last.value : "—";
+    if (light) {  // the member-facing caption is exactly the spec line — no trend suffix
+      card.appendChild(el("div", "spark-sub", `${vals.length} readings · latest ${lastVal}${t.unit ? " " + t.unit : ""}`));
+    } else {
+      // operator readout keeps the richer caption: show the Theil–Sen direction where one is asserted; for a
+      // sub-n_min series (no MK verdict) say so explicitly, so the absent trend line reads as honest abstention.
+      const dir = t.trend
+        ? (t.trend.slope != null ? ` · ${t.trend.direction}` : "")
+        : " · trend not computed (short series)";
+      card.appendChild(el("div", "spark-sub", `${vals.length} readings · latest ${lastVal} ${t.unit || ""}${dir}`));
+    }
     return card;
   }
 
-  function sparkSvg(t, vals, panic, flagged) {
+  function sparkSvg(t, vals, panic, flagged, palette) {
     const W = 240, H = 46, pad = 5, n = vals.length;
     const rr = t.reference_range || {};
     const domain = [...vals];
@@ -920,15 +994,74 @@
     const y = (v) => H - pad - ((v - lo) / (hi - lo)) * (H - 2 * pad);
     const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, class: "spark", width: W, height: H, role: "img", "aria-label": `${t.marker} trend over ${n} readings` });
     if (rr.ref_low != null && rr.ref_high != null)  // the normal band, faint
-      s.appendChild(svg("rect", { x: 0, y: y(rr.ref_high), width: W, height: Math.max(1, y(rr.ref_low) - y(rr.ref_high)), fill: "#2C2823" }));
+      s.appendChild(svg("rect", { x: 0, y: y(rr.ref_high), width: W, height: Math.max(1, y(rr.ref_low) - y(rr.ref_high)), fill: palette.band }));
     if (t.theil_sen && t.theil_sen.length === 2)  // the already-computed Theil–Sen line, dashed
-      s.appendChild(svg("line", { x1: x(0), y1: y(t.theil_sen[0].value), x2: x(n - 1), y2: y(t.theil_sen[1].value), stroke: "#8A8276", "stroke-width": 1, "stroke-dasharray": "3 3" }));
-    s.appendChild(svg("polyline", { points: vals.map((v, i) => `${x(i)},${y(v)}`).join(" "), fill: "none", stroke: "#9FBBE9", "stroke-width": 1.5 }));
+      s.appendChild(svg("line", { x1: x(0), y1: y(t.theil_sen[0].value), x2: x(n - 1), y2: y(t.theil_sen[1].value), stroke: palette.trend, "stroke-width": 1, "stroke-dasharray": "3 3" }));
+    s.appendChild(svg("polyline", { points: vals.map((v, i) => `${x(i)},${y(v)}`).join(" "), fill: "none", stroke: palette.line, "stroke-width": 1.5 }));
     vals.forEach((v, i) => {
       const isLast = i === n - 1, mark = isLast && flagged;
-      s.appendChild(svg("circle", { cx: x(i), cy: y(v), r: mark ? 3.5 : 2, fill: mark ? (panic ? "#E8957A" : "#E0B86A") : "#9FBBE9" }));
+      s.appendChild(svg("circle", { cx: x(i), cy: y(v), r: mark ? 3.5 : 2, fill: mark ? (panic ? palette.flagPanic : palette.flagAmber) : palette.point }));
     });
     return s;
+  }
+
+  // ---- right-panel tabs: Observations (default) | Trajectory ------------------------------------
+  // The Trajectory tab is a SECOND member-facing surface of GET /trajectory (the operator readout is the
+  // first). It is presentation only — the LLM never consumes this; the model sees only the collapsed verdict.
+  function selectRightTab(tab) {
+    state.rightTab = tab;
+    renderRightTabs();
+    if (tab === "trajectory") ensureTrajectory();  // lazy: fetch on first open for this member
+  }
+
+  function renderRightTabs() {
+    const onObs = state.rightTab !== "trajectory";
+    const tabObs = $("#tab-obs"), tabTraj = $("#tab-traj");
+    tabObs.setAttribute("aria-selected", String(onObs)); tabObs.tabIndex = onObs ? 0 : -1;
+    tabTraj.setAttribute("aria-selected", String(!onObs)); tabTraj.tabIndex = onObs ? -1 : 0;
+    $("#rp-body-obs").hidden = !onObs;
+    $("#rp-body-traj").hidden = onObs;
+  }
+
+  // fetch the per-member trajectory once and cache it (state.trajectory). Guarded by trajToken so a result
+  // that lands after a member switch OR a scan-invalidation is dropped (never paints a stale/wrong series).
+  async function ensureTrajectory() {
+    // don't fetch (or show) trajectory until the member is analyzed — both tabs wait for the scan together
+    if (!state.currentMember || !isAnalyzed()) { renderTrajectoryTab(); return; }
+    if (state.trajLoading || state.trajectory !== null) { renderTrajectoryTab(); return; }
+    state.trajLoading = true; state.trajError = false;
+    renderTrajectoryTab();  // loading indicator
+    const token = state.trajToken;  // bumped by member switch AND scan-invalidation (#3)
+    const r = await api("GET", `/members/${enc(state.currentMember)}/trajectory`);
+    if (token !== state.trajToken) return;  // member switched OR a scan invalidated mid-fetch → drop this stale result
+    state.trajLoading = false;
+    // sort once here at cache time (not on every paint, #12); flagged markers first, stable within tier.
+    if (r.ok) state.trajectory = r.data.slice().sort((a, b) => (SEV_RANK[b.severity] || 0) - (SEV_RANK[a.severity] || 0));
+    else state.trajError = true;
+    renderTrajectoryTab();
+  }
+
+  // invalidate the cache after a scan changed this member's analysis, so the Trajectory tab can't show a
+  // pre-scan series while Observations shows the post-scan findings. Bumps trajToken + clears trajLoading so an
+  // in-flight pre-scan GET is DROPPED (not silently written back, #3); refetches only if it's the visible tab.
+  function invalidateTrajectory() {
+    state.trajectory = null; state.trajError = false; state.trajLoading = false; state.trajToken++;
+    if (state.rightTab === "trajectory") ensureTrajectory();
+  }
+
+  function renderTrajectoryTab() {
+    const host = $("#trajectory-list"); host.innerHTML = "";
+    if (!state.currentMember) { host.appendChild(el("div", "obs-sub", "Select a member.")); return; }
+    if (state.loadError)  // member-load failed → honest, never a false "run a scan" (matches Observations, #4)
+      return appendRetry(host, "⚠ Couldn't load your results — check your connection.", () => { if (state.currentMember) selectMember(state.currentMember); });
+    if (state.loading) { host.appendChild(el("div", "obs-sub", "Loading…")); return; }  // member-load in flight → not a false "run a scan" (#4)
+    if (!isAnalyzed()) { host.appendChild(el("div", "obs-sub", NO_RESULTS_MSG)); return; }  // wait for the scan, with Observations
+    if (state.trajLoading) { host.appendChild(el("div", "obs-sub", "Loading your trends…")); return; }
+    if (state.trajError) return appendRetry(host, "⚠ Couldn't load trends.", ensureTrajectory);
+    if (state.trajectory === null) return;  // not fetched yet (tab hidden) — leave the body empty
+    if (!state.trajectory.length) { host.appendChild(el("div", "obs-sub", "No markers to show.")); return; }
+    // already sorted at cache time (flagged markers first, #12) — just render.
+    for (const t of state.trajectory) host.appendChild(sparkCard(t, SPARK_LIGHT, true));
   }
 
   // ============================== RENDER ==========================================================
@@ -1037,14 +1170,20 @@
     $("#ask-form").hidden = state.mode !== 2;
   }
 
-  // The ambient escalation flag beside the Observations heading. A load failure is NOT shown here — it
-  // surfaces in the panel body with a Retry (renderObservations), so the flag stays a pure all-clear/flagged
-  // signal and a failed load is never mistaken for an escalation (#4). Coloured by severity, never colour
-  // alone: it carries a hover/focus message and an aria-label (§8).
+  // The ambient escalation flag — a badge on the Observations TAB label (so it's visible from either tab). A
+  // load failure is NOT shown here — it surfaces in the panel body with a Retry (renderObservations), so the
+  // flag stays a pure all-clear/flagged signal and a failed load is never mistaken for an escalation (#4).
+  // Coloured by severity, never colour alone (§8). The badge glyph is decorative (aria-hidden); the full
+  // message is carried by the FOCUSABLE tab button — as data-tip (mouse hover + keyboard :focus-visible
+  // tooltip) and aria-label (screen readers) — because the span itself can't take focus (#5).
   function renderEscalationFlag() {
-    const flag = $("#obs-flag");
+    const flag = $("#obs-flag"), tab = $("#tab-obs");
     const active = state.loadError ? [] : state.activeEscalations;
-    if (!active.length) { flag.hidden = true; return; }
+    if (!active.length) {  // all-clear: hide the badge AND strip the flag message from the tab
+      flag.hidden = true;
+      tab.classList.remove("tip-below"); tab.removeAttribute("data-tip"); tab.removeAttribute("aria-label");
+      return;
+    }
     const anyUrgent = active.some((e) => e.level === "urgent");
     // No count: the flag ambiently summarises BOTH scan findings and chat escalations (ui-ux §107/§110),
     // but the Observations panel only renders scan findings — so any number is unverifiable against what
@@ -1055,9 +1194,10 @@
       : "Some results have been flagged for your care team.";
     flag.hidden = false;
     flag.textContent = anyUrgent ? "‼" : "⚑";
-    flag.className = `obs-flag tip-below ${anyUrgent ? "urgent" : "attention"}`;
-    flag.setAttribute("data-tip", msg);
-    flag.setAttribute("aria-label", msg);
+    flag.className = `obs-flag ${anyUrgent ? "urgent" : "attention"}`;
+    tab.classList.add("tip-below");
+    tab.setAttribute("data-tip", msg);                        // mouse hover + keyboard :focus-visible tooltip
+    tab.setAttribute("aria-label", `Observations — ${msg}`);  // full message in the tab's screen-reader name
   }
 
   function renderConversation() {
@@ -1188,15 +1328,12 @@
 
   function renderObservations() {
     const host = $("#observations-list"); host.innerHTML = "";
-    if (state.loadError) {  // honest: a failed load is not an all-clear (#4)
-      host.appendChild(el("div", "obs-sub", "⚠ Couldn't load your results — check your connection."));
-      const retry = el("button", "suggest-chip", "Retry");
-      retry.addEventListener("click", () => { if (state.currentMember) selectMember(state.currentMember); });
-      host.appendChild(retry);
-      return;
-    }
-    if (!state.observations.length) {
-      host.appendChild(el("div", "obs-sub", state.currentMember ? "Nothing stands out right now." : "Select a member."));
+    if (state.loadError)  // honest: a failed load is not an all-clear (#4)
+      return appendRetry(host, "⚠ Couldn't load your results — check your connection.", () => { if (state.currentMember) selectMember(state.currentMember); });
+    if (!state.currentMember) { host.appendChild(el("div", "obs-sub", "Select a member.")); return; }
+    if (state.loading) { host.appendChild(el("div", "obs-sub", "Loading…")); return; }  // member-load in flight → not a false empty state (#4)
+    if (!isAnalyzed()) {  // no scan yet → the shared empty state (Trajectory shows the SAME — they wait together)
+      host.appendChild(el("div", "obs-sub", NO_RESULTS_MSG));
       return;
     }
     for (const obs of state.observations) {
@@ -1209,7 +1346,9 @@
       item.appendChild(el("div", "obs-title", obs.title));
       const d = el("details");
       d.appendChild(el("summary", null, "why am I seeing this?"));
-      d.appendChild(el("div", "obs-why", obs.trigger_reason));
+      // member audience: deterministic plain-language explanation (states the range, never the
+      // statistics). The clinician trigger_reason stays on the operator console (raw-JSON readouts).
+      d.appendChild(el("div", "obs-why", obs.member_explanation));
       item.appendChild(d);
       host.appendChild(item);
     }
@@ -1303,14 +1442,30 @@
   // ---- static handlers --------------------------------------------------------------------------
   function setMode(m) { state.mode = m; renderModeToggle(); renderChips(); }
 
-  // clicking the Observations flag: bring the flagged observations into view AND pulse them, so the action
-  // is visible even on desktop where the panel is already on-screen (scrollIntoView alone is a no-op).
+  // clicking the (flagged) Observations tab: bring the flagged observations into view AND pulse them, so the
+  // action is visible even on desktop where the panel is already on-screen (scrollIntoView alone is a no-op).
   function viewFlagged() {
     const obs = $(".observations");
     const flagged = [...obs.querySelectorAll(".obs-item.attention, .obs-item.urgent")];
     const targets = flagged.length ? flagged : [...obs.querySelectorAll(".obs-item")];
     (targets[0] || obs).scrollIntoView({ behavior: "smooth", block: "nearest" });
     for (const item of targets) { item.classList.remove("flash"); void item.offsetWidth; item.classList.add("flash"); }
+  }
+
+  // activate the Observations tab; if anything is flagged, also pulse the flagged cards into view — the old
+  // flag-click affordance, now shared by BOTH mouse click and keyboard activation (#7).
+  function showObservationsTab() {
+    selectRightTab("observations");
+    if (state.activeEscalations.length) viewFlagged();
+  }
+
+  // ARIA tablist keyboard nav for the two right-panel tabs (Left/Home → Observations, Right/End → Trajectory).
+  function onRightTabKey(e) {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+    e.preventDefault();
+    const goTraj = e.key === "ArrowRight" || e.key === "End";
+    if (goTraj) selectRightTab("trajectory"); else showObservationsTab();
+    $(goTraj ? "#tab-traj" : "#tab-obs").focus();
   }
 
   function wireStaticHandlers() {
@@ -1324,7 +1479,11 @@
     });
     $("#mode1-btn").addEventListener("click", () => setMode(1));
     $("#mode2-btn").addEventListener("click", () => setMode(2));
-    $("#obs-flag").addEventListener("click", viewFlagged);
+    // right-panel tabs: switch bodies; activating the Observations tab while flagged also pulses the flagged
+    // cards (the old flag-click affordance, shared by click + keyboard via showObservationsTab, #7).
+    $("#tab-obs").addEventListener("click", showObservationsTab);
+    $("#tab-traj").addEventListener("click", () => selectRightTab("trajectory"));
+    $(".rp-tabs").addEventListener("keydown", onRightTabKey);
     $("#upload-file").addEventListener("change", (e) => { if (e.target.files[0]) onUploadFile(e.target.files[0]); e.target.value = ""; });
     $("#ask-form").addEventListener("submit", (e) => {
       e.preventDefault();

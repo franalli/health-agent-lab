@@ -25,6 +25,7 @@ one targeted exception (Phase 7): a ``/feedback`` override changes the analysis 
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 from datetime import UTC, date, datetime
@@ -161,6 +162,7 @@ def scan(con: sqlite3.Connection, member_id: str) -> list[Observation]:
                     title=title,
                     trigger_reason=trigger_reason,
                     data_version=data_version,
+                    # member_explanation is NOT stored; it is re-derived at read by `observations()`.
                 ),
             )
             level = severity_to_level(traj.severity)
@@ -196,6 +198,69 @@ def scan(con: sqlite3.Connection, member_id: str) -> list[Observation]:
         db.prune_observations(con, member_id, data_version, kept_ids)
 
     return db.get_observations(con, member_id, data_version=data_version)
+
+
+def observations(con: sqlite3.Connection, member_id: str) -> list[Observation]:
+    """The member-facing ``GET /observations`` projection: the member's persisted findings, each with its
+    ``member_explanation`` DERIVED at read (it is not stored). The third read-time-derive peer to
+    ``trajectory`` and ``suggestions``: re-``analyze()`` the member's current data, then attach the
+    deterministic member-facing prose (``templates.observation_member_explanation``) to each stored
+    observation, matched by its ``data_version``-keyed ``observation_id`` — which the analysis reproduces
+    exactly (the id keys on ``(member, marker, data_version)`` and ``analyze`` is deterministic), so no
+    fragile marker-parsing is needed. The explanation is therefore composed server-side in ``templates``
+    (never in JS — preserving the no-stats-leak / surface-the-flags invariant) and always agrees with the
+    value+range the Trajectory tab shows for that marker. Raises ``KeyError`` if the member is absent.
+
+    An unscanned member (or one whose last scan raised nothing) has no rows at the current
+    ``data_version`` -> returns ``[]`` without composing anything, so the panel is empty exactly as the
+    scan-state gating intends. A stored row whose id the current analysis doesn't reproduce (only
+    possible if data changed since the scan, which would also change ``data_version`` and so return no
+    rows here) keeps its default ``""`` rather than a wrong explanation."""
+    member, results, ranges, age, data_version = db.load_for_analysis(con, member_id)
+    rows = db.get_observations(con, member_id, data_version=data_version)
+    if not rows:
+        return rows
+    analysis = analyze(
+        member, results, ranges, age, ANALYSIS_CONFIG, data_version=data_version
+    )
+    # Rebuild the obs_id -> (traj, rng) map exactly as `scan` minted it, so each finding matches its
+    # trajectory by id. Same construction as the scan write-loop (db._det_id + _range_for).
+    by_id = {
+        db._det_id("obs:", member_id, traj.marker, data_version): (
+            traj,
+            _range_for(traj.marker, member.sex, age, ranges),
+        )
+        for traj in _raised_ranked(analysis)
+    }
+    return [
+        o.model_copy(
+            update={
+                "member_explanation": templates.observation_member_explanation(
+                    *by_id[o.observation_id]
+                )
+            }
+        )
+        if o.observation_id in by_id
+        else o
+        for o in rows
+    ]
+
+
+def scan_members(con: sqlite3.Connection, member_ids: list[str]) -> int:
+    """Scan several members BEST-EFFORT; return how many scanned cleanly. The orchestration behind the
+    auto-scan after ``POST /members/upload`` (so a freshly uploaded member's Observations match its live
+    Trajectory at once) — kept in the library, not the route, per "logic lives in pipeline, routes stay
+    thin". Best-effort by design: the upload's ingest has already committed, so one member's scan failing
+    must not fail the others or the request — it's logged and skipped. (The natural home, too, for a
+    future server-side 'scan all'.)"""
+    scanned = 0
+    for member_id in member_ids:
+        try:
+            scan(con, member_id)
+            scanned += 1
+        except Exception:
+            logging.exception("scan_members: scan failed for member %s", member_id)
+    return scanned
 
 
 def suggestions(

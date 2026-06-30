@@ -21,12 +21,11 @@ The few tagged additions (gate crisis/acute cases) are appended from ``added_cas
 
 from __future__ import annotations
 
-import json
-
 from eval.added_cases import ADDED_CASES
 from eval.types import Case, CaseExpectation, Mode1Coverage, Route
 from health_intelligence.models import AnswerDisposition, FloorLevel
 from preprocessing.datasets import dataset_dir
+from preprocessing.ingest import read_records
 
 # --------------------------------------------------------------------------------------------------
 # Escalation-label normalization — free text → enum / acceptable-set (architecture §8). Order matters:
@@ -116,14 +115,26 @@ def _to_case(rec: dict) -> Case:
 
 
 def load_supplied_cases(dataset: str | None = None) -> list[Case]:
-    """Parse ``<dataset>/eval_set.jsonl`` into ``Case``s. One JSON object per line."""
+    """Parse ``<dataset>/eval_set.jsonl`` into ``Case``s.
+
+    The eval set is now OPTIONAL on an uploaded dataset (a members-only upload creates a dataset folder
+    with no eval file), so a MISSING file is an empty supplied set (``[]``), not a crash. When present it
+    is read via the shared ``read_records`` — SHAPE-AGNOSTIC (a seeded dataset ships JSONL; an uploaded
+    hold-out's eval file may have arrived as a JSON **array**, kept verbatim under the canonical name) and
+    BOM-tolerant. A record missing a required field becomes a clear ``ValueError`` naming it, not a raw
+    ``KeyError`` that aborts the run with no context."""
     path = dataset_dir(dataset) / "eval_set.jsonl"
-    cases: list[Case] = []
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if line:
-            cases.append(_to_case(json.loads(line)))
-    return cases
+    if not path.exists():
+        return []
+    records = read_records(path.read_bytes())
+    try:
+        return [_to_case(rec) for rec in records]
+    except (KeyError, TypeError) as e:
+        # KeyError: a dict record missing a required field. TypeError: a non-dict record (read_records
+        # accepts arrays/scalars too) hitting rec[...]. Either way, a clear cause beats a raw traceback.
+        raise ValueError(
+            f"eval set for dataset {dataset!r} has a malformed record ({e!r})"
+        ) from e
 
 
 def load_cases(dataset: str | None = None) -> list[Case]:

@@ -288,6 +288,173 @@ def test_observation_summary_surfaces_status_on_a_flagged_trending_marker():
     assert "range" not in i_title and "threshold" not in i_title, i_title
 
 
+def test_format_reference_range_renders_the_three_bound_shapes():
+    """The member range formatter renders a band, an upper-only, and a lower-only bound, trims a
+    trailing .0, and is empty for an unbounded (no_reference) range so the caller states no range."""
+    f = templates._format_reference_range
+    assert f(70.0, 99.0, "mg/dL") == "70–99 mg/dL"  # band
+    assert f(None, 100.0, "mg/dL") == "under 100 mg/dL"  # upper bound only
+    assert f(30.0, None, "ng/mL") == "above 30 ng/mL"  # lower bound only
+    assert f(None, None, "mg/dL") == ""  # no reference → no clause
+    assert f(8.2, None, "%") == "above 8.2 %"  # a real decimal is preserved
+
+
+def test_observation_member_explanation_is_grounded_member_safe_and_leaks_no_stats():
+    """The member explanation (the audience-split partner of trigger_reason) must state the numeric
+    reference range for an out-of-range value, surface the out-of-range standing on a TREND (never the
+    trend alone — CLAUDE.md "every narrator surfaces the core flags"), gate the referral nudge by
+    severity, omit the range cleanly for a no_reference marker, and NEVER leak the statistics that
+    belong on the clinician surface."""
+    from health_intelligence.models import (
+        ClinicalChange,
+        MarkerTrajectory,
+        Reading,
+        ReferenceRange,
+        TrendResult,
+    )
+
+    def _rng(low, high):
+        return ReferenceRange(
+            marker="m",
+            sex="any",
+            unit="u",
+            ref_low=low,
+            ref_high=high,
+            config_version="t",
+        )
+
+    # counted adverse trend, out of range: states BOTH the trend and the range, with the numbers
+    counted = MarkerTrajectory(
+        marker="HbA1c",
+        unit="%",
+        latest=Reading(value=6.1, date="2024-01-01"),
+        trend=TrendResult(
+            direction="increasing",
+            tau=0.9,
+            p_value=0.017,
+            slope=0.001,
+            n=5,
+            significant=True,
+        ),
+        clinical_change=ClinicalChange(rcv=0.3, net_change=0.8, exceeds_rcv=True),
+        flags=["above_range"],
+        severity="attention",
+        n_readings=5,
+    )
+    c = templates.observation_member_explanation(counted, _rng(4.0, 5.6))
+    assert (
+        "above the normal range" in c and "4–5.6 %" in c
+    )  # core flag + the actual range
+    assert (
+        "5 tests" in c and "doctor" in c
+    )  # plain-language count + severity-gated referral
+
+    # static out-of-range (no trend; severity 'notable'): value + numeric upper bound, no referral
+    static = MarkerTrajectory(
+        marker="LDL cholesterol",
+        unit="mg/dL",
+        latest=Reading(value=142.0, date="2024-01-01"),
+        flags=["above_range"],
+        severity="notable",
+    )
+    s = templates.observation_member_explanation(static, _rng(None, 100.0))
+    assert "142 mg/dL" in s and "above the normal range (under 100 mg/dL)" in s
+    assert (
+        "doctor" not in s
+    )  # a bare range flag is not an escalation — no referral nudge
+
+    # panic: stated as urgent, points to prompt attention
+    panic = MarkerTrajectory(
+        marker="Potassium",
+        unit="mmol/L",
+        latest=Reading(value=6.1, date="2024-01-01"),
+        flags=["panic_high"],
+        severity="urgent",
+    )
+    p = templates.observation_member_explanation(panic, _rng(3.5, 5.1))
+    assert "critically high" in p and "prompt" in p
+
+    # sub-n_min sparse decline below range: honest "short history", still states the range
+    sparse = MarkerTrajectory(
+        marker="eGFR",
+        unit="mL/min/1.73m2",
+        latest=Reading(value=61, date="2024-01-01"),
+        trend=None,
+        clinical_change=ClinicalChange(rcv=5.0, net_change=-22.0, exceeds_rcv=True),
+        flags=["below_range"],
+        severity="attention",
+        n_readings=3,
+    )
+    sp = templates.observation_member_explanation(sparse, _rng(90.0, None))
+    assert "below the normal range" in sp and "above 90" in sp
+    assert "short history" in sp and "doctor" in sp
+
+    # in-range significant trend (no value flag): no spurious range claim, but still a referral
+    inrange = MarkerTrajectory(
+        marker="ALT",
+        unit="U/L",
+        latest=Reading(value=30, date="2024-01-01"),
+        trend=TrendResult(
+            direction="increasing",
+            tau=0.9,
+            p_value=0.02,
+            slope=0.01,
+            n=5,
+            significant=True,
+        ),
+        flags=[],
+        severity="attention",
+        n_readings=5,
+    )
+    i = templates.observation_member_explanation(inrange, _rng(None, 40.0))
+    assert "normal range" not in i and "doctor" in i
+
+    # a surfaced-but-uncounted trend (notable, no value flag) — reaches the final _classify "trend"
+    # branch; the referral is severity-gated, so it states the trend but offers NO "see a doctor"
+    # (a notable marker is not an escalation — Escalation ≠ out-of-range)
+    uncounted = MarkerTrajectory(
+        marker="ALT",
+        unit="U/L",
+        latest=Reading(value=31, date="2024-01-01"),
+        trend=TrendResult(
+            direction="increasing",
+            tau=0.7,
+            p_value=0.04,
+            slope=0.01,
+            n=5,
+            significant=False,
+        ),
+        flags=[],
+        severity="notable",
+        n_readings=5,
+    )
+    u = templates.observation_member_explanation(uncounted, _rng(None, 40.0))
+    assert "steadily rising" in u and "doctor" not in u
+
+    # a no_reference marker (rng=None) omits the range clause cleanly — no crash, no "(", no "None"
+    noref = templates.observation_member_explanation(static, None)
+    assert (
+        "above the normal range" in noref and "(" not in noref and "None" not in noref
+    )
+
+    # THE audience guarantee: not one statistical token from trigger_reason reaches member copy
+    forbidden = [
+        "Mann-Kendall",
+        "Theil",
+        "Kendall",
+        "p=",
+        "tau",
+        "RCV",
+        "reference-change",
+        "monotonic",
+        "FDR",
+        "p-value",
+    ]
+    for text in (c, s, p, sp, i, u, noref):
+        for tok in forbidden:
+            assert tok not in text, f"stat leak {tok!r} in member copy: {text!r}"
+
+
 def test_sparse_decline_escalates_with_grounded_limited_history_narration():
     con = _con()
     # 3 panels only (sub-n_min): eGFR 78 -> 70 -> 61, a strictly monotonic decline below the >=90 range
@@ -428,7 +595,8 @@ def test_rescan_overwrites_stale_observation_narration_without_fk_failure():
     obs = pipeline.scan(con, "C07")
     pot = next(o for o in obs if o.title.startswith("Potassium"))
 
-    # simulate stale narration persisted by an earlier templating version
+    # simulate stale narration persisted by an earlier templating version (member_explanation is no
+    # longer a stored column — it's derived fresh at the /observations read, so it can't go stale here).
     with con:
         con.execute(
             "UPDATE observations SET title='STALE', trigger_reason='STALE' WHERE observation_id=?",
@@ -451,6 +619,51 @@ def test_rescan_overwrites_stale_observation_narration_without_fk_failure():
     assert (
         len(db.get_escalations(con, "C07")) == 1
     )  # the referencing escalation survived intact
+
+
+def test_observations_projection_derives_member_explanation_not_stored():
+    # The member-facing member_explanation is DERIVED at read by pipeline.observations, NOT persisted:
+    # a raw db.get_observations row carries "" (no column), while the projection fills it from the live
+    # analysis — surfacing the out-of-range flag + the numeric range, leaking no clinician statistics.
+    con = _con()
+    ingest_bundle(
+        con,
+        _bundle(
+            "MX",
+            [
+                _panel(
+                    "MX-P1", "2024-01-15", [_r("Potassium", 5.5, "mmol/L", "3.5-5.1")]
+                )
+            ],
+        ),
+    )  # 5.5 > 5.1 -> above range
+    pipeline.scan(con, "MX")
+
+    raw = db.get_observations(con, "MX")
+    assert raw and all(o.member_explanation == "" for o in raw)  # not stored
+
+    proj = pipeline.observations(con, "MX")
+    pot = next(o for o in proj if o.title.startswith("Potassium"))
+    assert (
+        pot.member_explanation and "range" in pot.member_explanation
+    )  # derived at read
+    assert (
+        "Mann-Kendall" not in pot.member_explanation
+    )  # no stats leak (the audience split holds)
+
+    # an unscanned member -> empty (no analysis composed, per the scan-state gating)
+    ingest_bundle(
+        con,
+        _bundle(
+            "MZ",
+            [
+                _panel(
+                    "MZ-P1", "2024-01-15", [_r("Potassium", 4.2, "mmol/L", "3.5-5.1")]
+                )
+            ],
+        ),
+    )  # in range, and never scanned
+    assert pipeline.observations(con, "MZ") == []
 
 
 def test_c02_negative_control_raises_no_escalation():

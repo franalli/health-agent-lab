@@ -26,9 +26,9 @@ services:
         value: training_data
       # HEALTH_DB_PATH is left unset -> the app uses backend/data/health.db on the ephemeral container FS.
 
-# ---- Paid-disk upgrade (durable uploads + feedback across deploys, ~$8/mo) ---------------------------
+# ---- Paid-disk upgrade (durable across deploys, ~$8/mo) ----------------------------------------------
 # 1. change `plan: free` above to `plan: starter`
-# 2. add this env var under envVars:
+# 2. add this env var under envVars — makes the DB durable, so uploaded MEMBERS + feedback survive:
 #      - key: HEALTH_DB_PATH
 #        value: /data/health.db
 # 3. add this disk block under the service (a sibling of envVars):
@@ -36,3 +36,8 @@ services:
 #      name: health-data
 #      mountPath: /data
 #      sizeGB: 1
+# That alone persists everything in the DB. The dataset *folders* POST /members/upload writes (the kept
+# eval_set.jsonl / lab_panels.csv, for later `DATASET=<name> make eval`) still live under the ephemeral
+# app dir. To persist those too, also set HEALTH_DATA_ROOT to a disk path (e.g. /data/datasets) AND copy
+# the shipped backend/data/training_data into it once — an empty relocated root has no training_data for
+# the startup seed to read, so the 15 members won't appear until it's present.

@@ -21,8 +21,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError
 
 from health_intelligence import db, learn, pipeline
 from health_intelligence.models import (
@@ -35,7 +36,12 @@ from health_intelligence.models import (
     SuggestedPrompt,
 )
 from preprocessing.datasets import DEFAULT_DATASET
-from preprocessing.ingest import ingest_bundle, ingest_dataset, seed_if_empty
+from preprocessing.ingest import (
+    ingest_bundle,
+    ingest_dataset,
+    ingest_uploaded_dataset,
+    seed_if_empty,
+)
 
 # Load backend/.env into the process env at import (before any LLM provider is constructed) so the
 # Mode-2 path sees ANTHROPIC_API_KEY however the app is launched. A no-op when no .env is present (the
@@ -132,6 +138,63 @@ def post_member(
         raise HTTPException(status_code=422, detail=str(e)) from e
 
 
+@app.post("/members/upload")
+async def upload_dataset(
+    file: UploadFile = File(...),
+    name: str | None = Form(None),
+    con: sqlite3.Connection = Depends(get_con),
+) -> dict:
+    """Upload a whole dataset bundle, ingest its members, and persist it as a new dataset folder —
+    the control panel's **Upload bundle**. The multi-member, persisted sibling of ``POST /members``.
+
+    BODY: ``multipart/form-data`` with ``file`` (required) and an optional ``name`` (the new dataset
+    folder's name; defaults to the uploaded file's stem). ``file`` is either a **.zip** of a folder
+    shaped like ``backend/data/training_data/`` — one CSV (lab panels) + the members JSON + an optional
+    eval JSON — or a bare members-shaped ``.json``. Files are discovered by **type/content, not
+    filename** (a hold-out ships identical schemas under possibly-different names): the lone ``.csv`` is
+    the panels; the JSON whose records carry ``profile``/``panels`` is the members file, the other is the
+    eval set. They're written to disk under their **canonical** names, so the rest of the system stays
+    name-based.
+
+    EFFECT (see ``ingest_uploaded_dataset``): (1) every member is ingested **additively** — added on top
+    of the existing members (``member_id`` opaque, any ID space), a re-used id refreshing that member's
+    facts, never a reseed/truncate; AND (2) the **entire** uploaded bundle is written to a new
+    ``<data-root>/<name>/`` folder, so the kept ``eval_set.jsonl`` is available for later live use
+    (``DATASET=<name> make eval``). Then each newly ingested member is **auto-scanned** so its
+    Observations match its live Trajectory immediately (reseed deliberately does NOT auto-scan).
+
+    This doubles as the format check: a bad zip / an unresolvable bundle (no or several members-shaped
+    JSON) / a malformed member that fails the firewall (``ValueError``) or Pydantic shape
+    (``ValidationError``) -> **422**; a name that collides with an existing dataset (``FileExistsError``)
+    -> **409** (uploads never overwrite). The bundle is classified before any side effect and shape is
+    validated up front (no partial load); the semantic-partial-set caveat of ``ingest_members`` applies. Returns ``{dataset, members, results, ranges, member_ids, files, scanned}``. NOTE: on the
+    free/ephemeral Render tier both the DB rows and the new folder live only until the next cold start
+    (the durable paid-disk upgrade persists them — point ``HEALTH_DB_PATH`` and ``HEALTH_DATA_ROOT`` at
+    the disk; §15)."""
+    data = await file.read()
+    try:
+        result = ingest_uploaded_dataset(
+            con, data=data, filename=file.filename, name=name
+        )
+    except FileExistsError as e:
+        # name collides with an existing dataset/file — caught BEFORE the generic OSError below (it is an
+        # OSError subclass); raised by create_dataset_dir's mkdir BEFORE any DB write, so no side effects.
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except (ValueError, ValidationError) as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    except OSError as e:
+        # disk full / unwritable HEALTH_DATA_ROOT etc. — a genuine server/infra error (not bad input), but
+        # the folder write happens BEFORE the DB ingest, so no members were committed. Surface a clear 500.
+        raise HTTPException(
+            status_code=500, detail=f"failed to persist the uploaded dataset: {e}"
+        ) from e
+
+    # Auto-scan the just-ingested members so their stored Observations match their live Trajectory the
+    # moment the data source lands (best-effort, in the library; reseed deliberately does NOT auto-scan).
+    scanned = pipeline.scan_members(con, result["member_ids"])
+    return {**result, "scanned": scanned}
+
+
 @app.delete("/members/{member_id}")
 def delete_member(
     member_id: str, con: sqlite3.Connection = Depends(get_con)
@@ -160,9 +223,10 @@ def post_scan(
 def get_observations(
     member_id: str, con: sqlite3.Connection = Depends(get_con)
 ) -> list[Observation]:
-    """Read the member's current observations (the last scan's findings at the current data_version)."""
+    """Read the member's current observations (the last scan's findings at the current data_version),
+    each with its member-facing ``member_explanation`` derived at read by ``pipeline.observations``."""
     try:
-        return db.get_observations(con, member_id)
+        return pipeline.observations(con, member_id)
     except KeyError:
         raise HTTPException(
             status_code=404, detail=f"member {member_id!r} not found"

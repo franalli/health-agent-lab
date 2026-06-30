@@ -23,13 +23,24 @@ Runnable as the loader CLI:  ``python -m preprocessing.ingest [--dataset NAME] [
 from __future__ import annotations
 
 import argparse
+import io
 import json
+import lzma
+import os
+import pathlib
 import re
+import shutil
+import zipfile
+import zlib
 
 from health_intelligence import db
 from health_intelligence.config import CONFIG_VERSION, MARKERS
 from health_intelligence.models import LabResult, MemberBundle, RangeSex, ReferenceRange
-from preprocessing.datasets import members_path
+from preprocessing.datasets import (
+    create_dataset_dir,
+    derive_dataset_name,
+    members_path,
+)
 
 #: The three vitals every panel carries; folded into markers with config-supplied units (the data
 #: prints no vital units or ranges, so config is the source for both).
@@ -252,21 +263,382 @@ def ingest_dataset(con, dataset: str | None = None) -> dict:
     untouched, rather than after some members have already been committed (``db.replace_member`` is
     per-member-atomic, so an interleaved validate→write loop would strand a partial set on a bad entry).
     This makes the dominant failure mode (malformed data) leave no partial state; ``seed_if_empty`` adds
-    the rollback for the rarer write-phase failure on the unattended startup path."""
-    raw = json.loads(members_path(dataset).read_text())
+    the rollback for the rarer write-phase failure on the unattended startup path.
+
+    Reads via the shared ``read_records`` (not a bare ``json.loads``), so a dataset whose ``members.json``
+    was persisted by ``POST /members/upload`` in a non-array shape (a single object, JSONL, or BOM-prefixed
+    — all of which the upload accepts) re-ingests correctly on reseed / ``DATASET=<name> make eval``. The
+    write side and this re-read side share one reader, so the persisted bundle is always round-trippable."""
+    records = read_records(members_path(dataset).read_bytes())
+    if not records:
+        # An empty/whitespace members.json (e.g. a truncated write on a durable disk) parses to [] —
+        # fail LOUDLY here rather than silently seeding zero members (a seed dataset always has members).
+        raise ValueError(
+            f"dataset {dataset!r} members.json is empty — nothing to ingest"
+        )
+    return ingest_members(con, records)
+
+
+def ingest_members(con, raw: object) -> dict:
+    """Validate and write a ``members.json``-shaped array of bundles. The shared core of
+    ``ingest_dataset`` (the seed/startup path) and the ``/members/upload`` zip route — both feed it the
+    parsed array. Returns ``{members, results, ranges, member_ids}``; ``member_ids`` lets the uploader
+    focus the picker on what just landed.
+
+    Two-stage validation, and the partial-set boundary sits between them: every bundle's *Pydantic
+    shape* is checked up front (the list-comp below), so a SHAPE-malformed entry raises while the DB is
+    still untouched — no partial set. But the firewall's *semantic* parse (reference-range shapes,
+    marker-uniqueness) runs per member inside ``ingest_bundle``, which commits as it goes, so a
+    semantically-bad bundle LATE in the array raises only after the earlier members are already written
+    — leaving a partial set. We deliberately do NOT roll that back here: ``ingest_bundle`` *upserts*, so
+    deleting "what this call wrote" could clobber a member that pre-existed the call. The recovery is to
+    re-upload the corrected bundle (idempotent upsert) or reseed. The unattended startup path
+    (``seed_if_empty``) carries its own delete-the-prefix rollback because there it is provably safe (the
+    DB was empty), and that is the one place the partial set must not silently read as 'seeded'."""
+    if not isinstance(raw, list):
+        raise ValueError(
+            "members.json must be a JSON array of member bundles "
+            f"(got {type(raw).__name__}); a single bundle goes to POST /members"
+        )
     bundles = [
         MemberBundle.model_validate(entry) for entry in raw
     ]  # firewall: validate ALL up front
-    members = 0
+    # De-dup by member_id (LAST occurrence wins, matching upsert order): a duplicate id in one upload
+    # would otherwise ingest the same member twice and inflate the reported members/results counts.
+    deduped = list({bundle.member_id: bundle for bundle in bundles}.values())
+    member_ids = []
     total_results = 0
-    for bundle in bundles:
+    for bundle in deduped:
         summary = ingest_bundle(con, bundle)
-        members += 1
+        member_ids.append(bundle.member_id)
         total_results += summary["results"]
     n_ranges = len(
         db.get_ranges(con)
     )  # via db.py (the one SQLite seam), scoped to the active config
-    return {"members": members, "results": total_results, "ranges": n_ranges}
+    return {
+        "members": len(member_ids),
+        "results": total_results,
+        "ranges": n_ranges,
+        "member_ids": member_ids,
+    }
+
+
+# --------------------------------------------------------------------------------------------------
+# Uploaded-bundle handling — the firewall for a runtime hold-out. The hold-out ships the SAME three
+# kinds of file as `training_data` but the NAMES may differ (e.g. `panel.csv`/`members.json`/`eval.json`,
+# not guaranteed), so discovery is by TYPE/CONTENT, not name. The bundle is classified, its members are
+# ingested through the same `ingest_members` the seed uses, and every file is written to the new dataset
+# folder under its CANONICAL name — so every downstream reader (the seed loader, `members_path`, the eval
+# adapter) stays name-based and UNCHANGED; this upload boundary is the single place a name is normalized.
+# --------------------------------------------------------------------------------------------------
+
+#: The on-disk names every dataset folder uses, whatever the upload called its files.
+CANONICAL_MEMBERS = "members.json"
+CANONICAL_PANELS = "lab_panels.csv"
+CANONICAL_EVAL = "eval_set.jsonl"
+
+#: The record fields that distinguish a members file from an eval file — bound to ``MemberBundle`` so a
+#: rename of those model fields fails LOUDLY here at import, not silently at every upload (a members
+#: record carries ``profile``/``panels``; an eval case carries ``input``/``category`` and neither).
+_MEMBERS_KEYS = ("profile", "panels")
+if not all(k in MemberBundle.model_fields for k in _MEMBERS_KEYS):
+    raise RuntimeError(
+        f"_MEMBERS_KEYS {_MEMBERS_KEYS} drifted from MemberBundle fields "
+        f"{tuple(MemberBundle.model_fields)} — update the members-file discriminator"
+    )
+
+
+def read_records(data: bytes) -> list:
+    """Parse a JSON file into a list of records, accepting any of the three shapes a hold-out might ship:
+    a JSON **array**, a single JSON **object** (-> a one-record list), or line-delimited **JSONL**.
+    Tolerates a leading UTF-8 BOM (common in Windows/Excel exports). The SINGLE reader shared by the
+    upload classifier, the members parse, and the eval adapter — one place, so the forms can never drift
+    apart. Raises ``ValueError`` on bytes that are none of the three (e.g. a CSV)."""
+    if (
+        data[:3] == b"\xef\xbb\xbf"
+    ):  # strip a UTF-8 BOM so the parse below sees real content
+        data = data[3:]
+    head = data.lstrip()
+    if not head:
+        return []
+    # Try a WHOLE-document parse first — that cleanly covers a JSON array AND a single JSON object
+    # (-> a one-record list), each robust to pretty-printing. Only if that fails (a JSONL file is many
+    # documents, so it raises "Extra data") fall back to line-by-line JSONL. A CSV fails both -> ValueError.
+    # Catch UnicodeDecodeError alongside JSONDecodeError: json.loads on bytes decodes as UTF-8/16/32, so
+    # a non-UTF file (latin-1/cp1252 with no BOM — not valid JSON, which must be Unicode) raises
+    # UnicodeDecodeError (a ValueError but NOT a JSONDecodeError); without this it would escape both
+    # handlers and break the documented "Raises ValueError" contract (a raw traceback on the direct-read
+    # paths — ingest_dataset / load_supplied_cases).
+    _ParseError = (json.JSONDecodeError, UnicodeDecodeError)
+    whole_doc_err: Exception | None = None
+    try:
+        obj = json.loads(data)
+        return obj if isinstance(obj, list) else [obj]
+    except _ParseError as e:
+        whole_doc_err = (
+            e  # save it — the `as` name is unbound once the except block exits
+        )
+    try:
+        return [json.loads(line) for line in data.splitlines() if line.strip()]
+    except _ParseError as jsonl_err:
+        # When the content was clearly meant as ONE document (starts with [ or {), the whole-document
+        # error is the real one — surfacing the per-line JSONL error would point at a structural line
+        # (e.g. the bare "[") and mislead. Otherwise report the JSONL error.
+        err = whole_doc_err if head[:1] in (b"[", b"{") else jsonl_err
+        raise ValueError(f"not valid JSON or JSONL: {err}") from err
+
+
+def _try_records(data: bytes) -> list | None:
+    """``read_records`` but ``None`` instead of raising — for classification, where a non-JSON file (the
+    lab-panels CSV, a README) is expected and is simply not a JSON role rather than an error."""
+    try:
+        return read_records(data)
+    except ValueError:
+        return None
+
+
+def _open_zip(data: bytes) -> zipfile.ZipFile:
+    try:
+        return zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile as e:
+        raise ValueError(f"not a valid zip file: {e}") from e
+
+
+def _is_junk(name: str) -> bool:
+    """Archive cruft a zip of a folder carries that is not part of the bundle: the macOS ``__MACOSX/``
+    resource-fork tree, ``.DS_Store``, and AppleDouble ``._*`` sidecars. Deliberately NARROW — only these
+    known artifacts are dropped, so a legitimately dot-named bundle file (``.members.json``, a file under
+    a ``.v2/`` folder) is NOT silently discarded, and a ``.``/``..`` traversal segment still reaches the
+    path guard rather than being swallowed."""
+    base = name.rsplit("/", 1)[-1]
+    return name.startswith("__MACOSX/") or base == ".DS_Store" or base.startswith("._")
+
+
+def _common_top_folder(names: list[str]) -> str:
+    """The single wrapping folder to strip, or ``""``. ``zip -r training_data`` yields every entry under
+    ``training_data/``; we materialize the bundle's *contents* at the dataset-folder root, so that one
+    shared top segment is peeled. Returns ``""`` when entries don't all share one top folder (e.g. the
+    files already sit at the zip root), so nothing is stripped in that case."""
+    tops = {n.split("/", 1)[0] for n in names if "/" in n}
+    roots = {n for n in names if "/" not in n}
+    if len(tops) == 1 and not roots:
+        return next(iter(tops)) + "/"
+    return ""
+
+
+def _zip_entries(zf: zipfile.ZipFile) -> list[tuple[str, bytes]]:
+    """Every bundle file as ``(relative-path, bytes)`` — wrapping folder stripped, junk dropped.
+
+    SECURITY (zip-slip): rejects a path-traversal entry LEXICALLY here, before the bytes are used for any
+    classify/ingest/write decision — a malicious entry name (``../escape``, an absolute path, or one that
+    normalizes to ``.``/empty, i.e. the directory itself) raises ``ValueError`` so the upload has zero
+    side effects. The resolve-based check in :func:`_write_dataset_folder` re-guards the actual writes
+    (defense in depth). A per-entry read error (encrypted entry, unsupported compression, bad CRC) is also
+    mapped to ``ValueError`` so a damaged/odd zip stays a clean 422, never an opaque 500."""
+    files = [i for i in zf.infolist() if not i.is_dir() and not _is_junk(i.filename)]
+    prefix = _common_top_folder([i.filename for i in files])
+    out: list[tuple[str, bytes]] = []
+    for info in files:
+        rel = info.filename[len(prefix) :] if prefix else info.filename
+        norm = os.path.normpath(rel)
+        if (
+            not rel
+            or norm in ("", ".")
+            or os.path.isabs(norm)
+            or norm == ".."
+            or norm.startswith(".." + os.sep)
+        ):
+            raise ValueError(f"unsafe or empty path in zip: {info.filename!r}")
+        try:
+            payload = zf.read(info)
+        except (
+            RuntimeError,  # encrypted entry (password required)
+            NotImplementedError,  # unsupported compression method
+            zipfile.BadZipFile,  # bad CRC on a STORED entry / structurally bad
+            zlib.error,  # corrupt DEFLATE stream — the DEFAULT compression for `zip -r`/macOS Compress
+            lzma.LZMAError,  # corrupt ZIP_LZMA stream
+            EOFError,  # truncated compressed stream
+            OSError,  # corrupt ZIP_BZIP2 stream raises a bare OSError (zf reads in-memory, so no real I/O)
+        ) as e:
+            # a damaged/odd entry is bad INPUT, not a server error — keep the "bad zip -> 422, never 500"
+            # contract across ALL compression methods (DEFLATE/BZIP2/LZMA/STORED), not just the default.
+            raise ValueError(f"could not read zip entry {info.filename!r}: {e}") from e
+        out.append(
+            (norm, payload)
+        )  # store the NORMALIZED rel so downstream paths are clean (no './')
+    return out
+
+
+def _is_members_record(rec: object) -> bool:
+    """Whether a parsed record is a member bundle — it carries the :data:`_MEMBERS_KEYS` (``profile`` +
+    ``panels``). This record SHAPE, not the filename, is what tells the members file from the eval file
+    (the hold-out ships identical schemas under possibly-different names)."""
+    return isinstance(rec, dict) and all(k in rec for k in _MEMBERS_KEYS)
+
+
+def classify_bundle(
+    entries: list[tuple[str, bytes]],
+) -> tuple[dict[str, bytes], list, list[tuple[str, bytes]]]:
+    """Resolve the dataset's roles by TYPE/CONTENT (not filename). Returns
+    ``(canonical, members_records, extras)``:
+
+      * ``canonical`` maps the CANONICAL on-disk name -> uploaded bytes: ``members.json`` (always),
+        ``lab_panels.csv`` and ``eval_set.jsonl`` (if present);
+      * ``members_records`` is the members file ALREADY PARSED (so the caller ingests without re-parsing);
+      * ``extras`` are any other files (e.g. a README), kept verbatim.
+
+    Each file is sniffed ONCE with :func:`_try_records`: a file that parses as JSON array/JSONL with
+    dict records is a JSON role (the one that's members-shaped is the members file; another is the eval
+    set), and a file that doesn't parse as JSON is a non-JSON role (the ``.csv`` is the lab panels, the
+    rest are extras). Discovery is by content + extension HINT for the CSV only — never by the members
+    file being literally named ``members.json``. Roles are tracked by INDEX, so duplicate entry names in
+    the zip never cause a file to be silently dropped.
+
+    Rejects (``ValueError``, NO partial load) a bundle that can't resolve: zero or several members-shaped
+    JSON files, more than one eval-shaped JSON, or more than one CSV. The **members file is the only hard
+    requirement** (it alone is ingested); panels/eval are optional and a README is tolerated."""
+    sniffed = [(n, b, _try_records(b)) for (n, b) in entries]
+
+    def _first_dict(recs: list | None) -> dict | None:
+        """The file's first record iff it's a JSON file of dict records, else None — the clean
+        (type-narrowing) basis for routing a JSON file by shape; a CSV/README has ``recs is None``."""
+        return recs[0] if recs and isinstance(recs[0], dict) else None
+
+    members_idx = [
+        i
+        for i, (_, _, recs) in enumerate(sniffed)
+        if _is_members_record(_first_dict(recs))
+    ]
+    if len(members_idx) != 1:
+        raise ValueError(
+            f"could not identify the members file: expected exactly one JSON whose records carry "
+            f"{list(_MEMBERS_KEYS)}, found {len(members_idx)} "
+            f"(files seen: {[n for n, _, _ in sniffed] or 'none'})"
+        )
+    mi = members_idx[0]
+    members_records = (
+        sniffed[mi][2] or []
+    )  # non-None by the members_idx filter; `or []` narrows the type
+    canonical: dict[str, bytes] = {CANONICAL_MEMBERS: sniffed[mi][1]}
+
+    eval_idx = [
+        i
+        for i, (_, _, recs) in enumerate(sniffed)
+        if i != mi
+        and (r := _first_dict(recs)) is not None
+        and not _is_members_record(r)
+    ]
+    if len(eval_idx) > 1:
+        raise ValueError(
+            f"ambiguous bundle: {len(eval_idx)} eval-shaped JSON files, expected one "
+            f"({[sniffed[i][0] for i in eval_idx]})"
+        )
+    if eval_idx:
+        canonical[CANONICAL_EVAL] = sniffed[eval_idx[0]][1]
+
+    csv_idx = [
+        i
+        for i, (n, _, recs) in enumerate(sniffed)
+        if i != mi and recs is None and n.lower().endswith(".csv")
+    ]
+    if len(csv_idx) > 1:
+        raise ValueError(
+            f"ambiguous bundle: {len(csv_idx)} CSV files, expected one lab-panels CSV "
+            f"({[sniffed[i][0] for i in csv_idx]})"
+        )
+    if csv_idx:
+        canonical[CANONICAL_PANELS] = sniffed[csv_idx[0]][1]
+
+    claimed = {mi, *eval_idx, *csv_idx}
+    extras = [(n, b) for i, (n, b, _) in enumerate(sniffed) if i not in claimed]
+    return canonical, members_records, extras
+
+
+def _write_dataset_folder(
+    dest: pathlib.Path,
+    canonical: dict[str, bytes],
+    extras: list[tuple[str, bytes]],
+) -> list[str]:
+    """Write the classified bundle into ``dest`` (a freshly-created, empty dataset folder): the three
+    roles under their CANONICAL names, then any extras verbatim. Canonical names are safe by
+    construction; the extras' relative paths are re-checked against ``dest`` (zip-slip defense in depth),
+    and an extra is SKIPPED if its resolved path collides with an already-written file — so a stray entry
+    named like a canonical file (``members.json`` etc.) can never overwrite the authoritative one (the
+    canonical writes win). Returns the relative paths written, sorted."""
+    written: list[str] = []
+    dest_resolved = dest.resolve()
+    written_targets: set[pathlib.Path] = set()
+    for cname, payload in canonical.items():
+        (dest / cname).write_bytes(payload)
+        written.append(cname)
+        written_targets.add((dest / cname).resolve())
+    for rel, payload in extras:
+        target = (dest / rel).resolve()
+        if target == dest_resolved or dest_resolved not in target.parents:
+            raise ValueError(f"unsafe path (path traversal): {rel!r}")
+        if target in written_targets:
+            continue  # never let an extra overwrite a canonical file (or a prior extra) — first write wins
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+        written.append(rel)
+        written_targets.add(target)
+    return sorted(written)
+
+
+def ingest_uploaded_dataset(
+    con, *, data: bytes, filename: str | None, name: str | None
+) -> dict:
+    """The ``POST /members/upload`` firewall: classify an uploaded hold-out bundle by type/content, ingest
+    its members ADDITIVELY, and persist the whole bundle as a new dataset folder under the datasets root.
+
+    Accepts a ``.zip`` of a ``training_data``-shaped folder — one CSV (lab panels) + the members JSON +
+    an optional eval JSON, under ANY filenames — or a bare members-shaped ``.json``. Order is deliberate
+    so a failure leaves the cleanest state (the spec's "no partial load"):
+
+      1. Read the bundle (zip -> entries, with zip-slip + per-entry read errors mapped to a clean
+         ``ValueError`` here; or the bare file) and ``classify_bundle`` it by content. An unreadable zip
+         or unresolvable bundle raises HERE, before ANY side effect — so it ingests nothing.
+      2. ``create_dataset_dir`` — ``mkdir(exist_ok=False)`` atomically RESERVES the folder name BEFORE the
+         DB write. This is the single collision check (it matches what it creates — no ``is_dir`` vs
+         ``mkdir`` drift), so a name that clashes with an existing dataset OR an existing file (e.g.
+         ``health.db``) is a clean ``FileExistsError`` -> 409 with no members ingested.
+      3. Inside the reserved folder, materialize the files (CANONICAL names; zip-slip re-guarded) and THEN
+         ``ingest_members`` the already-parsed records — ADDITIVE (``ingest_bundle`` upserts per member;
+         existing members stay, a re-used id refreshes that member; no reseed). Folder/disk failures
+         therefore happen BEFORE the DB write, so they never strand committed members; on ANY failure the
+         reserved folder is removed so the name stays free for a clean retry. The only residual
+         side-effect-on-failure is the documented per-member semantic caveat in ``ingest_members``.
+
+    The persisted ``eval_set.jsonl`` / ``lab_panels.csv`` are stored opaquely for later live use (e.g.
+    ``DATASET=<name> make eval``); their CONTENTS are validated only when consumed, not here. Returns
+    ``{dataset, members, results, ranges, member_ids, files}``; the route adds the auto-scan."""
+    dataset = derive_dataset_name(name, filename)
+
+    is_zip = (filename or "").lower().endswith(".zip") or data[:2] == b"PK"
+    if is_zip:
+        entries = _zip_entries(
+            _open_zip(data)
+        )  # bad/odd zip + zip-slip -> ValueError, no side effect
+    else:
+        bare_name = pathlib.PurePosixPath(filename or "").name or CANONICAL_MEMBERS
+        entries = [(bare_name, data)]
+
+    canonical, members_records, extras = classify_bundle(
+        entries
+    )  # by content, BEFORE any side effect
+
+    dest = create_dataset_dir(
+        dataset
+    )  # mkdir(exist_ok=False): atomic name reservation, pre-ingest 409
+    try:
+        files = _write_dataset_folder(dest, canonical, extras)
+        summary = ingest_members(
+            con, members_records
+        )  # DB write LAST; semantic-partial caveat only
+    except Exception:
+        shutil.rmtree(dest, ignore_errors=True)  # leave the name free for a clean retry
+        raise
+    return {"dataset": dataset, **summary, "files": files}
 
 
 def seed_if_empty(con) -> dict:

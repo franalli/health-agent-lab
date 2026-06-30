@@ -98,15 +98,20 @@ CREATE INDEX idx_interactions_member ON interactions(member_id, created_at);
 -- Proactive observations: severity + narrated summary + which signal fired + the snapshot
 -- it stood on. Narration/evidence live via response_id (the interactions row above).
 -- Re-scanning a member replaces its observations for the new data_version, so identical
--- inputs yield identical observations.
+-- inputs yield identical observations. trigger_reason is the clinician/operator explainability (the
+-- statistical signal — p-values, RCV), persisted here. The MEMBER-facing plain-language explanation
+-- ("what this means for you", no statistics, reference range stated for out-of-range values) is NOT
+-- stored: it is a deterministic template (templates.observation_member_explanation) re-derived at read
+-- by the /observations projection (pipeline.observations), from the same value+range it states — so
+-- there is no stored copy to migrate or go stale.
 CREATE TABLE observations (
-    observation_id TEXT PRIMARY KEY,
-    member_id      TEXT NOT NULL REFERENCES members(member_id),
-    response_id    TEXT NOT NULL REFERENCES interactions(response_id),
-    severity       TEXT NOT NULL CHECK (severity IN ('info','notable','attention','urgent')),
-    title          TEXT NOT NULL,               -- narrated summary
-    trigger_reason TEXT NOT NULL,               -- which statistical signal fired (explainability)
-    data_version   TEXT NOT NULL
+    observation_id     TEXT PRIMARY KEY,
+    member_id          TEXT NOT NULL REFERENCES members(member_id),
+    response_id        TEXT NOT NULL REFERENCES interactions(response_id),
+    severity           TEXT NOT NULL CHECK (severity IN ('info','notable','attention','urgent')),
+    title              TEXT NOT NULL,           -- narrated summary (member-facing headline)
+    trigger_reason     TEXT NOT NULL,           -- which statistical signal fired (CLINICIAN/operator audience)
+    data_version       TEXT NOT NULL
 );
 CREATE INDEX idx_obs_member ON observations(member_id, severity);
 

@@ -109,6 +109,21 @@ def _status_phrase(traj: MarkerTrajectory) -> str:
     return ""
 
 
+def _member_status_phrase(traj: MarkerTrajectory) -> str:
+    """The member-worded value-status phrase ("above the normal range") embedded in a member explanation
+    — the member-facing mirror of ``_status_phrase`` (the clinician-tilted scan copy says "above range").
+    Member copy says "normal range", never "reference range". Empty when the value carries no range/band
+    flag; panic is handled in its own ``member_explanation`` branch upstream."""
+    f = traj.flags
+    if "above_range" in f:
+        return "above the normal range"
+    if "below_range" in f:
+        return "below the normal range"
+    if "band_cross" in f:
+        return "past a clinical threshold"
+    return ""
+
+
 def _classify(traj: MarkerTrajectory) -> str:
     """Which signal drove this marker — the single source of truth all narration reads. A trend is the
     headline only when it was COUNTED toward the floor (severity 'attention': significant + adverse +
@@ -195,6 +210,97 @@ def observation_summary(traj: MarkerTrajectory) -> tuple[str, str]:
             f"{m} moved across a clinical band cut-point",
         )
     return f"{m} flagged", f"{m} flagged ({', '.join(traj.flags) or 'no signal'})"
+
+
+def _fmt_num(x: float) -> str:
+    """A clinical value as member-friendly text — drops a trailing ``.0`` ("142", not "142.0"; "8.2"
+    stays "8.2"). The clinician ``trigger_reason`` keeps the raw-float style (``observation_summary``);
+    this trims it for member copy only. Lab magnitudes never reach scientific-notation territory."""
+    return f"{x:g}"
+
+
+def _format_reference_range(
+    ref_low: float | None, ref_high: float | None, unit: str
+) -> str:
+    """A marker's normal range as member-facing text, in whichever of the three shapes its bounds allow:
+    a band ("70–99 mg/dL"), an upper bound only ("under 100 mg/dL"), or a lower bound only ("above 30
+    mg/dL"). Empty when neither bound is set (a ``no_reference`` marker has no range to state). The
+    numbers are read off the resolved ``ReferenceRange`` — never computed — which is exactly why the
+    deterministic layer MAY print them where the LLM composer may NOT (llm.py rule 1: "The system prints
+    the exact bounds as evidence")."""
+    u = f" {unit}" if unit else ""
+    if ref_low is not None and ref_high is not None:
+        return f"{_fmt_num(ref_low)}–{_fmt_num(ref_high)}{u}"  # en-dash band
+    if ref_high is not None:
+        return f"under {_fmt_num(ref_high)}{u}"
+    if ref_low is not None:
+        return f"above {_fmt_num(ref_low)}{u}"
+    return ""
+
+
+def observation_member_explanation(
+    traj: MarkerTrajectory, rng: ReferenceRange | None
+) -> str:
+    """The member-facing plain-language explanation for an observation card — "what this means for you",
+    derived from the SAME ``_classify`` signal as ``observation_summary`` so the headline, the clinician
+    ``trigger_reason``, and this explanation can never describe different findings. Deterministic by
+    REQUIREMENT, not merely for cost: it states the numeric reference range, which the LLM composer is
+    forbidden to do (llm.py rule 1 — "never state a numeric cutoff ... The system prints the exact bounds
+    as evidence"); only this layer, reading the resolved ``ReferenceRange``, may print the real bounds.
+
+    Upholds two invariants (locked by tests): it SURFACES THE CORE FLAG — a trend on an out-of-range
+    value states the out-of-range standing, never the trend alone (CLAUDE.md "every narrator surfaces the
+    core flags") — and it LEAKS NO STATISTICS (no test name, p-value, tau, or RCV wording in member
+    copy; "your last 5 tests" is a count, not a statistic). The referral nudge is severity-gated: panic
+    prompts urgent attention, an attention-level (sparse-)trend suggests raising it with a doctor, and a
+    bare range/band flag (at most 'notable' — Escalation ≠ out-of-range) carries no referral, mirroring
+    the deterministic floor."""
+    m, signal = _display_name(traj.marker), _classify(traj)
+    val = f"{_fmt_num(traj.latest.value)} {traj.unit}".strip()
+    low, high = (rng.ref_low, rng.ref_high) if rng else (None, None)
+    rng_txt = _format_reference_range(low, high, traj.unit)
+    rng_paren = f" ({rng_txt})" if rng_txt else ""
+
+    if signal == "panic_high":
+        return f"Your {m} is {val}, which is critically high and needs prompt medical attention."
+    if signal == "panic_low":
+        return f"Your {m} is {val}, which is critically low and needs prompt medical attention."
+    if signal in ("trend", "sparse_trend"):
+        if signal == "trend":
+            t = traj.trend
+            word = _DIRECTION_WORD.get(t.direction, "changing") if t else "changing"
+            span = f"steadily {word} across your last {t.n if t else traj.n_readings or 0} tests"
+        else:  # sub-n_min: no MK verdict, direction from the net change, honest "short history"
+            cc = traj.clinical_change
+            net = cc.net_change if cc is not None and cc.net_change is not None else 0.0
+            span = f"{'rising' if net > 0 else 'falling'} across your last few tests"
+        # Referral is severity-gated, not signal-gated: a COUNTED trend (attention) and the sub-n_min
+        # sparse trend (always attention) earn it; a surfaced-but-uncounted trend (notable/info, the
+        # final _classify "trend" branch) does not — it is not an escalation (Escalation ≠ out-of-range),
+        # so it gets no "see a doctor", same as a bare range flag.
+        if signal == "sparse_trend":
+            tail = (
+                " Based on a short history so far, but worth raising with your doctor."
+            )
+        elif traj.severity == "attention":
+            tail = " Worth raising with your doctor."
+        else:
+            tail = ""
+        status = _member_status_phrase(
+            traj
+        )  # surface the value's standing alongside the trend
+        if status:
+            return f"Your {m} has been {span}, and your latest is {val}, {status}{rng_paren}.{tail}"
+        return f"Your {m} has been {span}, now at {val}.{tail}"
+    if signal == "above_range":
+        return f"Your {m} is {val}, above the normal range{rng_paren}."
+    if signal == "below_range":
+        return f"Your {m} is {val}, below the normal range{rng_paren}."
+    if signal == "band_cross":
+        return (
+            f"Your {m} has moved across a clinical threshold worth keeping an eye on."
+        )
+    return f"Your {m} was flagged for review."
 
 
 def qa_title(traj: MarkerTrajectory) -> str:
