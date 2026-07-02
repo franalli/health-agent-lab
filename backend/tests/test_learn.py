@@ -764,3 +764,39 @@ def test_reset_reverts_a_rejected_verdict_so_it_re_gates():
     assert (
         db.find_prompt_by_text(con, "Y") is None
     )  # after /reset, re-gateable vs the new baseline
+
+
+# --------------------------------------------------------------------------------------------------
+# Single-flight — the CROSS-PROCESS guard (a bare threading.Lock only serialized threads within one
+# worker; flock extends single-flight across worker processes on the same host, so scaling past
+# --workers 1 can't silently double-run the ~6-minute gate). flock locks the open file DESCRIPTION,
+# so a second fd in THIS process models a second worker faithfully.
+# --------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(learn.fcntl is None, reason="flock is POSIX-only")
+def test_single_flight_blocks_a_concurrent_worker(tmp_path):
+    con = fresh_con(str(tmp_path / "health.db"))
+    lock_path = learn._learn_lock_path(con)
+    fd = learn.os.open(lock_path, learn.os.O_CREAT | learn.os.O_RDWR, 0o600)
+    learn.fcntl.flock(
+        fd, learn.fcntl.LOCK_EX | learn.fcntl.LOCK_NB
+    )  # stand in for another worker
+    try:
+        with pytest.raises(learn.LearnBusy):
+            with learn._single_flight(con):
+                pass  # pragma: no cover — the acquire raises before the body runs
+    finally:
+        learn.fcntl.flock(fd, learn.fcntl.LOCK_UN)
+        learn.os.close(fd)
+
+
+def test_single_flight_releases_both_layers_so_a_later_run_reacquires(tmp_path):
+    # No leak: after one run's context exits, BOTH the thread lock and the fd are freed, so the next
+    # acquisition succeeds (a leaked fd would make this second acquire raise LearnBusy).
+    con = fresh_con(str(tmp_path / "health.db"))
+    with learn._single_flight(con):
+        pass
+    with learn._single_flight(con):
+        pass
+    assert not learn._LOCK.locked()  # thread lock fully released

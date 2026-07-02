@@ -33,10 +33,19 @@ only when ``/learn`` is actually called.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+import tempfile
 import threading
 from datetime import UTC, datetime
+
+try:
+    import fcntl  # POSIX advisory file locks — the cross-process half of single-flight (see _LOCK)
+except (
+    ImportError
+):  # non-POSIX (e.g. Windows): the cross-process guard degrades to in-process only
+    fcntl = None
 
 from pydantic import BaseModel
 
@@ -101,8 +110,53 @@ _REQUIRED_CLAUSES: tuple[str, ...] = (
 # this module never pulls in ``eval``. Adding a pass/fail scorer there updates both the report and the
 # gate, so neither can go stale.
 
-#: Single-flight: one /learn run at a time (single-worker deploy, §15). A held lock -> 409 LearnBusy.
+#: Single-flight: one /learn run at a time, in TWO layers. A bare threading.Lock serializes THREADS
+#: within one worker but silently depends on the single-worker deploy (§15) — with --workers >1 two
+#: processes would each hold their own lock and both run the ~6-minute, credit-burning gate (and race
+#: ``next_prompt_version``). The OS advisory file lock (``fcntl.flock``, added below) closes that gap:
+#: single-flight holds across worker PROCESSES on the same host regardless of worker count. flock
+#: auto-releases when its holder dies (no stale-lock TTL to manage, unlike a DB lease); its scope is one
+#: host, which matches this deployment — a multi-INSTANCE deploy has a per-instance ephemeral DB, so it
+#: is not a shared-state topology to begin with. A held lock (either layer) -> 409 LearnBusy.
 _LOCK = threading.Lock()
+
+
+def _learn_lock_path(con) -> str:
+    """The advisory-lock file path for THIS connection's database — sited next to the SQLite file so
+    co-located workers (which all open that same file) contend on the same lock. Derived from the LIVE
+    connection (``PRAGMA database_list``), not an env var, so it tracks whatever DB this process actually
+    opened. An unfiled/in-memory DB (tests) has no path -> a stable temp-dir fallback."""
+    row = con.execute("PRAGMA database_list").fetchone()
+    db_file = (row["file"] if row is not None else "") or ""
+    if not db_file:
+        return os.path.join(tempfile.gettempdir(), "health_intelligence_learn.lock")
+    return db_file + ".learn.lock"
+
+
+@contextlib.contextmanager
+def _single_flight(con):
+    """Hold BOTH the in-process lock and (on POSIX) the cross-process file lock for the duration of a
+    /learn run; raise ``LearnBusy`` (-> 409) if either is already held. Releasing is symmetric and
+    crash-safe: closing the fd drops the flock, and the ``finally`` frees the thread lock. See ``_LOCK``."""
+    if not _LOCK.acquire(blocking=False):
+        raise LearnBusy("a /learn run is already in progress")
+    try:
+        if fcntl is None:  # non-POSIX: in-process guard only (documented degrade)
+            yield
+            return
+        lock_fd = os.open(_learn_lock_path(con), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as e:
+                raise LearnBusy(
+                    "a /learn run is already in progress (held by another worker)"
+                ) from e
+            yield
+        finally:
+            os.close(lock_fd)  # closing the fd releases any flock held on it
+    finally:
+        _LOCK.release()
 
 
 class LearnBusy(Exception):
@@ -520,12 +574,8 @@ def run_learn(con, *, provider: llm.Provider | None = None) -> dict:
     promote or reject. Single-flight (409 ``LearnBusy`` if a run is in progress); 503 ``LearnUnavailable``
     if no working LLM. ``provider`` defaults to the real provider; tests inject a fake. Returns
     ``{status, version, reason, report, cached?}``."""
-    if not _LOCK.acquire(blocking=False):
-        raise LearnBusy("a /learn run is already in progress")
-    try:
+    with _single_flight(con):
         return _run_learn_locked(con, provider=provider)
-    finally:
-        _LOCK.release()
 
 
 def _run_learn_locked(con, *, provider) -> dict:
