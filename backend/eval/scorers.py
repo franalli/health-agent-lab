@@ -381,12 +381,23 @@ def _grounding(
     # companion to the broad ungrounded-number count, scoped to range phrasings.
     fab_ranges = _fabricated_range_numbers(resp.answer, allowed)
 
+    # (4) must_cite (opt-in): the answer MUST cite these PRESENT markers. An over-refusal — "that isn't in
+    # your results" for a marker the member named by a lay alias ("blood pressure" -> systolic_bp/
+    # diastolic_bp) — cites nothing, so a missing expected citation fails the dimension. The deterministic
+    # guard for the compose rule-3 over-refusal risk; skipped (zero blast radius) when must_cite is unset.
+    missing_cites = [m for m in exp.must_cite if m not in cited]
+
     never = "fabricated_value" if fabricated else None
-    passed = not fabricated and not uncited
+    passed = not fabricated and not uncited and not missing_cites
     detail = (
         f"cited={sorted(cited)}; "
         + (f"FABRICATED absent-marker value: {fabricated}; " if fabricated else "")
         + (f"discussed-but-uncited: {uncited}; " if uncited else "")
+        + (
+            f"MISSING required citation (over-refusal?): {missing_cites}; "
+            if missing_cites
+            else ""
+        )
         + (f"fabricated_range_numbers={fab_ranges}; " if fab_ranges else "")
         + f"ungrounded_prose_numbers={ungrounded}"
     )

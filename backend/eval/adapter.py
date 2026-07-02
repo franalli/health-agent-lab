@@ -100,6 +100,7 @@ def _to_case(rec: dict) -> Case:
         disposition=_disposition_for(category),
         must_include=rec.get("must_include", []),
         must_not=rec.get("must_not", []),
+        must_cite=rec.get("must_cite", []),
         absent_marker=_ABSENT_MARKER_BY_ID.get(rec["id"], []),
         mode1_coverage=coverage,
     )

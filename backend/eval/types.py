@@ -73,6 +73,13 @@ class CaseExpectation(BaseModel):
     disposition: list[AnswerDisposition] = Field(default_factory=lambda: ["answered"])
     must_include: list[str] = Field(default_factory=list)
     must_not: list[str] = Field(default_factory=list)
+    must_cite: list[str] = Field(
+        default_factory=list
+    )  # PRESENT marker key(s) the answer MUST cite as evidence — an over-refusal ("not in your results" for
+    # a marker named by a lay alias, e.g. "blood pressure"->systolic_bp) cites nothing and fails this. A
+    # DETERMINISTIC guard for the compose rule-3 over-refusal risk; empty (the default) skips it — zero blast
+    # radius on cases that don't set it. (must_include / must_not are semantic assertions for the deferred
+    # LLM judge; must_cite is the deterministic slice a scorer CAN check today.)
     absent_marker: list[str] = Field(
         default_factory=list
     )  # marker(s) not in the member's data
