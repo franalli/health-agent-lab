@@ -43,4 +43,5 @@ backend/eval/reports/
 backend/data/*/
 !backend/data/training_data/
 backend/data/eval_data.zip
+backend/data/upload_test.zip
 ui-working.png

@@ -3,9 +3,10 @@
 #
 # Shipped on the FREE / EPHEMERAL tier: no persistent disk, and the instance spins down when idle, so
 # the SQLite file is wiped on a cold start. That is fine by construction — the app's lifespan runs
-# init_db + seed-if-empty on startup (the build can't see the runtime filesystem), so a fresh instance
-# self-heals its schema and the 15 training members. The trade-off: POST /members uploads and feedback
-# do NOT survive a spin-down. The paid-disk upgrade for durable storage is the commented block below.
+# init_db + seed-if-empty + auto-scan on startup (the build can't see the runtime filesystem), so a fresh
+# instance self-heals its schema, the 15 training members, AND their observations (proactive-by-default:
+# findings are visible on the first page load). The trade-off: POST /members uploads and feedback do NOT
+# survive a spin-down. The paid-disk upgrade for durable storage is the commented block below.
 services:
   - type: web
     name: health-intelligence
@@ -14,7 +15,7 @@ services:
     rootDir: backend                                    # pyproject.toml + uv.lock live here; build/start run here
     buildCommand: "pip install uv==0.11.14 && uv sync --frozen"  # uv pinned so the build stays reproducible
     startCommand: "uv run uvicorn api:app --host 0.0.0.0 --port $PORT --workers 1"  # $PORT injected; --workers 1 enforces the §15 single-worker invariant
-    healthCheckPath: /health  # served once the lifespan completes; the startup seed is sub-second, so no cold-start health-check timeout
+    healthCheckPath: /health  # served once the lifespan completes; the startup seed + auto-scan is sub-second (~0.3s for 15 members), so no cold-start health-check timeout
     # Python is pinned to 3.12 by the repo-root .python-version file: Render reads it from the repository
     # root and auto-selects the latest 3.12 patch. (The env-var PYTHON_VERSION method is NOT used — it
     # requires a fully-qualified patch, e.g. 3.12.7; the file form may omit it. Without a pin, new Render

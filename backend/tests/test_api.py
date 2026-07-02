@@ -1213,10 +1213,29 @@ def test_reseed_restores_initial_members_and_drops_holdouts(client):
     client.post("/members", json=_bundle("T99"))  # add an uploaded holdout
     r = client.post("/admin/reseed")
     assert r.status_code == 200 and r.json()["reseeded"] is True
+    assert r.json()["scanned"] == 15  # every ingest path auto-scans what it loaded
     ids = [m["member_id"] for m in client.get("/members").json()]
     assert "C01" in ids  # the deleted seeded member is back
     assert "T99" not in ids  # the uploaded holdout is dropped
     assert len(ids) == 15  # back to the initial state
+    # Observations are consistent with the restored data WITHOUT a manual scan: C07 (the panic member)
+    # has findings and its urgent escalation straight off the factory reset.
+    n_auto = len(client.get("/members/C07/observations").json())
+    assert n_auto >= 1
+    queue = client.get("/escalations").json()
+    assert any(e["member_id"] == "C07" and e["level"] == "urgent" for e in queue)
+    # Idempotent under the manual button: a reviewer clicking Scan after the auto-scan re-runs the same
+    # scan (observations overwrite on their dedup key, escalations fire once) — no duplicate findings.
+    client.post("/members/C07/scan")
+    assert len(client.get("/members/C07/observations").json()) == n_auto
+    urgent = [
+        e
+        for e in client.get("/escalations").json()
+        if e["member_id"] == "C07" and e["level"] == "urgent"
+    ]
+    assert len(urgent) == len(
+        [e for e in queue if e["member_id"] == "C07" and e["level"] == "urgent"]
+    )
     # The v0 baseline prompt is materialized post-reseed (not left to a lazy /learn) — promoted, BASE
     # text, no report yet — so the prompt store is never empty after a factory reset.
     con = db.connect(_DB_FILE)
@@ -1242,3 +1261,21 @@ def test_cold_start_seeds_the_v0_baseline_prompt(client):
     finally:
         con.close()
     assert [(r["version"], r["status"]) for r in rows] == [(0, "promoted")]
+
+
+def test_cold_start_seeds_and_auto_scans_the_members():
+    # A TRUE cold start (no members — a fresh ephemeral deploy / spun-down free tier): the lifespan
+    # seeds the 15 AND auto-scans them, so a reviewer's first page load shows findings without knowing
+    # to click Scan. The standard `client` fixture pre-seeds (its lifespan seed no-ops), so this test
+    # wipes members itself and lets the lifespan do BOTH.
+    con = fresh_con(_DB_FILE)
+    for t in [*_CHILD_TABLES, "members", "prompt_versions"]:
+        con.execute(f"DELETE FROM {t}")
+    con.commit()
+    con.close()
+    with TestClient(api.app) as c:
+        assert len(c.get("/members").json()) == 15  # the lifespan seeded
+        # ...and scanned: C07's panic K+ is an observation + an urgent escalation with NO manual scan.
+        assert len(c.get("/members/C07/observations").json()) >= 1
+        queue = c.get("/escalations").json()
+        assert any(e["member_id"] == "C07" and e["level"] == "urgent" for e in queue)

@@ -147,6 +147,12 @@
   }
 
   /* ---- control panel (operator — deliberately plain, held apart) -------------------------------- */
+  /* rail banner: names the audience split OUT LOUD (ui-ux §2). The member surface is the centre chat +
+     right panel; this rail is the operator/clinician console — the label keeps a reviewer (or member
+     build) from reading admin controls as part of the member experience. */
+  .cp-header { margin: 0 0 10px; padding-bottom: 9px; border-bottom: 1px solid var(--line); }
+  .cp-header strong { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--accent); font-weight: 700; }
+  .cp-header span { display: block; margin-top: 2px; font-size: 10.5px; line-height: 1.4; color: var(--faint); }
   /* Drag-and-drop bundle upload. The primary path in browsers whose native file picker won't open
      (a Chrome instance can silently refuse the OS file-selection dialog); a drop delivers the file
      without ever invoking that dialog. Click is a fallback for browsers where the picker works. */
@@ -171,7 +177,7 @@
   .cp-group h3 { font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--accent); font-weight: 600; margin-bottom: 7px; }
   .cp-btn {
     position: relative; display: block; width: 100%; text-align: left; margin-bottom: 6px;
-    border: 1px solid var(--line); background: var(--panel); border-radius: 10px; padding: 8px 10px; font-size: 12.5px; font-weight: 500; color: var(--ink);
+    border: 1px solid var(--line); background: var(--panel); border-radius: 999px; padding: 8px 13px; font-size: 12.5px; font-weight: 500; color: var(--ink);
     transition: border-color .15s, background .15s;
   }
   .cp-btn:hover { border-color: var(--faint); background: var(--panel-2); }
@@ -444,6 +450,10 @@
   <main>
     <!-- LEFT · operator control panel (not member-facing) -->
     <aside class="control" aria-label="Operator control panel">
+      <div class="cp-header">
+        <strong>Operator console</strong>
+        <span>clinician / debug surface &mdash; not part of the member experience</span>
+      </div>
       <input id="upload-file" type="file" accept=".zip,application/zip" hidden />
       <button type="button" id="upload-drop" class="dropzone"
               aria-label="Upload a new valid .zip dataset holding a .json, a .jsonl, and a .csv file: drag it here, or click to choose a file"
@@ -643,6 +653,103 @@
       highlightValues(block, text);
     }
   };
+  // Mode-2 twin of highlightAnswerValues for LLM-composed answers. The composer's markdown is already
+  // rendered (its own <strong>/<em>/lists must survive), so this walks TEXT NODES and wraps matches in
+  // <strong class="obs-val"> rather than rebuilding blocks from textContent. What gets bolded is
+  // grounded, never guessed: the marker names the response itself cites (findings[].evidence[].marker,
+  // case-insensitive, longest-first so "LDL cholesterol" wins over an overlapping shorter name), plus
+  // values that READ as measurements — a number with a %/slash-unit ("109 mg/dL"), a decimal, or an
+  // en-dash/hyphen range. Bare integers are deliberately NOT values here (unlike Mode-1's controlled
+  // template prose): free prose is full of them ("over 5 readings", "type 2 diabetes") and the
+  // crisis/seek-care templates' emergency phone numbers must never be restyled. Those safety templates
+  // are also excluded wholesale by the grounding gate — they cite no findings, so the pass no-ops.
+  const _escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Mode-2's value shape: number, optional en-dash/hyphen range, optional captured unit word. The
+  // unit is captured (group 1) so a trailing lowercase-only word can be judged and trimmed back off.
+  const COMPOSED_VALUE_RE = /\b\d[\d.,]*(?:\s*[–-]\s*\d[\d.,]*)?(\s*(?:%|[A-Za-z][A-Za-z0-9/²]*))?/g;
+  const highlightComposedMarkers = (container, resp) => {
+    const cited = [...new Set(
+      (resp.findings || []).flatMap((f) => (f.evidence || []).map((e) => e.marker)).filter(Boolean)
+    )];
+    if (!cited.length) return;  // ungrounded turn (incl. the gate's safety templates) → untouched
+    // Free prose shortens canonical marker names ("HDL cholesterol" → "HDL", "systolic_bp" →
+    // "blood pressure"), so each cited name also contributes its contiguous sub-phrases — kept only
+    // when multi-word or acronym-shaped (has an uppercase/digit, ≥2 chars). That admits "HDL" /
+    // "BMI" / "blood pressure" while a generic lowercase word ("pressure", "cholesterol") or the
+    // bare "D" of "Vitamin D (25-OH)" can never be bolded on its own. Vitals arrive as raw keys
+    // (bmi, systolic_bp — ingest folds vitals in as markers), so keys are humanized first:
+    // underscores → spaces, the "bp" token → "blood pressure" (the same expansion the backend's
+    // member-facing narration uses).
+    const names = new Set(cited);
+    for (const name of cited) {
+      const norm = name.replace(/_/g, " ").replace(/\bbp\b/i, "blood pressure");
+      const words = norm.split(/\s+/).filter(Boolean);
+      for (let i = 0; i < words.length; i++)
+        for (let j = i; j < words.length; j++) {
+          const phrase = words.slice(i, j + 1).join(" ");
+          if (j > i || (phrase.length >= 2 && /[A-Z0-9]/.test(phrase))) names.add(phrase);
+        }
+      // a cited blood-pressure marker also admits its qualifier ("systolic"/"diastolic") and the "BP"
+      // abbreviation — the lowercase-single-word rule above would reject both, but with the marker
+      // cited they are unambiguous in prose ("systolic 134 mmHg", "the BP trend").
+      const bpq = norm.match(/^(\w+)\s+blood pressure$/i);
+      if (bpq) { names.add(bpq[1]); names.add("BP"); }
+    }
+    const sorted = [...names].sort((a, b) => b.length - a.length);  // longest-first: full name wins
+    // lookarounds, not \b: marker names can end in a non-word char ("Vitamin D (25-OH)")
+    const nameRe = new RegExp(`(?<!\\w)(?:${sorted.map(_escRe).join("|")})(?!\\w)`, "gi");
+    // The cited evidence VALUES ground bare numbers the same way markers ground names: "(109)" bolds
+    // because fasting glucose's evidence value IS 109, while "over 5 readings" stays plain (a count,
+    // never an evidence value). This keeps the bare-integer door shut for emergency phone numbers
+    // without losing real readings the composer echoes without units.
+    const citedVals = new Set(
+      (resp.findings || []).flatMap((f) => (f.evidence || []).map((e) => e.value))
+        .filter((v) => typeof v === "number")
+    );
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+    const textNodes = [];
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      if (!n.parentElement.closest("code, .obs-val")) textNodes.push(n);
+    }
+    for (const node of textNodes) {
+      const text = node.nodeValue;
+      const spans = [], blocked = [];
+      let m;
+      DATE_RE.lastIndex = 0;
+      while ((m = DATE_RE.exec(text)) !== null) blocked.push([m.index, m.index + m[0].length]);
+      nameRe.lastIndex = 0;
+      while ((m = nameRe.exec(text)) !== null) spans.push([m.index, m.index + m[0].length]);
+      // number + optional range + optional unit. Unlike Mode-1's VALUE_RE the unit needn't carry a
+      // slash ("134 mmHg", "26 U/L", "18 ng/mL" all count) — but a trailing lowercase-only word is
+      // prose, not a unit ("5 readings"), and is trimmed back off before the number is judged alone.
+      COMPOSED_VALUE_RE.lastIndex = 0;
+      while ((m = COMPOSED_VALUE_RE.exec(text)) !== null) {
+        let val = m[0], unit = (m[1] || "").trim();
+        if (unit && unit !== "%" && !unit.includes("/") && !/[A-Z]/.test(unit)) {
+          val = val.slice(0, val.length - m[1].length);   // not a unit → judge the bare number
+          unit = "";
+        }
+        val = val.replace(/[.,\s]+$/, "");           // shed sentence punctuation the match ran into
+        const s = m.index, e = s + val.length;
+        // a number qualifies with a unit, a decimal, a range — or by being a cited evidence value
+        if (!unit && !/[.–-]/.test(val) && !citedVals.has(parseFloat(val.replace(/,/g, "")))) continue;
+        if (spans.some(([a, b]) => s < b && e > a)) continue;
+        if (blocked.some(([a, b]) => s < b && e > a)) continue;
+        spans.push([s, e]);
+      }
+      if (!spans.length) continue;
+      spans.sort((a, b) => a[0] - b[0]);
+      const frag = document.createDocumentFragment();
+      let last = 0;
+      for (const [s, e] of spans) {
+        if (s > last) frag.appendChild(document.createTextNode(text.slice(last, s)));
+        frag.appendChild(el("strong", "obs-val", text.slice(s, e)));
+        last = e;
+      }
+      if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+      node.parentNode.replaceChild(frag, node);
+    }
+  };
   const enc = encodeURIComponent;
 
   // ---- markdown → safe HTML (the Mode-2 LLM emits markdown; Mode-1 deterministic prose is mostly one
@@ -758,8 +865,9 @@
   }
 
   // member-load sequence: load EXISTING state only (observations + escalations + suggestions) — all
-  // READS, never a scan. A member scan is only ever triggered manually via the "Run scan" button, so
-  // selecting a member shows whatever the last scan left (nothing until the operator runs one).
+  // READS, never a scan. Selecting a member shows whatever the last scan left. Scans run automatically
+  // at every data load (seed / reseed / upload — proactive by default), so a freshly loaded member
+  // already has findings; the "Run scan" button is a manual re-run of the same idempotent scan.
   async function selectMember(id) {
     flushMemberState();
     state.currentMember = id;
@@ -1685,7 +1793,18 @@
     }
     // re-insert cached nodes for unchanged turns + build only new/changed ones (#6)
     log.replaceChildren(...state.log.map(turnNode));
-    log.scrollTop = log.scrollHeight;
+    scrollConversationToEnd();
+  }
+
+  // Scroll the newest turn into view. #conversation-log itself never scrolls (no overflow) — the real
+  // scroller is .center on desktop and <main> in the stacked <=820px layout — so target the convo-foot
+  // (the log's sibling, always the bottom of the conversation column) and let scrollIntoView walk
+  // whichever ancestor scrolls. Deliberately NOT "bottom of the scroller": in the stacked layout the
+  // Observations panel sits BELOW the chat inside <main>, so scrolling main to scrollHeight would
+  // overshoot past the newest message. Runs on every conversation render — i.e. both when the member's
+  // message is pushed (with the pending bubble) and again when the full assistant answer replaces it.
+  function scrollConversationToEnd() {
+    document.querySelector(".convo-foot")?.scrollIntoView({ block: "end" });
   }
 
   // a turn's rendered node, cached by identity + a signature of the render-affecting fields (kind/text;
@@ -1758,11 +1877,14 @@
     if (disp.tag) card.appendChild(el("div", "disp-tag", disp.tag));
     const answer = el("div", "answer-text");
     answer.innerHTML = mdToHtml(resp.answer || "");   // safe: mdToHtml escapes first, emits a fixed tag set
-    // Bold-purple the marker name + values in a Mode-1 chip answer, matching the Observations panel.
-    // Gated on turn.askedPrompt (set only for Mode-1 chip turns), so the Mode-2 LLM's own markdown and the
-    // gate-routed safety templates (crisis / seek-care — their emergency numbers must not be restyled) are
-    // left untouched.
+    // Bold-purple the marker names + values, matching the Observations panel. Mode-1 chip turns
+    // (turn.askedPrompt) rebuild each block — safe, the deterministic prose has no inline markdown.
+    // Mode-2 LLM answers get the text-node walker instead (highlightComposedMarkers), which preserves
+    // the composer's own markdown and bolds only the markers the response's evidence cites; the
+    // gate-routed safety templates (crisis / seek-care — their emergency numbers must not be restyled)
+    // cite no findings, so they stay untouched.
     if (turn.askedPrompt) highlightAnswerValues(answer);
+    else highlightComposedMarkers(answer, resp);
     card.appendChild(answer);
     if (resp.uncertainty) card.appendChild(el("div", "uncertainty", resp.uncertainty));
 

@@ -101,6 +101,19 @@ async def lifespan(app: FastAPI):
                     "startup: seeded %d members from the active dataset",
                     outcome["members"],
                 )
+                # Every ingest path auto-scans what it loaded (startup seed here; reseed + upload in
+                # their routes), so persisted Observations are always consistent with the loaded data —
+                # a cold open (fresh deploy / ephemeral-tier restart) shows findings without a manual
+                # Scan. Best-effort like the seed itself: scan_members already absorbs per-member
+                # failures, and this envelope keeps a systemic scan bug from blocking serving (the
+                # deterministic spine still answers; observations lag until a manual scan).
+                try:
+                    scanned = pipeline.scan_members(con, outcome["member_ids"])
+                    logger.info("startup: auto-scanned %d seeded members", scanned)
+                except Exception:
+                    logger.exception(
+                        "startup auto-scan failed; observations lag until a manual scan"
+                    )
         # Materialize the v0 composer baseline so prompt_versions is never empty (the operator UI shows
         # the active baseline; /learn back-fills its eval report lazily). Idempotent — a no-op on a warm
         # restart, and a one-time back-fill for DBs seeded before this landed. NON-fatal like the seed:
@@ -170,7 +183,8 @@ def upload_dataset(
     facts, never a reseed/truncate; AND (2) the **entire** uploaded bundle is written to a new
     ``<data-root>/<name>/`` folder, so the kept ``eval_set.jsonl`` is available for later live use
     (``DATASET=<name> make eval``). Then each newly ingested member is **auto-scanned** so its
-    Observations match its live Trajectory immediately (reseed deliberately does NOT auto-scan).
+    Observations match its live Trajectory immediately (every ingest path auto-scans — the startup
+    seed and ``/admin/reseed`` do the same).
 
     This doubles as the format check, surfaced at file+row granularity: a missing or duplicated required
     file, or a FIRST-RECORD format failure in any of the three files (member bundle / eval case / CSV panel
@@ -217,7 +231,7 @@ def upload_dataset(
         ) from e
 
     # Auto-scan the just-ingested members so their stored Observations match their live Trajectory the
-    # moment the data source lands (best-effort, in the library; reseed deliberately does NOT auto-scan).
+    # moment the data source lands (best-effort, in the library; startup seed + reseed do the same).
     scanned = pipeline.scan_members(con, result["member_ids"])
     return {**result, "scanned": scanned}
 
@@ -417,7 +431,14 @@ def post_reseed(con: sqlite3.Connection = Depends(get_con)) -> dict:
     ATOMIC: the truncate + re-ingest + v0 seed run as ONE transaction (``db.reseed_transaction``, with the
     ingest/seed passing ``commit=False``), so a concurrent request on another threadpool connection reads
     the pre-reseed or post-reseed state, never a half-wiped DB, and any mid-reseed failure rolls back to
-    the prior populated state rather than leaving the DB empty."""
+    the prior populated state rather than leaving the DB empty.
+
+    Then AUTO-SCANS the restored members — every ingest path (startup seed, reseed, upload) scans what it
+    loaded, so Observations are always consistent with the loaded data (a reviewer lands on findings, not
+    a "run a scan" nudge). The scan runs AFTER the transaction commits, deliberately: ``pipeline.scan``
+    persists via its own per-member commits, which inside the block would flush the half-done reseed.
+    Best-effort like the upload's auto-scan (a member's scan failure is logged, not fatal); ``scanned``
+    rides the response like the upload's."""
     with db.reseed_transaction(con):
         db.clear_all_data(
             con
@@ -426,7 +447,8 @@ def post_reseed(con: sqlite3.Connection = Depends(get_con)) -> dict:
         learn.seed_baseline_prompt(
             con, commit=False
         )  # v0 baseline, so the prompt store isn't empty
-    return {"reseeded": True, **summary}
+    scanned = pipeline.scan_members(con, summary["member_ids"])
+    return {"reseeded": True, "scanned": scanned, **summary}
 
 
 # Serve the static member surface on the same origin (Phase 6 ships frontend/index.html). Mounted LAST

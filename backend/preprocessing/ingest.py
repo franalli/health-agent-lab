@@ -1073,6 +1073,18 @@ def main(argv: list[str] | None = None) -> None:
             f"ingested {summary['members']} members, {summary['results']} results, "
             f"{summary['ranges']} reference ranges"
         )
+        # Every ingest path ends in a scan (the lifespan seed, /admin/reseed, /members/upload, and this
+        # CLI — the `make seed` behind `make run`), so persisted Observations are always consistent with
+        # the loaded data: the local one-command run boots with findings already visible, same as a fresh
+        # deploy. Proactive-by-default is the product behavior ("surfaces drift without being asked");
+        # the UI's Scan button is the manual re-run of the same idempotent scan, not the trigger.
+        # Lazy import: pipeline pulls the LLM seam, which library importers of the firewall never need
+        # (the scan itself is deterministic — no LLM call). Best-effort per member (scan_members logs and
+        # skips a failing member), so a scan problem can never fail the seed it rides on.
+        from health_intelligence import pipeline
+
+        scanned = pipeline.scan_members(con, summary["member_ids"])
+        print(f"scanned {scanned} members (observations up to date)")
         if args.verify:
             _verify(con)
     finally:

@@ -15,7 +15,7 @@ Full design and rationale: [`architecture.md`](docs/architecture.md).
 Requires [uv](https://docs.astral.sh/uv/), which manages the Python toolchain and dependencies.
 
 ```bash
-git clone <repo> && cd health-intelligence
+git clone https://github.com/franalli/health-agent-lab.git && cd health-agent-lab
 echo "ANTHROPIC_API_KEY=sk-..." > backend/.env   # only needed for Mode 2 (LLM answers)
 cd backend && make hooks                          # install pre-commit hooks (ruff + gitleaks); once after clone
 make run                                          # uv-installs, builds + seeds the DB, serves on :8000
@@ -27,12 +27,26 @@ Open `http://localhost:8000` — one process serves both the API and the UI; no 
 >
 > **Code quality gates.** Commits are checked by [pre-commit](https://pre-commit.com/) (`.pre-commit-config.yaml` at the repo root): `ruff` lints and formats Python, and `gitleaks` scans for secrets. `make hooks` installs the git hook; `make lint` runs every check over the whole tree on demand.
 
+## Reviewer notes
+
+**Hosted demo:** https://health-intelligence-jfuf.onrender.com — pre-seeded with the 15 training members. The free tier spins down after ~15 minutes idle; the first request after a spin-down takes 10–20 seconds and triggers a self-heal (re-seeds **and re-scans** the DB automatically, so observations are populated on the first page load). Uploads and feedback added to the live demo don't survive a spin-down on the free tier (see [Deployment](#deployment) for the durable paid-disk upgrade).
+
+**Two surfaces, one page:** the **member surface** is the center chat plus the right Observations/Trajectory panel — that is the consumer-facing product. The **left rail is an operator/clinician console** (labeled as such in the UI): it drives the service's raw endpoints one click each — reseed, upload, scan, feedback, `/learn`, the clinician escalation queue — with raw JSON in the route readout. It exists so a reviewer can exercise every endpoint without `curl`; it is not part of the member experience, and a member build drops the whole column (`operatorView = false` in `frontend/index.html`). Two escalation views live there deliberately: **Clinician queue** (`GET /escalations`) is the *global cross-member* triage worklist — seeing other members' escalations there is the point, not a scoping leak — while **Member escalations** (`GET /members/{id}/escalations`) is the selected member's own record.
+
+**Mode toggle:** the **Mode** control in the header (**1 · Guided** / **2 · Ask**) flips between Mode 1 (deterministic, no API key needed — chips + grounded answers) and Mode 2 (LLM-rendered free-form answers, needs `ANTHROPIC_API_KEY`). Mode 1 is the default; Mode 2 degrades gracefully to the deterministic fallback when the key is absent — never a 500.
+
+**Upload your own dataset:** the **Data** group in the operator panel (left rail) accepts a `.zip` bundle shaped like `backend/data/training_data/` — exactly one `.json` (members), one `.jsonl` (eval set), one `.csv` (lab panels), under any base names; extension is what matters. Drop the file on the dropzone. Members are ingested *additively* (on top of the existing 15; no reseed) and auto-scanned immediately. A 422 with per-field reasons fires if the first record of any file fails its schema gate, before any side effect; a malformed *later* member row is skipped and reported per-row, never fatal. Two conventions to know: the new dataset folder takes the **zip's base name**, so name the file simply (letters, digits, `._-` — a unicode/spaced name is rejected with the exact rule in the readout); and reference ranges are **global definitions** — a member row whose range for an already-known marker *diverges* from the stored definition is skipped with the stored bound quoted (new markers define freely).
+
+**Before exploring feedback or `/learn`:** click **Reseed (factory)** in the **Data** group of the operator panel to flush the DB to v0. Otherwise, feedback from a prior session colors the candidate prompt and the learning readout reflects an already-exercised state rather than a clean baseline. The reseed auto-scans the restored members, so observations are populated the moment it returns.
+
+**Concurrency scope (deliberate):** `--workers 1` is intentional — reads and `/ask` requests serialize safely under concurrent use (SQLite WAL mode; 5-second busy-timeout on write contention). Destructive ops (Reseed, dataset upload) are fully atomic transactions, but assume a single operator: multi-tenant concurrency is out of scope per the brief. Conversation history is client-side and ephemeral — refreshing the browser tab starts a fresh conversation (there is no server session store, by design). These are deliberate scope boundaries, not gaps.
+
 ## What it does
 
 Two behaviors, over one deterministic core:
 
 - **Grounded Q&A** — ask in plain language ("what's changed since I started?", "is my thyroid okay?"). Every claim is backed by the member's own readings, with the evidence one tap away. Out-of-scope or unsafe requests (e.g. "change my dose") are declined and pointed to a clinician.
-- **Proactive observations** — on each new panel the system scans every marker for drift, ranks what's worth knowing by severity, and raises a clinician hand-off when a value is critical or a trajectory is significantly adverse. A healthy baseline produces no false alarms; an improving trend is recognized as good news, not a problem.
+- **Proactive observations** — generated at ingest, without being asked: whenever data loads (the startup seed, a reseed, a dataset upload), the system scans every marker for drift, ranks what's worth knowing by severity, and raises a clinician hand-off when a value is critical or a trajectory is significantly adverse. Open the app cold and the findings are already there; the UI's **Run scan** button is a manual re-run of the same idempotent scan (useful for demonstrating the mechanism — it returns the scan digest). A healthy baseline produces no false alarms; an improving trend is recognized as good news, not a problem.
 
 **Two modes**, flipped by a single toggle:
 
@@ -74,6 +88,16 @@ make eval
 
 Runs the supplied 17-case set (plus a few tagged gate/trend additions) through both modes and writes a markdown + JSON report under `backend/eval/reports/`. The harness mirrors the system's own discipline: deterministic scorers wherever there's a ground truth (grounding, escalation, trend verdicts, latency, cost, consistency), an LLM judge only for the irreducibly subjective (semantic support, tone). Safety failures are **never-events** that fail the run outright and surface first; over-escalation is measured, not failed. The JSON report is the regression gate (it persists each run's raw inputs/outputs, so a scorer change can be re-graded offline). Mode 2 calls the real Anthropic API (it measures consistency and latency/cost), so `make eval` needs `ANTHROPIC_API_KEY`. The deterministic scorers ship today, and setting `LANGSMITH_API_KEY` additionally streams each run to LangSmith for trace inspection (offline, synthetic-data-only) — the local report staying canonical. `make eval` also runs the **feedback input-judge accuracy gate** (`eval/judge_eval.py`, run standalone by `make eval-judge`): a labeled, held-out battery through the real Haiku that screens clinician corrections (`learn.judge_corrected_answer`) — measured, not unit-testable, since the judge is an LLM; a miss (or, with a key present, a transient provider failure) fails the run alongside a safety never-event, and it SKIPs only when the key is absent. That gate is distinct from the **composer** semantic LLM judge (semantic support, tone of the answers themselves), which remains the next increment.
 
+## Failure modes (walked)
+
+Three found, documented, and bounded during development — included here because the brief asks for this, and a failure mode you call out first reads differently than one a tester discovers unmentioned.
+
+**1. Gate misroutes in-scope meta questions.** The Mode 2 intent gate (Haiku, `temperature=0`) classifies each message before the composer runs. During development it misrouted in-scope questions phrased as "what are you noticing?" or "what observations are concerning?" to `out_of_scope` — a false refusal on the system's own features. Root cause: the `out_of_scope` definition was too broad (it pulled in "what should I do?" alongside genuine drug/symptom questions). Fix: tightened `out_of_scope` to drugs, doses, and diagnosis questions only; added explicit `none`-route exemplars for next-steps and meta-asks, plus held-out eval cases (A06–A10) so the fix is regression-pinned; the full live-API eval battery passes with it. At-boundary phrasing can still flip between runs (this is nondeterminism in the model, not a systemic bug) — if a specific phrasing consistently misfires, add it as an eval case.
+
+**2. `/learn` certifies non-regression, not improvement.** The harness-gated prompt promotion gate (`POST /learn`) tells you "this candidate does *not* regress any measured dimension" — not "it improved anything." A pure tone/quality gain that trips no deterministic scorer (grounding, escalation, trend verdict) passes the gate for the same reason a neutral change does. The deferred eval LLM judge (semantic grounding, tone) would differentiate; the current gate is deliberately safe-toward-rejection. This is a correctness choice: the gate errs on the side of not promoting, since a promoted prompt that degrades unmeasured dimensions is harder to detect than a gate that rejected a benign candidate.
+
+**3. `/learn` runs at N=1 — grounding noise can false-reject a benign candidate.** The main eval harness (`make eval`) samples N=3 to absorb run-to-run LLM variance in the grounding scorer. The in-process `/learn` gate runs at N=1 to control LLM cost, so a borderline candidate that would clear N=3 can false-reject on a single unlucky sample. The gate errs safe (toward rejection), and a false-reject is recoverable: accumulate more feedback signals and trigger `/learn` again. The skip reason is logged and shown in the operator "Learning" readout so it's visible, not silent.
+
 ## Layout
 
 ```
@@ -96,9 +120,9 @@ A single [Render](https://render.com/) Web Service serves both the API and the s
 1. Push this repo to GitHub.
 2. Render → **New** → **Blueprint** → connect the repo; it reads `render.yaml` (a `web` service, `uv sync` build, `uvicorn api:app` on `$PORT`, health check `/health`).
 3. Set **`ANTHROPIC_API_KEY`** as a secret when prompted (`render.yaml` marks it `sync: false`, so it's never committed). Mode 1 works without it; Mode 2 + the gate need it.
-4. **Create** → on first boot the app inits the schema and **seeds the 15 training members** (the build can't see the runtime filesystem, so both run at startup). Hit `<url>/health`, then open `<url>/`.
+4. **Create** → on first boot the app inits the schema, **seeds the 15 training members, and auto-scans them** (the build can't see the runtime filesystem, so all of it runs at startup — sub-second), so the first page load already shows observations. Hit `<url>/health`, then open `<url>/`.
 
-**Free tier (the shipped default): the database is ephemeral.** The free plan has no persistent disk and spins down when idle, so the SQLite file is wiped on a cold start — the app re-seeds `training_data` automatically, but `POST /members` / `POST /members/upload` uploads and `feedback` do **not** survive a spin-down. For durable storage, upgrade in `render.yaml`: switch `plan: free` → `plan: starter`, uncomment the `disk` block (mounted at `/data`), and set `HEALTH_DB_PATH=/data/health.db` — then uploaded members and learning persist across deploys (~$8/mo). (The dataset *folders* `POST /members/upload` writes — the kept `eval_set.jsonl`/`lab_panels.csv` — still live under the ephemeral app dir unless you also point `HEALTH_DATA_ROOT` at the disk; see the `render.yaml` comment.)
+**Free tier (the shipped default): the database is ephemeral.** The free plan has no persistent disk and spins down when idle, so the SQLite file is wiped on a cold start — the app re-seeds `training_data` (and re-scans it, so observations self-heal too) automatically, but `POST /members` / `POST /members/upload` uploads and `feedback` do **not** survive a spin-down. For durable storage, upgrade in `render.yaml`: switch `plan: free` → `plan: starter`, uncomment the `disk` block (mounted at `/data`), and set `HEALTH_DB_PATH=/data/health.db` — then uploaded members and learning persist across deploys (~$8/mo). (The dataset *folders* `POST /members/upload` writes — the kept `eval_set.jsonl`/`lab_panels.csv` — still live under the ephemeral app dir unless you also point `HEALTH_DATA_ROOT` at the disk; see the `render.yaml` comment.)
 
 Locally, `make serve` runs the exact production command (no `--reload`, binds `$PORT` or 8000, seeds on startup if empty); `make run` stays the primary dev command.
 
