@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from health_intelligence.config import CRISIS_CONTACT, EMERGENCY_MEDICAL_CONTACT
 from health_intelligence.models import (
     Evidence,
     Finding,
@@ -56,6 +57,46 @@ _DISPLAY_NAME = {
 
 def _display_name(marker: str) -> str:
     return _DISPLAY_NAME.get(marker, marker)
+
+
+#: Generic, member-INDEPENDENT one-liners: what a marker measures and how an out-of-range value is
+#: usually handled. Educational framing for the Mode-1 answers so a member reading a finding learns what
+#: the test is for, not just its number. Two disciplines make this safe to state as fixed prose:
+#:   * NUMBER-FREE — no bound or value is ever written here (those come from ``observation_member_explanation``,
+#:     the one vetted number-printer), so these strings stay clear of the eval number-tracer and can never
+#:     drift from the real range.
+#:   * NON-DIAGNOSTIC — each defers to the clinician and describes the marker CLASS, never interpreting
+#:     THIS member's result or naming a cause (the §153 mechanism boundary / "never a diagnosis"). Where a
+#:     marker's adverse direction is counter-intuitive (HDL, eGFR: LOWER is worse) the framing says so,
+#:     since that is a fixed property of the test, not a claim about the member.
+_MARKER_MEANING: dict[str, str] = {
+    "HbA1c": "HbA1c reflects your average blood sugar over roughly the past three months; a value outside the usual range is typically read alongside your other glucose markers by a clinician.",
+    "Fasting glucose": "Fasting glucose is your blood sugar after not eating for a while; a reading outside the usual range is usually interpreted together with HbA1c rather than on its own.",
+    "LDL cholesterol": "LDL is the cholesterol that can build up in blood vessels over time; where it sits relative to range is generally weighed by a clinician against your overall heart-health picture.",
+    "HDL cholesterol": "HDL is the cholesterol thought to be protective, so here a LOWER value is the less favourable direction; it is read in the context of your full lipid panel.",
+    "Total cholesterol": "Total cholesterol sums the cholesterol carried in your blood; it is most meaningful alongside the LDL, HDL and triglyceride breakdown.",
+    "Triglycerides": "Triglycerides are a type of fat carried in the blood; a value above range is typically considered together with the rest of your lipid panel.",
+    "ALT": "ALT is an enzyme that can rise when liver cells are under stress; a value outside the usual range is generally re-checked and interpreted in context by a clinician.",
+    "AST": "AST is an enzyme found in the liver and muscle; like ALT, an out-of-range value is reviewed in context rather than read alone.",
+    "CRP": "CRP is a general marker of inflammation; a raised value signals inflammation somewhere in the body without saying where, so it is interpreted clinically.",
+    "Creatinine": "Creatinine is a waste product your kidneys filter out of the blood; it is one of the main signals of how your kidneys are working and is read alongside eGFR.",
+    "eGFR": "eGFR estimates how well your kidneys are filtering, so here a LOWER value is the less favourable direction; it is interpreted together with creatinine.",
+    "Ferritin": "Ferritin reflects your body's iron stores; both low and high values can matter, so it is interpreted in context by a clinician.",
+    "Hemoglobin": "Hemoglobin is the protein in red blood cells that carries oxygen; a value outside the usual range is typically reviewed alongside the rest of a blood count.",
+    "Potassium": "Potassium is an electrolyte important for heart and muscle function; because both high and low extremes can affect the heart, it is a marker clinicians watch closely.",
+    "TSH": "TSH is the hormone that regulates your thyroid; an out-of-range value is usually the starting point for a broader thyroid assessment.",
+    "Vitamin D (25-OH)": "Vitamin D (25-OH) reflects your vitamin D status, which supports bone and general health; low values are common, and a clinician can advise on next steps.",
+    "systolic_bp": "Systolic blood pressure is the pressure in your arteries when the heart beats; readings above range are usually confirmed over several measurements before any conclusion is drawn.",
+    "diastolic_bp": "Diastolic blood pressure is the pressure between heartbeats; like the systolic number, it is interpreted over repeated readings rather than a single value.",
+    "bmi": "BMI relates your weight to your height as a rough screen; it does not capture muscle or body composition, so it is best read as one signal among many.",
+}
+
+
+def _marker_meaning(marker: str) -> str:
+    """The generic educational one-liner for a marker (``_MARKER_MEANING``), or ``""`` for an uncurated
+    one — never a fabricated description. Number-free and non-diagnostic by construction; see the table's
+    note. Appended to the Mode-1 single-marker narrations so the member learns what the test measures."""
+    return _MARKER_MEANING.get(marker, "")
 
 
 def _trend_stat(t: TrendResult) -> str:
@@ -387,11 +428,13 @@ def render_finding(
 
 
 def seek_care_template(metadata: ResponseMetadata) -> HealthIntelligenceResponse:
-    """Acute-medical responder: the unmissable next step leads; no lab narration to dilute it."""
+    """Acute-medical responder: the unmissable next step leads; no lab narration to dilute it. The Swiss
+    emergency numbers (``config.EMERGENCY_MEDICAL_CONTACT``) are stated so the action is concrete — this
+    is the GUARANTEED acute path (fires off the emergency-phrase floor even when the LLM is unavailable)."""
     return HealthIntelligenceResponse(
         answer=(
             "Based on what you've described, please seek medical care now — contact urgent care or "
-            "emergency services. This can't wait for a routine review."
+            f"emergency services. {EMERGENCY_MEDICAL_CONTACT} This can't wait for a routine review."
         ),
         answer_disposition="answered",
         escalation="urgent",
@@ -400,12 +443,13 @@ def seek_care_template(metadata: ResponseMetadata) -> HealthIntelligenceResponse
 
 
 def crisis_template(metadata: ResponseMetadata) -> HealthIntelligenceResponse:
-    """Crisis responder: warm, present, resources — never a clinical frame, never disengages."""
+    """Crisis responder: warm, present, resources — never a clinical frame, never disengages. Names the
+    Swiss crisis line and emergency number (``config.CRISIS_CONTACT``) so the resource is reachable, not
+    abstract — the guaranteed crisis path when the LLM is unavailable or jailbroken."""
     return HealthIntelligenceResponse(
         answer=(
-            "I'm really glad you told me, and I don't want you to go through this alone. If you're in "
-            "immediate danger please contact emergency services or a crisis line right now — they're "
-            "there for exactly this, any time."
+            "I'm really glad you told me, and I don't want you to go through this alone. "
+            f"{CRISIS_CONTACT} They're there for exactly this."
         ),
         answer_disposition="answered",
         escalation="urgent",
@@ -507,6 +551,11 @@ def _change_narrative(traj: MarkerTrajectory) -> str:
         parts.append(
             f"Across {t.n} readings there's no significant trend."
         )  # flagged: don't claim 'normal variation'
+    # The generic marker meaning is deliberately NOT appended here — this drill-down leads with the value's
+    # status ("...above the reference range."), and a digit-bearing marker name (HbA1c, Vitamin D (25-OH))
+    # placed immediately after that clause reads to the eval range-word scorer as an invented bound. The
+    # meaning lives on the "Tell me about ..." pivot answer (``_pivot_narrative``) instead, which is the
+    # primary single-marker detail surface; this stays the trend-focused view.
     return " ".join(parts)
 
 
@@ -577,6 +626,20 @@ def render_change(
     )
 
 
+def _pivot_narrative(traj: MarkerTrajectory, rng: ReferenceRange | None) -> str:
+    """The enriched single-marker answer: the member-facing value-vs-range explanation followed by the
+    generic marker meaning. The first sentence REUSES ``observation_member_explanation`` — so the three
+    invariants it already satisfies (no statistics leaked, the core flag surfaced, the referral nudge
+    severity-gated) carry over unchanged, and every NUMBER still originates in that one vetted printer.
+    Only the trailing ``_marker_meaning`` sentence is new prose, and it is number-free + non-diagnostic by
+    construction (see ``_MARKER_MEANING``), so enriching the answer opens none of those invariants."""
+    parts = [observation_member_explanation(traj, rng)]
+    meaning = _marker_meaning(traj.marker)
+    if meaning:
+        parts.append(meaning)
+    return " ".join(parts)
+
+
 def render_pivot(
     traj: MarkerTrajectory,
     rng: ReferenceRange | None,
@@ -585,11 +648,19 @@ def render_pivot(
     metadata: ResponseMetadata,
 ) -> HealthIntelligenceResponse:
     """One raised finding as its own answer — the SAME per-marker ``Finding`` the proactive scan builds
-    (``observation_summary`` title + ``scan_finding`` evidence), rendered by the 3a ``render_finding``.
-    This is the "reactive path reuses the 3a response builder" of the phase, so a chip's answer for a
-    marker is identical in substance to that marker's scan observation."""
-    return render_finding(
-        _marker_finding(traj, rng), escalation=escalation, metadata=metadata
+    (``observation_summary`` title + ``scan_finding`` evidence), now under an enriched member-facing
+    narrative (``_pivot_narrative``: the value against its reference range, its current standing, and what
+    the marker measures) rather than the scan's terse audit boilerplate (``render_finding``, still used by
+    the persisted scan interaction). ``finding.text`` stays the ``observation_summary`` title — the
+    grounding guarantee that the chip's finding matches its scan observation — so only the prose is richer.
+    Built AT the floor, like every Mode-1 response."""
+    return HealthIntelligenceResponse(
+        answer=_pivot_narrative(traj, rng),
+        findings=[_marker_finding(traj, rng)],
+        uncertainty="Based on your recorded panels for this marker.",
+        answer_disposition="answered",
+        escalation=escalation,
+        metadata=metadata,
     )
 
 
@@ -625,11 +696,18 @@ def render_overview(
             metadata=metadata,
         )
     findings = [_marker_finding(t, rng_for.get(t.marker)) for t in raised]
+    # Per-marker detail, not just a name list: one bullet each carrying the member-facing value-vs-range
+    # explanation (``observation_member_explanation`` — the vetted number-printer, so every figure here is
+    # grounded and the no-stats-leak / core-flag / severity-gated-nudge invariants hold per line). Rendered
+    # as a markdown list (the UI's mini-renderer supports ``- `` bullets); the meaning sentence is left to
+    # the single-marker drill-down so the "what's changed" roll-up stays scannable.
+    bullets = "\n".join(
+        f"- {observation_member_explanation(t, rng_for.get(t.marker))}" for t in raised
+    )
     return HealthIntelligenceResponse(
         answer=(
-            f"A few things are worth a closer look since your earlier panels: "
-            f"{_join_markers([_display_name(t.marker) for t in raised])}. Here's what each shows — your "
-            "clinician can interpret them in context."
+            "A few things are worth a closer look since your earlier panels. Here's what each shows — "
+            "your clinician can interpret them in context:\n\n" + bullets
         ),
         findings=findings,
         uncertainty="Based on your recorded panels for these markers.",
@@ -657,9 +735,12 @@ def render_summary(
     if m == 0:
         answer = f"I looked at {n} markers from your panels, and they're all {rest} — nothing flagged right now."
     else:
+        # Name the flagged markers (this anchor stays orientation-only — the per-marker value-vs-range
+        # detail lives in the overview and pivot chips — but naming them is a cheap, honest enrichment).
+        names = _join_markers([_display_name(t.marker) for t in raised])
         answer = (
             f"I looked at {n} markers from your panels. {m} {'is' if m == 1 else 'are'} worth a closer "
-            f"look (shown on the right and in detail above); the rest are {rest}."
+            f"look — {names} — shown on the right and in detail above; the rest are {rest}."
         )
     return HealthIntelligenceResponse(
         answer=answer,

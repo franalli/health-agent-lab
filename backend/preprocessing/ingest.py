@@ -23,8 +23,11 @@ Runnable as the loader CLI:  ``python -m preprocessing.ingest [--dataset NAME] [
 from __future__ import annotations
 
 import argparse
+import csv
+import datetime
 import io
 import json
+import logging
 import lzma
 import os
 import pathlib
@@ -33,14 +36,24 @@ import shutil
 import zipfile
 import zlib
 
+from pydantic import ValidationError
+
 from health_intelligence import db
 from health_intelligence.config import CONFIG_VERSION, MARKERS
-from health_intelligence.models import LabResult, MemberBundle, RangeSex, ReferenceRange
+from health_intelligence.models import (
+    EvalCaseInput,
+    LabResult,
+    MemberBundle,
+    RangeSex,
+    ReferenceRange,
+)
 from preprocessing.datasets import (
     create_dataset_dir,
     derive_dataset_name,
     members_path,
 )
+
+logger = logging.getLogger(__name__)
 
 #: The three vitals every panel carries; folded into markers with config-supplied units (the data
 #: prints no vital units or ranges, so config is the source for both).
@@ -117,8 +130,9 @@ def _parse_scalar(s: str) -> tuple[float | None, float | None]:
 # --------------------------------------------------------------------------------------------------
 
 
-def ingest_bundle(con, bundle: MemberBundle) -> dict:
-    """Normalize one member and persist it (replacing any prior version). Returns summary counts."""
+def ingest_bundle(con, bundle: MemberBundle, *, commit: bool = True) -> dict:
+    """Normalize one member and persist it (replacing any prior version). Returns summary counts.
+    ``commit=False`` defers the write's commit to the caller's transaction (the atomic reseed)."""
     results: list[LabResult] = []
     # marker -> (printed reference_range string, data unit); constant per marker, so parse it once.
     lab_range_src: dict[str, tuple[str, str]] = {}
@@ -151,7 +165,12 @@ def ingest_bundle(con, bundle: MemberBundle) -> dict:
     _assert_unique_markers_per_panel(results)
     ranges = _build_ranges(lab_range_src)
     db.replace_member(
-        con, profile=bundle.profile, results=results, ranges=ranges, notes=bundle.notes
+        con,
+        profile=bundle.profile,
+        results=results,
+        ranges=ranges,
+        notes=bundle.notes,
+        commit=commit,
     )
     return {
         "member_id": bundle.member_id,
@@ -255,15 +274,12 @@ def _require_unit(marker: str) -> str:
 # --------------------------------------------------------------------------------------------------
 
 
-def ingest_dataset(con, dataset: str | None = None) -> dict:
-    """Load ``members.json`` for the active dataset, validate every bundle (the firewall check —
-    ``extra='forbid'`` makes a malformed bundle fail loudly), and write each. Returns summary counts.
-
-    Bundles are validated IN FULL before any write: a malformed bundle raises here while the DB is still
-    untouched, rather than after some members have already been committed (``db.replace_member`` is
-    per-member-atomic, so an interleaved validate→write loop would strand a partial set on a bad entry).
-    This makes the dominant failure mode (malformed data) leave no partial state; ``seed_if_empty`` adds
-    the rollback for the rarer write-phase failure on the unattended startup path.
+def ingest_dataset(con, dataset: str | None = None, *, commit: bool = True) -> dict:
+    """Load ``members.json`` for the active dataset, ingest each bundle SKIPPING any buggy row (via
+    ``ingest_members``), and return summary counts (including a ``skipped`` list). An entry that fails its
+    Pydantic shape or the semantic firewall parse is recorded and skipped, not raised — one malformed
+    bundle never aborts the batch. An empty file is still a loud error (below), since a seed dataset must
+    have members.
 
     Reads via the shared ``read_records`` (not a bare ``json.loads``), so a dataset whose ``members.json``
     was persisted by ``POST /members/upload`` in a non-array shape (a single object, JSONL, or BOM-prefixed
@@ -276,40 +292,95 @@ def ingest_dataset(con, dataset: str | None = None) -> dict:
         raise ValueError(
             f"dataset {dataset!r} members.json is empty — nothing to ingest"
         )
-    return ingest_members(con, records)
+    result = ingest_members(con, records, commit=commit)
+    # ``ingest_members`` is lenient (a buggy row is skipped, not fatal) so one bad bundle never aborts a
+    # batch — but on the SEED path (this function backs seed_if_empty / reseed / the CLI) a skipped member
+    # is an ANOMALY the old fail-loud path used to surface. Log it LOUDLY so a partial seed can't read as a
+    # clean success (a fresh instance would otherwise boot missing that member silently, and never re-heal
+    # since the DB is no longer empty). Availability is kept (the good members still seed); the noise is the
+    # fix — a trusted seed dataset is expected to be clean, so any skip warrants operator attention.
+    if result["skipped"]:
+        logger.warning(
+            "ingest_dataset(%r): %d member row(s) skipped as malformed — seeded %d of %d: %s",
+            dataset,
+            len(result["skipped"]),
+            result["members"],
+            len(records),
+            result["skipped"],
+        )
+    return result
 
 
-def ingest_members(con, raw: object) -> dict:
-    """Validate and write a ``members.json``-shaped array of bundles. The shared core of
+def _short_validation_error(e: Exception) -> str:
+    """A compact one-line reason for a skipped member row — the first field:msg of a Pydantic error, or
+    the plain message of a bare ``ValueError`` (e.g. the member_id-mismatch validator)."""
+    if isinstance(e, ValidationError):
+        errs = e.errors()
+        if errs:
+            loc = ".".join(str(p) for p in errs[0].get("loc", ()))
+            return (
+                f"{loc}: {errs[0].get('msg', 'invalid')}"
+                if loc
+                else errs[0].get("msg", "invalid")
+            )
+    return str(e)
+
+
+def ingest_members(con, raw: object, *, commit: bool = True) -> dict:
+    """Write a ``members.json``-shaped array of bundles, SKIPPING any buggy row. The shared core of
     ``ingest_dataset`` (the seed/startup path) and the ``/members/upload`` zip route — both feed it the
-    parsed array. Returns ``{members, results, ranges, member_ids}``; ``member_ids`` lets the uploader
-    focus the picker on what just landed.
+    parsed array. Returns ``{members, results, ranges, member_ids, skipped}``; ``member_ids`` lets the
+    uploader focus the picker on what just landed, and ``skipped`` lists the rows that didn't ingest —
+    each ``{file, row, member_id, detail}`` — so the caller can surface them without failing the upload.
 
-    Two-stage validation, and the partial-set boundary sits between them: every bundle's *Pydantic
-    shape* is checked up front (the list-comp below), so a SHAPE-malformed entry raises while the DB is
-    still untouched — no partial set. But the firewall's *semantic* parse (reference-range shapes,
-    marker-uniqueness) runs per member inside ``ingest_bundle``, which commits as it goes, so a
-    semantically-bad bundle LATE in the array raises only after the earlier members are already written
-    — leaving a partial set. We deliberately do NOT roll that back here: ``ingest_bundle`` *upserts*, so
-    deleting "what this call wrote" could clobber a member that pre-existed the call. The recovery is to
-    re-upload the corrected bundle (idempotent upsert) or reseed. The unattended startup path
-    (``seed_if_empty``) carries its own delete-the-prefix rollback because there it is provably safe (the
-    DB was empty), and that is the one place the partial set must not silently read as 'seeded'."""
+    Lenient by design: a row that fails its *Pydantic shape* OR the firewall's *semantic* parse
+    (reference-range shapes, marker-uniqueness) is recorded in ``skipped`` and the loop moves on, so one
+    malformed bundle never aborts a good batch (the upload's first-record format gate has already
+    confirmed the file is the right kind). ``ingest_bundle`` upserts, so the surviving rows land
+    additively; a skip leaves no partial write for that row (its parse fails before the row's own
+    ``replace_member`` write)."""
     if not isinstance(raw, list):
         raise ValueError(
             "members.json must be a JSON array of member bundles "
             f"(got {type(raw).__name__}); a single bundle goes to POST /members"
         )
-    bundles = [
-        MemberBundle.model_validate(entry) for entry in raw
-    ]  # firewall: validate ALL up front
-    # De-dup by member_id (LAST occurrence wins, matching upsert order): a duplicate id in one upload
-    # would otherwise ingest the same member twice and inflate the reported members/results counts.
-    deduped = list({bundle.member_id: bundle for bundle in bundles}.values())
+    skipped: list[dict] = []
+    # Validate each entry's shape, skipping (not raising on) a bad one. De-dup by member_id (LAST
+    # occurrence wins, matching upsert order) so a duplicate id doesn't inflate the counts.
+    valid: dict[str, tuple[int, MemberBundle]] = {}
+    for i, entry in enumerate(raw):
+        try:
+            bundle = MemberBundle.model_validate(entry)
+        except (ValidationError, ValueError) as e:
+            mid = entry.get("member_id") if isinstance(entry, dict) else None
+            skipped.append(
+                {
+                    "file": CANONICAL_MEMBERS,
+                    "row": i
+                    + 1,  # 1-based record number, consistent with the gate + eval/CSV file lines
+                    "member_id": mid,
+                    "detail": _short_validation_error(e),
+                }
+            )
+            continue
+        valid[bundle.member_id] = (i, bundle)
     member_ids = []
     total_results = 0
-    for bundle in deduped:
-        summary = ingest_bundle(con, bundle)
+    for row_i, bundle in valid.values():
+        try:
+            summary = ingest_bundle(
+                con, bundle, commit=commit
+            )  # semantic parse (ranges) can still raise here
+        except ValueError as e:
+            skipped.append(
+                {
+                    "file": CANONICAL_MEMBERS,
+                    "row": row_i + 1,  # 1-based record number (see the gate above)
+                    "member_id": bundle.member_id,
+                    "detail": str(e),
+                }
+            )
+            continue
         member_ids.append(bundle.member_id)
         total_results += summary["results"]
     n_ranges = len(
@@ -320,16 +391,21 @@ def ingest_members(con, raw: object) -> dict:
         "results": total_results,
         "ranges": n_ranges,
         "member_ids": member_ids,
+        "skipped": skipped,
     }
 
 
 # --------------------------------------------------------------------------------------------------
 # Uploaded-bundle handling — the firewall for a runtime hold-out. The hold-out ships the SAME three
-# kinds of file as `training_data` but the NAMES may differ (e.g. `panel.csv`/`members.json`/`eval.json`,
-# not guaranteed), so discovery is by TYPE/CONTENT, not name. The bundle is classified, its members are
-# ingested through the same `ingest_members` the seed uses, and every file is written to the new dataset
-# folder under its CANONICAL name — so every downstream reader (the seed loader, `members_path`, the eval
-# adapter) stays name-based and UNCHANGED; this upload boundary is the single place a name is normalized.
+# kinds of file as `training_data` and — by contract — the SAME three extensions (`.json` members,
+# `.jsonl` eval set, `.csv` lab panels), even though the base filenames may differ. So the upload
+# REQUIRES exactly one of each extension and FORMAT-GATES THE FIRST RECORD of each file against its
+# expected shape up front (before any side effect) — a first-record failure or a missing/duplicated role
+# 422s here; later rows are NOT gated (a buggy later member row is skipped at ingest, and later eval/CSV
+# rows ride through unchecked). Only then does it ingest the members and write each file to the new dataset
+# folder under its CANONICAL name — so every downstream reader (the seed loader, `members_path`, the
+# eval adapter) stays name-based and UNCHANGED; this upload boundary is the single place a name is
+# normalized. A first-record/role failure is reported at file+row granularity, never a partial load.
 # --------------------------------------------------------------------------------------------------
 
 #: The on-disk names every dataset folder uses, whatever the upload called its files.
@@ -337,15 +413,30 @@ CANONICAL_MEMBERS = "members.json"
 CANONICAL_PANELS = "lab_panels.csv"
 CANONICAL_EVAL = "eval_set.jsonl"
 
-#: The record fields that distinguish a members file from an eval file — bound to ``MemberBundle`` so a
-#: rename of those model fields fails LOUDLY here at import, not silently at every upload (a members
-#: record carries ``profile``/``panels``; an eval case carries ``input``/``category`` and neither).
-_MEMBERS_KEYS = ("profile", "panels")
-if not all(k in MemberBundle.model_fields for k in _MEMBERS_KEYS):
-    raise RuntimeError(
-        f"_MEMBERS_KEYS {_MEMBERS_KEYS} drifted from MemberBundle fields "
-        f"{tuple(MemberBundle.model_fields)} — update the members-file discriminator"
-    )
+#: The exact header the lab-panels CSV must carry, in order (the shape of `training_data/lab_panels.csv`).
+_CSV_COLUMNS: tuple[str, ...] = (
+    "member_id",
+    "panel_id",
+    "collected_date",
+    "analyte",
+    "value",
+    "unit",
+    "reference_range",
+)
+
+
+class BundleValidationError(ValueError):
+    """An uploaded bundle failed validation. Carries ``failures`` — a list of
+    ``{file, row, field, detail}`` dicts so the route can surface each problem at the exact file and
+    row it occurs (``row`` is ``None`` for a whole-file/whole-bundle problem, e.g. a missing file).
+
+    A ``ValueError`` subclass so any caller catching ``ValueError`` still treats it as bad input, but
+    the route matches it FIRST to serialize the structured ``failures`` rather than a flat string."""
+
+    def __init__(self, failures: list[dict]):
+        self.failures = failures
+        n = len(failures)
+        super().__init__(f"bundle validation failed with {n} issue(s)")
 
 
 def read_records(data: bytes) -> list:
@@ -386,15 +477,6 @@ def read_records(data: bytes) -> list:
         # (e.g. the bare "[") and mislead. Otherwise report the JSONL error.
         err = whole_doc_err if head[:1] in (b"[", b"{") else jsonl_err
         raise ValueError(f"not valid JSON or JSONL: {err}") from err
-
-
-def _try_records(data: bytes) -> list | None:
-    """``read_records`` but ``None`` instead of raising — for classification, where a non-JSON file (the
-    lab-panels CSV, a README) is expected and is simply not a JSON role rather than an error."""
-    try:
-        return read_records(data)
-    except ValueError:
-        return None
 
 
 def _open_zip(data: bytes) -> zipfile.ZipFile:
@@ -469,88 +551,324 @@ def _zip_entries(zf: zipfile.ZipFile) -> list[tuple[str, bytes]]:
     return out
 
 
-def _is_members_record(rec: object) -> bool:
-    """Whether a parsed record is a member bundle — it carries the :data:`_MEMBERS_KEYS` (``profile`` +
-    ``panels``). This record SHAPE, not the filename, is what tells the members file from the eval file
-    (the hold-out ships identical schemas under possibly-different names)."""
-    return isinstance(rec, dict) and all(k in rec for k in _MEMBERS_KEYS)
+def _pydantic_failures(exc: ValidationError, file: str, row: int) -> list[dict]:
+    """Flatten a Pydantic ``ValidationError`` into one ``{file, row, field, detail}`` per error, so a
+    record with several bad fields surfaces each one (``field`` is the dotted ``loc`` path, ``""`` for a
+    whole-record/root error). Same shape the file-level and CSV checks emit — one uniform failure list."""
+    out: list[dict] = []
+    for err in exc.errors():
+        loc = ".".join(str(p) for p in err.get("loc", ()))
+        out.append(
+            {
+                "file": file,
+                "row": row,
+                "field": loc,
+                "detail": err.get("msg", "invalid"),
+            }
+        )
+    return out
 
 
-def classify_bundle(
+def _validate_members(data: bytes) -> tuple[list, list[dict]]:
+    """Format-gate the members ``.json`` file on its FIRST record against :class:`MemberBundle` — the
+    SAME model the ingest uses, so the gate can never drift from what actually ingests. Returns
+    ``(records, failures)``: ``records`` is the parsed array (handed forward so ingest doesn't re-parse),
+    ``failures`` is empty when the first record is well-formed, else one entry per bad field on that
+    record (``row`` 0). A file that isn't a JSON array, is empty, or whose FIRST record isn't an object is
+    a whole-file failure (``row=None``). A LATER non-object (or otherwise malformed) row is NOT gated here
+    — it is skipped at ingest time, matching the documented "a buggy later member row is skipped, not
+    fatal" contract (and the same treatment a dict-with-bad-fields later row already gets)."""
+    try:
+        records = read_records(data)  # BOM-tolerant; JSON array or JSONL -> list
+    except ValueError as e:
+        return [], [
+            {"file": CANONICAL_MEMBERS, "row": None, "field": "", "detail": str(e)}
+        ]
+    if not isinstance(records, list):
+        return [], [
+            {
+                "file": CANONICAL_MEMBERS,
+                "row": None,
+                "field": "",
+                "detail": "must be a JSON array of member-bundle objects",
+            }
+        ]
+    if not records:
+        return records, [
+            {
+                "file": CANONICAL_MEMBERS,
+                "row": None,
+                "field": "",
+                "detail": "file has no member records",
+            }
+        ]
+    if not isinstance(records[0], dict):
+        # Gate the FIRST record only (like the eval/CSV gates): a non-object first record means the file is
+        # the wrong KIND. A later non-object row is deliberately NOT fatal here — ingest_members skips it
+        # (its `isinstance(entry, dict)` guard + MemberBundle.model_validate raising), so a non-dict late row
+        # and a dict-with-bad-fields late row are treated the SAME (both skipped), not opposite outcomes.
+        return records, [
+            {
+                "file": CANONICAL_MEMBERS,
+                "row": None,
+                "field": "",
+                "detail": "must be a JSON array of member-bundle objects",
+            }
+        ]
+    try:
+        MemberBundle.model_validate(records[0])  # gate on the FIRST record only
+    except ValidationError as e:
+        # Row numbers are 1-BASED (record 1 = first member), matching the 1-based file-line numbering the
+        # eval (`start=1`) and CSV (header = row 1) gates emit — so a mixed 422 doesn't put "members.json
+        # row 0" beside "eval_set.jsonl row 1" for what is the first record of each file.
+        return records, _pydantic_failures(e, CANONICAL_MEMBERS, 1)
+    except (
+        ValueError
+    ) as e:  # model_validator (member_id mismatch) raises a bare ValueError
+        return records, [
+            {"file": CANONICAL_MEMBERS, "row": 1, "field": "", "detail": str(e)}
+        ]
+    return records, []
+
+
+def _validate_eval(data: bytes) -> list[dict]:
+    """Format-gate the eval ``.jsonl`` file on its FIRST record against :class:`EvalCaseInput`. Returns
+    ``[]`` when the first non-blank line is well-formed, else the failure(s) for that line — ``row`` is
+    the true 1-based FILE line number the operator can open to. BOM-tolerant on the first line; an empty
+    file is a whole-file failure (``row=None``)."""
+    if data[:3] == b"\xef\xbb\xbf":
+        data = data[3:]
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        return [
+            {
+                "file": CANONICAL_EVAL,
+                "row": None,
+                "field": "",
+                "detail": f"not valid UTF-8: {e}",
+            }
+        ]
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError as e:
+            return [
+                {
+                    "file": CANONICAL_EVAL,
+                    "row": lineno,
+                    "field": "",
+                    "detail": f"not valid JSON: {e}",
+                }
+            ]
+        try:
+            EvalCaseInput.model_validate(rec)
+        except ValidationError as e:
+            return _pydantic_failures(e, CANONICAL_EVAL, lineno)
+        return []  # first non-blank line gated; the rest ride opaquely
+    return [
+        {"file": CANONICAL_EVAL, "row": None, "field": "", "detail": "file is empty"}
+    ]
+
+
+def _validate_panels_csv(data: bytes) -> list[dict]:
+    """Format-gate the lab-panels ``.csv`` file against the shape of ``training_data/lab_panels.csv``:
+    the exact header :data:`_CSV_COLUMNS`, then its FIRST data row — ``value`` numeric, ``reference_range``
+    parseable by the SAME :func:`parse_reference_range` the ingest uses (so 'valid range' means exactly
+    'a range the system can parse'), a well-formed ``collected_date`` (``YYYY-MM-DD``), and non-empty
+    ``member_id``/``panel_id``/``analyte``/``unit``. ``row`` is the 1-based FILE line (header is line 1;
+    the first data row is line 2), and ``field`` names the offending column. Later rows are not gated."""
+    if data[:3] == b"\xef\xbb\xbf":
+        data = data[3:]
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        return [
+            {
+                "file": CANONICAL_PANELS,
+                "row": None,
+                "field": "",
+                "detail": f"not valid UTF-8: {e}",
+            }
+        ]
+    reader = csv.reader(io.StringIO(text))
+    try:
+        header = next(reader)
+    except StopIteration:
+        return [
+            {
+                "file": CANONICAL_PANELS,
+                "row": None,
+                "field": "",
+                "detail": "file is empty",
+            }
+        ]
+    if [c.strip() for c in header] != list(_CSV_COLUMNS):
+        return [
+            {
+                "file": CANONICAL_PANELS,
+                "row": 1,
+                "field": "",
+                "detail": f"header must be exactly {','.join(_CSV_COLUMNS)} (got {','.join(header)})",
+            }
+        ]
+    ncols = len(_CSV_COLUMNS)
+    for lineno, cells in enumerate(reader, start=2):
+        if not any(c.strip() for c in cells):
+            continue  # skip blank lines to reach the first real data row
+        return _check_csv_row(cells, lineno, ncols)  # gate on the FIRST data row only
+    return [
+        {
+            "file": CANONICAL_PANELS,
+            "row": None,
+            "field": "",
+            "detail": "file has a header but no data rows",
+        }
+    ]
+
+
+def _check_csv_row(cells: list[str], lineno: int, ncols: int) -> list[dict]:
+    """The per-row CSV format checks, factored out so the gate (first row) reads them once."""
+    if len(cells) != ncols:
+        return [
+            {
+                "file": CANONICAL_PANELS,
+                "row": lineno,
+                "field": "",
+                "detail": f"expected {ncols} columns, got {len(cells)}",
+            }
+        ]
+    row = dict(
+        zip(_CSV_COLUMNS, cells, strict=True)
+    )  # lengths verified equal just above
+    failures: list[dict] = []
+    for col in ("member_id", "panel_id", "analyte", "unit"):
+        if not row[col].strip():
+            failures.append(
+                {
+                    "file": CANONICAL_PANELS,
+                    "row": lineno,
+                    "field": col,
+                    "detail": f"{col} must not be empty",
+                }
+            )
+    try:
+        float(row["value"])
+    except ValueError:
+        failures.append(
+            {
+                "file": CANONICAL_PANELS,
+                "row": lineno,
+                "field": "value",
+                "detail": f"value {row['value']!r} is not numeric",
+            }
+        )
+    try:
+        datetime.date.fromisoformat(row["collected_date"].strip())
+    except ValueError:
+        failures.append(
+            {
+                "file": CANONICAL_PANELS,
+                "row": lineno,
+                "field": "collected_date",
+                "detail": f"collected_date {row['collected_date']!r} is not an ISO date (YYYY-MM-DD)",
+            }
+        )
+    try:
+        parse_reference_range(row["reference_range"], row["analyte"])
+    except ValueError:
+        failures.append(
+            {
+                "file": CANONICAL_PANELS,
+                "row": lineno,
+                "field": "reference_range",
+                "detail": f"reference_range {row['reference_range']!r} is not a recognized range",
+            }
+        )
+    return failures
+
+
+#: How the three required roles are bucketed — by file EXTENSION (the hold-out ships stable extensions,
+#: only the base names differ), each mapped to its canonical on-disk name.
+_ROLE_BY_EXT: dict[str, str] = {
+    ".json": CANONICAL_MEMBERS,
+    ".jsonl": CANONICAL_EVAL,
+    ".csv": CANONICAL_PANELS,
+}
+
+
+def validate_bundle(
     entries: list[tuple[str, bytes]],
 ) -> tuple[dict[str, bytes], list, list[tuple[str, bytes]]]:
-    """Resolve the dataset's roles by TYPE/CONTENT (not filename). Returns
-    ``(canonical, members_records, extras)``:
+    """Validate an uploaded bundle and resolve its roles by EXTENSION. Returns
+    ``(canonical, members_records, extras)`` on success:
 
-      * ``canonical`` maps the CANONICAL on-disk name -> uploaded bytes: ``members.json`` (always),
-        ``lab_panels.csv`` and ``eval_set.jsonl`` (if present);
+      * ``canonical`` maps each CANONICAL on-disk name -> uploaded bytes: ``members.json`` (from the
+        ``.json``), ``eval_set.jsonl`` (from the ``.jsonl``), ``lab_panels.csv`` (from the ``.csv``);
       * ``members_records`` is the members file ALREADY PARSED (so the caller ingests without re-parsing);
-      * ``extras`` are any other files (e.g. a README), kept verbatim.
+      * ``extras`` are any other files (e.g. a ``README.md``), kept verbatim.
 
-    Each file is sniffed ONCE with :func:`_try_records`: a file that parses as JSON array/JSONL with
-    dict records is a JSON role (the one that's members-shaped is the members file; another is the eval
-    set), and a file that doesn't parse as JSON is a non-JSON role (the ``.csv`` is the lab panels, the
-    rest are extras). Discovery is by content + extension HINT for the CSV only — never by the members
-    file being literally named ``members.json``. Roles are tracked by INDEX, so duplicate entry names in
-    the zip never cause a file to be silently dropped.
+    REQUIRES exactly one ``.json``, one ``.jsonl``, and one ``.csv`` — a missing OR duplicated extension
+    is a failure. Then the FIRST record of each file is format-gated against its expected shape
+    (:class:`MemberBundle`, :class:`EvalCaseInput`, and the CSV schema) — a cheap "is this the right kind
+    of file" check, not a whole-file scan; a buggy LATER member row is skipped at ingest time, not
+    rejected here. Problems across all three files are collected, and on ANY failure this raises
+    :class:`BundleValidationError` carrying them at file+row granularity — with NO side effect (the caller
+    has not yet created the folder or written a DB row)."""
+    buckets: dict[str, list[tuple[str, bytes]]] = {ext: [] for ext in _ROLE_BY_EXT}
+    extras: list[tuple[str, bytes]] = []
+    for name, payload in entries:
+        ext = pathlib.PurePosixPath(name.lower()).suffix
+        if ext in buckets:
+            buckets[ext].append((name, payload))
+        else:
+            extras.append((name, payload))
 
-    Rejects (``ValueError``, NO partial load) a bundle that can't resolve: zero or several members-shaped
-    JSON files, more than one eval-shaped JSON, or more than one CSV. The **members file is the only hard
-    requirement** (it alone is ingested); panels/eval are optional and a README is tolerated."""
-    sniffed = [(n, b, _try_records(b)) for (n, b) in entries]
+    failures: list[dict] = []
+    for ext, canon in _ROLE_BY_EXT.items():
+        n = len(buckets[ext])
+        if n == 0:
+            failures.append(
+                {
+                    "file": canon,
+                    "row": None,
+                    "field": "",
+                    "detail": f"bundle is missing its {ext} file",
+                }
+            )
+        elif n > 1:
+            names = [nm for nm, _ in buckets[ext]]
+            failures.append(
+                {
+                    "file": canon,
+                    "row": None,
+                    "field": "",
+                    "detail": f"expected exactly one {ext} file, found {n}: {names}",
+                }
+            )
 
-    def _first_dict(recs: list | None) -> dict | None:
-        """The file's first record iff it's a JSON file of dict records, else None — the clean
-        (type-narrowing) basis for routing a JSON file by shape; a CSV/README has ``recs is None``."""
-        return recs[0] if recs and isinstance(recs[0], dict) else None
+    # Missing/duplicate roles make row validation ambiguous — report the structural failure and stop.
+    if failures:
+        raise BundleValidationError(failures)
 
-    members_idx = [
-        i
-        for i, (_, _, recs) in enumerate(sniffed)
-        if _is_members_record(_first_dict(recs))
-    ]
-    if len(members_idx) != 1:
-        raise ValueError(
-            f"could not identify the members file: expected exactly one JSON whose records carry "
-            f"{list(_MEMBERS_KEYS)}, found {len(members_idx)} "
-            f"(files seen: {[n for n, _, _ in sniffed] or 'none'})"
-        )
-    mi = members_idx[0]
-    members_records = (
-        sniffed[mi][2] or []
-    )  # non-None by the members_idx filter; `or []` narrows the type
-    canonical: dict[str, bytes] = {CANONICAL_MEMBERS: sniffed[mi][1]}
+    members_bytes = buckets[".json"][0][1]
+    eval_bytes = buckets[".jsonl"][0][1]
+    csv_bytes = buckets[".csv"][0][1]
 
-    eval_idx = [
-        i
-        for i, (_, _, recs) in enumerate(sniffed)
-        if i != mi
-        and (r := _first_dict(recs)) is not None
-        and not _is_members_record(r)
-    ]
-    if len(eval_idx) > 1:
-        raise ValueError(
-            f"ambiguous bundle: {len(eval_idx)} eval-shaped JSON files, expected one "
-            f"({[sniffed[i][0] for i in eval_idx]})"
-        )
-    if eval_idx:
-        canonical[CANONICAL_EVAL] = sniffed[eval_idx[0]][1]
+    members_records, member_failures = _validate_members(members_bytes)
+    failures.extend(member_failures)
+    failures.extend(_validate_eval(eval_bytes))
+    failures.extend(_validate_panels_csv(csv_bytes))
+    if failures:
+        raise BundleValidationError(failures)
 
-    csv_idx = [
-        i
-        for i, (n, _, recs) in enumerate(sniffed)
-        if i != mi and recs is None and n.lower().endswith(".csv")
-    ]
-    if len(csv_idx) > 1:
-        raise ValueError(
-            f"ambiguous bundle: {len(csv_idx)} CSV files, expected one lab-panels CSV "
-            f"({[sniffed[i][0] for i in csv_idx]})"
-        )
-    if csv_idx:
-        canonical[CANONICAL_PANELS] = sniffed[csv_idx[0]][1]
-
-    claimed = {mi, *eval_idx, *csv_idx}
-    extras = [(n, b) for i, (n, b, _) in enumerate(sniffed) if i not in claimed]
+    canonical = {
+        CANONICAL_MEMBERS: members_bytes,
+        CANONICAL_EVAL: eval_bytes,
+        CANONICAL_PANELS: csv_bytes,
+    }
     return canonical, members_records, extras
 
 
@@ -588,16 +906,23 @@ def _write_dataset_folder(
 def ingest_uploaded_dataset(
     con, *, data: bytes, filename: str | None, name: str | None
 ) -> dict:
-    """The ``POST /members/upload`` firewall: classify an uploaded hold-out bundle by type/content, ingest
-    its members ADDITIVELY, and persist the whole bundle as a new dataset folder under the datasets root.
+    """The ``POST /members/upload`` firewall: format-gate the FIRST record of each file in an uploaded
+    hold-out bundle, ingest its members ADDITIVELY, and persist the whole bundle as a new dataset folder
+    under the datasets root.
 
-    Accepts a ``.zip`` of a ``training_data``-shaped folder — one CSV (lab panels) + the members JSON +
-    an optional eval JSON, under ANY filenames — or a bare members-shaped ``.json``. Order is deliberate
-    so a failure leaves the cleanest state (the spec's "no partial load"):
+    Accepts ONLY a ``.zip`` of a ``training_data``-shaped folder that carries exactly three files by
+    EXTENSION — one ``.json`` (members), one ``.jsonl`` (eval set), one ``.csv`` (lab panels), under ANY
+    base names — plus optional extras (e.g. a ``README.md``). Order is deliberate so a failure leaves the
+    cleanest state (the spec's "no partial load"):
 
       1. Read the bundle (zip -> entries, with zip-slip + per-entry read errors mapped to a clean
-         ``ValueError`` here; or the bare file) and ``classify_bundle`` it by content. An unreadable zip
-         or unresolvable bundle raises HERE, before ANY side effect — so it ingests nothing.
+         ``ValueError`` here) and ``validate_bundle`` it: require the three roles by extension AND
+         FORMAT-GATE THE FIRST RECORD of each against its expected shape (a whole-file scan is NOT run — see
+         ``validate_bundle``). A bad zip, a missing/duplicated role, or a first-record format failure raises
+         HERE (``BundleValidationError`` carrying file+row detail), before ANY side effect — so it ingests
+         nothing and writes no folder. Later rows are NOT gated here: a buggy later MEMBER row is skipped at
+         ingest (step 3, returned in ``skipped``), and later eval/CSV rows ride through unchecked (a bad one
+         surfaces only when that file is later consumed, e.g. ``DATASET=<name> make eval``).
       2. ``create_dataset_dir`` — ``mkdir(exist_ok=False)`` atomically RESERVES the folder name BEFORE the
          DB write. This is the single collision check (it matches what it creates — no ``is_dir`` vs
          ``mkdir`` drift), so a name that clashes with an existing dataset OR an existing file (e.g.
@@ -609,23 +934,30 @@ def ingest_uploaded_dataset(
          reserved folder is removed so the name stays free for a clean retry. The only residual
          side-effect-on-failure is the documented per-member semantic caveat in ``ingest_members``.
 
-    The persisted ``eval_set.jsonl`` / ``lab_panels.csv`` are stored opaquely for later live use (e.g.
-    ``DATASET=<name> make eval``); their CONTENTS are validated only when consumed, not here. Returns
+    The persisted ``eval_set.jsonl`` / ``lab_panels.csv`` are first-record format-gated here (step 1), then
+    kept for later live use (e.g. ``DATASET=<name> make eval``). Returns
     ``{dataset, members, results, ranges, member_ids, files}``; the route adds the auto-scan."""
     dataset = derive_dataset_name(name, filename)
 
     is_zip = (filename or "").lower().endswith(".zip") or data[:2] == b"PK"
-    if is_zip:
-        entries = _zip_entries(
-            _open_zip(data)
-        )  # bad/odd zip + zip-slip -> ValueError, no side effect
-    else:
-        bare_name = pathlib.PurePosixPath(filename or "").name or CANONICAL_MEMBERS
-        entries = [(bare_name, data)]
+    if not is_zip:
+        raise BundleValidationError(
+            [
+                {
+                    "file": None,
+                    "row": None,
+                    "field": "",
+                    "detail": "upload must be a .zip containing a .json (members), a .jsonl (eval set), and a .csv (lab panels)",
+                }
+            ]
+        )
+    entries = _zip_entries(
+        _open_zip(data)
+    )  # bad/odd zip + zip-slip -> ValueError, no side effect
 
-    canonical, members_records, extras = classify_bundle(
+    canonical, members_records, extras = validate_bundle(
         entries
-    )  # by content, BEFORE any side effect
+    )  # roles by extension + per-row format, BEFORE any side effect
 
     dest = create_dataset_dir(
         dataset
@@ -635,6 +967,32 @@ def ingest_uploaded_dataset(
         summary = ingest_members(
             con, members_records
         )  # DB write LAST; semantic-partial caveat only
+        if summary["members"] == 0:
+            # Every member row was skipped — all shape-valid at the first-record gate but semantically bad at
+            # ingest (e.g. an unparseable reference_range on every row). An upload that ingests NOBODY is a
+            # failed upload, not a 200 with an orphan folder: raise so the reserved folder is rolled back
+            # below and the route 422s with the per-row detail, rather than persisting an empty dataset that
+            # only 409s on retry. ``members_records`` is non-empty here (the gate rejects an empty file), so
+            # members==0 ⟺ every row skipped ⟺ ``skipped`` is populated; the fallback is purely defensive.
+            raise BundleValidationError(
+                [
+                    {
+                        "file": s["file"],
+                        "row": s["row"],
+                        "field": "",
+                        "detail": f"member {s['member_id']!r}: {s['detail']}",
+                    }
+                    for s in summary["skipped"]
+                ]
+                or [
+                    {
+                        "file": CANONICAL_MEMBERS,
+                        "row": None,
+                        "field": "",
+                        "detail": "no members were ingested from the bundle",
+                    }
+                ]
+            )
     except Exception:
         shutil.rmtree(dest, ignore_errors=True)  # leave the name free for a clean retry
         raise

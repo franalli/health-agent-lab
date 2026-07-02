@@ -117,11 +117,13 @@ def _to_case(rec: dict) -> Case:
 def load_supplied_cases(dataset: str | None = None) -> list[Case]:
     """Parse ``<dataset>/eval_set.jsonl`` into ``Case``s.
 
-    The eval set is now OPTIONAL on an uploaded dataset (a members-only upload creates a dataset folder
-    with no eval file), so a MISSING file is an empty supplied set (``[]``), not a crash. When present it
-    is read via the shared ``read_records`` — SHAPE-AGNOSTIC (a seeded dataset ships JSONL; an uploaded
-    hold-out's eval file may have arrived as a JSON **array**, kept verbatim under the canonical name) and
-    BOM-tolerant. A record missing a required field becomes a clear ``ValueError`` naming it, not a raw
+    A MISSING eval file is a defensive empty supplied set (``[]``), not a crash — an upload now requires
+    an ``eval_set.jsonl`` (so an uploaded dataset always has one), but a dataset assembled another way may
+    not, and the harness must degrade rather than throw. When present it is read via the shared
+    ``read_records``, which stays SHAPE-AGNOSTIC (a JSON array OR JSONL) and BOM-tolerant — defensive
+    breadth for a dataset assembled by hand, though the upload path now format-gates the eval role as
+    line-delimited JSON objects (``ingest._validate_eval``), so an UPLOADED eval file is always JSONL, not a
+    JSON array. A record missing a required field becomes a clear ``ValueError`` naming it, not a raw
     ``KeyError`` that aborts the run with no context."""
     path = dataset_dir(dataset) / "eval_set.jsonl"
     if not path.exists():

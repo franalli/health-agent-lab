@@ -47,6 +47,7 @@ from health_intelligence.llm import LLMParseError, LLMUnavailable, LLMUsage
 from health_intelligence.models import (
     SEVERITY_ORDER,
     ComposeDraft,
+    ConversationTurn,
     FloorLevel,
     HealthIntelligenceResponse,
     MarkerTrajectory,
@@ -128,6 +129,9 @@ def scan(con: sqlite3.Connection, member_id: str) -> list[Observation]:
     kept_ids: set[str] = (
         set()
     )  # the observation rows this scan keeps (the rest are pruned below)
+    live_esc_ids: set[str] = (
+        set()
+    )  # the escalation rows this scan (re-)emitted — the live findings the reconcile keeps 'open'
     with con:  # atomic: interaction + observation + escalation per finding commit (or roll back) together
         for traj in raised:
             response_id = db._det_id("scan:", member_id, traj.marker, data_version)
@@ -179,11 +183,16 @@ def scan(con: sqlite3.Connection, member_id: str) -> list[Observation]:
                     sex=member.sex,
                     age=age,
                 )
+                dedup_key = f"data:{member_id}:{traj.marker}:{marker_version}"
+                # Record the escalation identity this scan emits, so the reconcile below keeps the CURRENT
+                # findings 'open' and supersedes a stale-marker_version clinician_review twin (urgent is
+                # never superseded regardless — see reconcile_escalation_status).
+                live_esc_ids.add(db._det_id("esc:", dedup_key))
                 db._insert_escalation(
                     con,
                     member_id=member_id,
                     kind="data_finding",
-                    dedup_key=f"data:{member_id}:{traj.marker}:{marker_version}",
+                    dedup_key=dedup_key,
                     level=level,
                     observation_id=obs_id,
                     trigger_reason=trigger_reason,
@@ -197,7 +206,18 @@ def scan(con: sqlite3.Connection, member_id: str) -> list[Observation]:
         # never a blanket delete.
         db.prune_observations(con, member_id, data_version, kept_ids)
 
-    return db.get_observations(con, member_id, data_version=data_version)
+        # Escalation-queue peer of the prune (§720 lifecycle): a CLINICIAN_REVIEW data_finding this scan did
+        # NOT re-emit — its marker was cleared by an override, or it's a stale-marker_version twin — flips to
+        # 'superseded' (off the active GET /escalations queue, row KEPT for audit). Symmetric: removing the
+        # override re-raises the marker and re-emits (re-opens) it. An 'urgent' escalation is NEVER superseded
+        # (a fired urgent stays queued until a human resolves it — never trade that for de-duplicating a
+        # still-urgent range_override twin, which stays as a safe-direction over-show).
+        db.reconcile_escalation_status(con, member_id, data_version, live_esc_ids)
+
+    # Return the same read projection GET /observations serves (member_explanation derived at read),
+    # so a client that renders the scan response directly gets the member-facing prose too — the raw
+    # stored rows carry only trigger_reason, and an empty member_explanation renders as a blank card.
+    return observations(con, member_id)
 
 
 def observations(con: sqlite3.Connection, member_id: str) -> list[Observation]:
@@ -232,6 +252,12 @@ def observations(con: sqlite3.Connection, member_id: str) -> list[Observation]:
         )
         for traj in _raised_ranked(analysis)
     }
+    # A stored observation whose marker is NO LONGER raised (its obs_id isn't in the live raised set) is a
+    # STALE finding kept only by the escalation RESTRICT FK after a /feedback override cleared it (Finder E2):
+    # HIDE it, so the member panel matches the live analysis + the Trajectory tab (and the clinician queue,
+    # whose escalation the reconcile superseded) instead of a card with a blank explanation. The DB row is
+    # still KEPT (FK + audit); only this member-facing projection drops it. A currently-raised finding is
+    # always in `by_id`, so this never hides an active finding (safe direction).
     return [
         o.model_copy(
             update={
@@ -240,9 +266,8 @@ def observations(con: sqlite3.Connection, member_id: str) -> list[Observation]:
                 )
             }
         )
-        if o.observation_id in by_id
-        else o
         for o in rows
+        if o.observation_id in by_id
     ]
 
 
@@ -517,11 +542,18 @@ _SAFETY_TEMPLATES = {
 }
 
 
+#: Cap on replayed prior turns fed to the composer — the last 10 member+assistant exchanges (20 turns).
+#: The history is UNTRUSTED client-authored prose (no server conversation store); this bounds the
+#: prompt cost/storage of the field regardless of what the client sends. The gate never sees it.
+MAX_HISTORY_TURNS = 20
+
+
 def ask(
     con: sqlite3.Connection,
     member_id: str,
     message: str,
     *,
+    history: list[ConversationTurn] | None = None,
     provider: llm.Provider | None = None,
 ) -> HealthIntelligenceResponse:
     """One grounded Mode-2 turn. ``gate`` classifies the raw message and sets a message floor; the turn
@@ -531,9 +563,18 @@ def ask(
     Fails SAFE: gate down -> ``couldnt_route`` template at ``clinician_review``; compose down -> a
     deterministic grounded answer at the data floor. Raises ``KeyError`` if the member is absent.
 
+    ``history`` is the prior turns of this chat (client-replayed; there is no server conversation store),
+    threaded into the composer ONLY — capped to the most-recent ``MAX_HISTORY_TURNS`` and rendered as
+    `<conversation_history>` so a short follow-up resolves against what was said. It is deliberately NOT
+    fed to the gate: safety is classified per-message so a benign follow-up after a crisis turn can only
+    RAISE the floor via its own analysis, never inherit a diluted route. History never touches the
+    analysis or the floor — the one law holds (documented gap: a crisis stated only in a *prior* turn is
+    not re-detected on a benign follow-up).
+
     ``provider`` is the LLM seam — defaults to the Anthropic provider; tests inject a fake so the whole
     path runs offline. A clock is used (created_at, the day-scoped dedup key, latency) — fine here; only
     ``analysis.py`` is clock-free."""
+    history = list(history or ())[-MAX_HISTORY_TURNS:]
     start = time.perf_counter()
     now = datetime.now(UTC)
     now_iso = now.isoformat()
@@ -584,6 +625,7 @@ def ask(
                 floor=floor,
                 message=message,
                 preferences=db.get_active_preferences(con, member_id),
+                history=history,
             )
             draft, compose_usage = llm.compose(
                 ctx, prompt_text=prompt_text, provider=provider
@@ -594,12 +636,25 @@ def ask(
         except LLMParseError as e:
             # malformed/refused/truncated output that survived the retry -> grounded fallback below.
             # Count the tokens those attempts still billed so the cost stamp isn't an undercount.
+            # Log it: the degrade is otherwise invisible — a fallback answer is indistinguishable on
+            # screen from a real compose, so a silent throw reads as a quality regression (see the
+            # "follow-up loses context" investigation — it was a transient degrade, not context loss).
+            logging.warning(
+                "ask: compose parse-failed for member %s -> grounded fallback: %s",
+                member_id,
+                e,
+            )
             if e.usage is not None:
                 usages.append(e.usage)
             draft = None
         except LLMUnavailable as e:
             # provider down -> grounded fallback. Mode 2 NEVER 500s; it fails safe (§6). A parse-fail-
             # then-unavailable retry carries the first attempt's billed tokens here -> still count them.
+            logging.warning(
+                "ask: compose unavailable for member %s -> grounded fallback: %s",
+                member_id,
+                e,
+            )
             if e.usage is not None:
                 usages.append(e.usage)
             draft = None
@@ -653,6 +708,12 @@ def ask(
     resp = safety.validate(resp, floor)
 
     # Atomic: the audit interaction + the clinician-queue escalation commit (or roll back) together.
+    # DELIBERATE: only the current ``message`` is persisted, NOT ``history``. History is client-replayed
+    # (the "no server conversation store" design), so it is untrusted and ephemeral — storing it would put
+    # unbounded, unverified client text in the audit trail and contradict that design. Accepted tradeoff:
+    # the stored answer reflects context (history) that isn't reconstructable server-side. The safety-
+    # relevant inputs ARE durable and reproducible — analysis (``data_version``), floor, gate route
+    # (``trigger_reason``), and prompt (``prompt_version``) — none of which history can influence.
     with con:
         db.write_interaction(
             con,

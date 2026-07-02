@@ -176,10 +176,63 @@ class MemberBundle(_IngestModel):
         return self
 
 
-class AskRequest(BaseModel):
-    """The thin wire body for POST /members/{id}/ask."""
+class EvalCaseInput(_IngestModel):
+    """One labeled eval case as the supplied ``eval_set.jsonl`` prints it — the exact row format an
+    uploaded bundle's ``.jsonl`` file must match. ``extra='forbid'`` (via ``_IngestModel``) makes a
+    mistyped or added key a clear per-row validation error; the upload doubles as the format check.
 
-    message: str
+    The free-text ``category`` and ``escalation_expected`` are validated as strings, NOT enums: the
+    supplied set ships many phrasings ('routine clinician workup', 'defer to clinician', 'low', …) and
+    the harness's ``eval.adapter.normalize_escalation`` owns the mapping at consume-time. All eight
+    fields are required — every row in ``training_data/eval_set.jsonl`` carries them, so 'exactly the
+    expected format' means none may be omitted."""
+
+    id: str
+    member_id: str
+    category: str
+    input: str
+    expected_behavior: str
+    must_include: list[str]
+    must_not: list[str]
+    escalation_expected: str
+
+
+class ConversationTurn(BaseModel):
+    """One prior chat turn the client replays for multi-turn context. UNTRUSTED and client-authored —
+    there is no server-side conversation store, so a client can send arbitrary ``assistant`` turns. It
+    only ever reaches the composer as prose *context*, never the analysis or the floor: the escalation
+    floor is computed from the member's real analysis + the gate on the current message, and any marker
+    the composer cites is re-grounded against the live analysis (an uncited/hallucinated marker is
+    dropped). ``content`` is length-bounded (untrusted body, same concern as the feedback field)."""
+
+    role: Literal["user", "assistant"]
+    #: 8000 chars is ABOVE the composer's own ceiling (COMPOSE_MAX_TOKENS=2048 ≈ ~7600 chars): a prior
+    #: ASSISTANT turn is a replayed composer answer, so a smaller cap would 422 the *next* turn whenever
+    #: turn 1 was substantive (breaking multi-turn). Still bounds an untrusted item (same concern as the
+    #: feedback field). `min_length=1` rejects an empty turn.
+    content: str = Field(min_length=1, max_length=8000)
+
+
+class AskRequest(BaseModel):
+    """The thin wire body for POST /members/{id}/ask. ``history`` is the last few prior turns the client
+    replays for multi-turn context (oldest first, excluding the current ``message``); the pipeline keeps
+    only the most-recent ``MAX_HISTORY_TURNS`` (see ``pipeline.ask``).
+
+    ``message`` shares BOTH bounds with ``ConversationTurn.content`` (``min_length=1``, ``max_length=8000``)
+    on purpose: the client replays a prior message back as a ``user`` history turn, so an accepted message
+    must be replayable. A smaller/absent max let a >cap message 422 every *following* turn; and — the
+    ``min_length`` half — an ACCEPTED empty message (turn 1) could not be replayed (``content`` requires
+    ``min_length=1``), 422-ing every following turn just the same. Rejecting it here keeps the two symmetric.
+
+    ``history`` has ``max_length=40`` — headroom over the 20-turn slice (a legitimate client is never
+    rejected) that bounds the VALIDATED history and therefore the PROMPT. It is NOT a memory-DoS guard:
+    Starlette reads the whole request body and ``json.loads`` materializes the raw array before Pydantic's
+    ``max_length`` fires, so a hostile body of arbitrary size is still parsed into memory first (no HTTP
+    body-size limit is configured — the same exposure architecture.md §720 defers on ``POST /members/
+    upload`` until auth lands)."""
+
+    message: str = Field(min_length=1, max_length=8000)
+    history: list[ConversationTurn] = Field(default_factory=list, max_length=40)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -372,6 +425,11 @@ class Escalation(BaseModel):
     interaction_id: str | None = None
     trigger_reason: str
     created_at: str
+    #: Lifecycle (Phase-7 §720). 'open' = on the active clinician queue; 'superseded' = a re-scan found the
+    #: finding cleared (e.g. a /feedback override removed the flag) — off the active queue but KEPT for audit.
+    #: Set by the scan's reconcile (db.reconcile_escalation_status), symmetric. An 'urgent' escalation is
+    #: NEVER superseded (only 'clinician_review' auto-clears — safety). Defaults 'open' (freshly emitted).
+    status: Literal["open", "superseded"] = "open"
 
 
 # --------------------------------------------------------------------------------------------------
@@ -382,7 +440,11 @@ class Escalation(BaseModel):
 
 class Feedback(BaseModel):
     """A correction (range_override / suppress_marker / preference) or a signal (helpful / incorrect /
-    escalation_accept|reject). ``target`` is a marker (overrides) or finding_id (signals)."""
+    escalation_accept|reject). ``target`` is a marker key (corrections) or a finding reference (signals);
+    the operator UI sources both from dropdowns — markers from the member's trajectory, findings from the
+    current observations — so a non-matching target (200-but-silently-inert) can't be stored. ``learn.py``
+    does not read a signal's target (it is audit/provenance only); only the correction kinds resolve their
+    target into the analysis (``db.resolve_overrides``)."""
 
     kind: FeedbackKind
     target: str | None = None
@@ -417,9 +479,15 @@ class ComposeDraft(BaseModel):
     "HbA1c", "systolic_bp") the answer drew on; ``pipeline`` resolves each to a code-built ``Finding`` +
     ``Evidence`` from the ``TrajectoryAnalysis`` and drops any key not in the member's data (a fabricated
     marker can never produce an evidence chip). ``escalation`` is deliberately absent — it is the
-    deterministic floor's to set, never the model's."""
+    deterministic floor's to set, never the model's.
 
-    answer: str
+    ``answer`` is ``min_length=1``: an empty answer is never a valid response, and this makes a leaked-
+    empty tool call FAIL validation → ``LLMParseError`` → the deterministic grounded fallback (never a
+    blank member message). Repair of a leaked tool envelope / a dropped ``answer_disposition`` in the raw
+    model output is PROVIDER-TRANSPORT concern and lives at the ``llm.py`` seam (``repair_compose_output``,
+    applied to the tool ``block.input`` before this validates) — this module stays pure declaration."""
+
+    answer: str = Field(min_length=1)
     uncertainty: str | None = None
     answer_disposition: AnswerDisposition
     cited_markers: list[str] = Field(default_factory=list)

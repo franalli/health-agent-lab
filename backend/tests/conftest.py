@@ -23,7 +23,16 @@ class FakeProvider:
         self.calls: list[SimpleNamespace] = []
 
     def structured(
-        self, *, model, system, user, schema, max_tokens, tool_name, tool_description
+        self,
+        *,
+        model,
+        system,
+        user,
+        schema,
+        max_tokens,
+        tool_name,
+        tool_description,
+        repair=None,  # accepted for Provider-parity; the scripted result is already a clean instance
     ):
         self.calls.append(
             SimpleNamespace(

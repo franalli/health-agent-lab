@@ -42,9 +42,11 @@ _CHILD_TABLES = [
 
 def _reset_and_seed() -> None:
     """Fresh schema + the 15-member training dataset on the file the app reads. reference_ranges are
-    global (upserted by range_id), so they need no wipe."""
+    global (upserted by range_id), so they need no wipe. ``prompt_versions`` IS wiped so each test is a
+    true cold start (an empty learning store) — the app's lifespan then re-seeds v0, exactly like a fresh
+    deploy, which is what ``test_cold_start_seeds_the_v0_baseline_prompt`` pins."""
     con = fresh_con(_DB_FILE)
-    for t in [*_CHILD_TABLES, "members"]:
+    for t in [*_CHILD_TABLES, "members", "prompt_versions"]:
         con.execute(f"DELETE FROM {t}")
     con.commit()
     ingest_dataset(con)
@@ -72,6 +74,49 @@ def test_get_members_projection(client):
     assert ids == sorted(ids)  # ordered by id
     c01 = next(m for m in body if m["member_id"] == "C01")
     assert c01["age"] == 46 and c01["sex"] == "male"
+
+
+# ---- GET /escalations (global triage queue) -------------------------------------------------------
+
+
+def test_global_escalations_queue_spans_members_worst_first(client):
+    """The cross-member worklist: scanning C07 (panic K+ -> urgent) and C01 (an adverse trend ->
+    clinician_review) must both surface in ONE global read, the urgent ranked ahead. This is the
+    property a per-member route structurally can't deliver (you'd have to know C07 to look)."""
+    client.post("/members/C07/scan")  # -> urgent
+    client.post("/members/C01/scan")  # -> clinician_review
+
+    r = client.get("/escalations")
+    assert r.status_code == 200
+    queue = r.json()
+    members = {e["member_id"] for e in queue}
+    assert {"C01", "C07"} <= members  # genuinely cross-member (the whole point)
+
+    # worst-first: every urgent precedes every clinician_review.
+    rank = {"urgent": 0, "clinician_review": 1}
+    ranks = [rank[e["level"]] for e in queue]
+    assert ranks == sorted(ranks)
+    assert queue[0]["level"] == "urgent" and queue[0]["member_id"] == "C07"
+
+
+def test_global_escalations_queue_empty_before_any_scan(client):
+    """No scan run yet -> no escalations anywhere -> an empty queue (a clean 200, never a 404)."""
+    r = client.get("/escalations")
+    assert r.status_code == 200 and r.json() == []
+
+
+def test_per_member_escalations_is_the_drill_in_not_the_queue(client):
+    """The per-member route is the drill-in: it returns ONLY that member's escalations, so it can't
+    serve as the queue. C07 scanned (urgent), C01 not -> C07's drill-in has its row, C01's is empty,
+    and neither sees the other's."""
+    client.post("/members/C07/scan")
+    c07 = client.get("/members/C07/escalations").json()
+    c01 = client.get("/members/C01/escalations").json()
+    assert c07 and all(e["member_id"] == "C07" for e in c07)
+    assert c01 == []  # unscanned -> nothing; never C07's rows
+    assert (
+        client.get("/members/NOPE/escalations").status_code == 404
+    )  # drill-in still 404s
 
 
 # ---- POST /members --------------------------------------------------------------------------------
@@ -143,9 +188,26 @@ def upload_client(tmp_path, monkeypatch):
         yield c
 
 
-def _dataset_zip(member_ids, *, top="bundle", extra=None, mutate=None):
-    """Build a dataset .zip: ``members.json`` (+ optional ``extra`` ``{relpath: str|bytes}``) under a
-    single wrapping folder ``top`` (``None`` -> at the zip root)."""
+def _valid_eval_bytes(ids, member_id):
+    """A valid JSONL eval file (one :class:`EvalCaseInput`-shaped object per line) — the ``.jsonl`` role."""
+    import json
+
+    return "\n".join(json.dumps(r) for r in _eval_records(ids, member_id)).encode()
+
+
+def _valid_csv_bytes(member_ids):
+    """A valid lab-panels CSV (exact header + one HbA1c row per member) — the ``.csv`` role."""
+    header = "member_id,panel_id,collected_date,analyte,value,unit,reference_range"
+    rows = [f"{mid},{mid}-P1,2024-01-15,HbA1c,5.3,%,<5.7" for mid in member_ids]
+    return ("\n".join([header, *rows]) + "\n").encode()
+
+
+def _dataset_zip(member_ids, *, top="bundle", extra=None, mutate=None, required=True):
+    """Build a COMPLETE dataset .zip — ``members.json`` + ``eval_set.jsonl`` + ``lab_panels.csv`` (the
+    three files the upload now requires by extension) under a single wrapping folder ``top`` (``None`` ->
+    at the zip root), plus optional ``extra`` ``{relpath: str|bytes}``. Pass ``required=False`` to write
+    ONLY ``members.json`` (for the missing-required-file rejection tests). ``mutate`` edits each member
+    dict before serialization."""
     import io
     import json
     import zipfile
@@ -160,6 +222,11 @@ def _dataset_zip(member_ids, *, top="bundle", extra=None, mutate=None):
     with zipfile.ZipFile(buf, "w") as zf:
         prefix = f"{top}/" if top else ""
         zf.writestr(prefix + "members.json", json.dumps(members))
+        if required:
+            zf.writestr(
+                prefix + "eval_set.jsonl", _valid_eval_bytes(["E1"], member_ids[0])
+            )
+            zf.writestr(prefix + "lab_panels.csv", _valid_csv_bytes(member_ids))
         for rel, content in (extra or {}).items():
             zf.writestr(prefix + rel, content)
     return buf.getvalue()
@@ -168,11 +235,7 @@ def _dataset_zip(member_ids, *, top="bundle", extra=None, mutate=None):
 def test_upload_zip_persists_folder_and_ingests_additively(upload_client):
     # The whole requirement: keep EVERYTHING (members.json + csv + jsonl) as a new dataset folder, AND
     # add the members on top of the existing 15 (no reseed).
-    data = _dataset_zip(
-        ["U01", "U02", "U03"],
-        top="holdout",
-        extra={"lab_panels.csv": "a,b\n1,2\n", "eval_set.jsonl": '{"input":"hi"}\n'},
-    )
+    data = _dataset_zip(["U01", "U02", "U03"], top="holdout")
     r = upload_client.post(
         "/members/upload", files={"file": ("holdout.zip", data, "application/zip")}
     )
@@ -199,6 +262,7 @@ def test_upload_auto_scans_new_members(upload_client):
     # proving the auto-scan ran and PERSISTED, so the member's Observations match its live Trajectory.
     import io
     import json
+    import zipfile
 
     member = _bundle(
         "S01",
@@ -206,9 +270,14 @@ def test_upload_auto_scans_new_members(upload_client):
             make_panel("S01-P1", "2024-01-15", [make_result("HbA1c", 9.0, "%", "<5.7")])
         ],
     )
-    data = io.BytesIO(json.dumps([member]).encode())
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("members.json", json.dumps([member]))
+        zf.writestr("eval_set.jsonl", _valid_eval_bytes(["E1"], "S01"))
+        zf.writestr("lab_panels.csv", _valid_csv_bytes(["S01"]))
     r = upload_client.post(
-        "/members/upload", files={"file": ("scanme.json", data, "application/json")}
+        "/members/upload",
+        files={"file": ("scanme.zip", buf.getvalue(), "application/zip")},
     )
     assert r.status_code == 200, r.text
     assert r.json()["scanned"] == 1
@@ -221,7 +290,9 @@ def test_upload_auto_scans_new_members(upload_client):
     assert "Mann-Kendall" not in hba1c["member_explanation"]
 
 
-def test_upload_bare_json_array_creates_dataset(upload_client):
+def test_upload_bare_json_rejected_must_be_zip(upload_client):
+    # A bare (non-zip) .json can't carry the required .jsonl + .csv, so it is rejected with a clear,
+    # structured reason — NOT ingested as a one-file dataset (the pre-validation contract accepted it).
     import io
     import json
 
@@ -229,10 +300,11 @@ def test_upload_bare_json_array_creates_dataset(upload_client):
     r = upload_client.post(
         "/members/upload", files={"file": ("myset.json", data, "application/json")}
     )
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["dataset"] == "myset" and body["member_ids"] == ["U10", "U11"]
-    assert (upload_client.data_root / "myset" / "members.json").is_file()
+    assert r.status_code == 422
+    failures = r.json()["detail"]["failures"]
+    assert any("must be a .zip" in f["detail"] for f in failures)
+    assert not (upload_client.data_root / "myset").exists()  # no side effect
+    assert "U10" not in {m["member_id"] for m in upload_client.get("/members").json()}
 
 
 def test_upload_explicit_name_field_wins(upload_client):
@@ -309,23 +381,30 @@ def test_upload_empty_derived_name_rejected(upload_client):
 
 
 def test_upload_shape_malformed_422_no_partial_set(upload_client):
-    # A SHAPE error (extra='forbid') is caught in the up-front Pydantic pass — before ANY DB write and
-    # before the folder is created. Neither the sibling member nor the folder lands.
+    # A SHAPE error (extra='forbid') on the FIRST member is caught by the first-record format gate —
+    # before ANY DB write and before the folder is created. `mutate` corrupts every member, so the first
+    # is bad and the gate fires (a later-only bad row would instead be skipped at ingest, not rejected).
+    # Neither the sibling member nor the folder lands, and the structured `failures` list rides the wire.
     data = _dataset_zip(["U20", "U21"], mutate=lambda b: b["profile"].update(oops="x"))
     r = upload_client.post(
         "/members/upload", files={"file": ("bad.zip", data, "application/zip")}
     )
     assert r.status_code == 422
+    assert r.json()["detail"][
+        "failures"
+    ]  # structured file+row failures, not a flat string
     picker = {m["member_id"] for m in upload_client.get("/members").json()}
     assert not ({"U20", "U21"} & picker)
     assert not (upload_client.data_root / "bad").exists()  # no folder on a shape error
 
 
-def test_upload_late_semantic_error_422_partial_db_no_folder(upload_client):
-    # The documented boundary: the SEMANTIC firewall parse runs per-member inside the committing write
-    # loop, so a parse failure in a LATER bundle raises after the earlier valid member is written — a
-    # partial DB set persists by design. But the folder is created only AFTER ingest, so it is NOT left
-    # behind. If this flips, update ingest_members' + the route's docstrings.
+def test_upload_late_semantic_error_skips_row_not_upload(upload_client):
+    # The new skip semantics: the first member is good, a LATER member carries a bad reference_range. The
+    # first-record format gate passes it (MemberBundle keeps the range as a raw string, parsed only at
+    # ingest — the documented residual), so the semantic firewall parse fails per-member at ingest. That
+    # bad row is now SKIPPED, not rejected: the upload SUCCEEDS (200), the good member ingests + scans, the
+    # bad one lands in `skipped` with its member_id + a range-parse detail, the folder IS created, and
+    # `member_ids` excludes the skipped row.
     import io
     import json
     import zipfile
@@ -335,16 +414,77 @@ def test_upload_late_semantic_error_422_partial_db_no_folder(upload_client):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("members.json", json.dumps([good, bad]))
+        zf.writestr("eval_set.jsonl", _valid_eval_bytes(["E1"], "U22"))
+        zf.writestr("lab_panels.csv", _valid_csv_bytes(["U22", "U23"]))
     r = upload_client.post(
         "/members/upload",
         files={"file": ("sem.zip", buf.getvalue(), "application/zip")},
     )
-    assert r.status_code == 422
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["member_ids"] == ["U22"]  # skipped row excluded from the ingested set
+    skipped = body["skipped"]
+    assert [s["member_id"] for s in skipped] == ["U23"]
+    assert (
+        skipped[0]["file"] == "members.json" and "not-a-range" in skipped[0]["detail"]
+    )
     picker = {m["member_id"] for m in upload_client.get("/members").json()}
-    assert "U22" in picker and "U23" not in picker  # partial DB set, by design
+    assert "U22" in picker and "U23" not in picker  # good member in, skipped member out
+    assert (upload_client.data_root / "sem").is_dir()  # folder still created on success
+
+
+def test_upload_non_dict_later_member_row_skipped_not_fatal(upload_client):
+    # A NON-DICT later row (a bare string, a null) must be SKIPPED at ingest like a shape-invalid row, NOT
+    # 422 the whole upload — the first-record gate checks only records[0]'s shape. This is the contract "a
+    # buggy later member row is skipped, not fatal", and it makes a non-dict late row and a
+    # dict-with-bad-fields late row behave the SAME (both skipped), not opposite outcomes.
+    import io
+    import json
+    import zipfile
+
+    members = [_bundle("G1"), "junk-not-an-object", None, _bundle("G2")]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("members.json", json.dumps(members))
+        zf.writestr("eval_set.jsonl", _valid_eval_bytes(["E1"], "G1"))
+        zf.writestr("lab_panels.csv", _valid_csv_bytes(["G1", "G2"]))
+    r = upload_client.post(
+        "/members/upload",
+        files={"file": ("mixed.zip", buf.getvalue(), "application/zip")},
+        data={"name": "mixed"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["members"] == 2 and set(body["member_ids"]) == {"G1", "G2"}
+    assert len(body["skipped"]) == 2  # the string + the null skipped, not fatal
+    picker = {m["member_id"] for m in upload_client.get("/members").json()}
+    assert {"G1", "G2"} <= picker
+    assert (upload_client.data_root / "mixed").is_dir()  # good rows persisted
+
+
+def test_upload_all_member_rows_bad_is_422_and_rolls_back_folder(upload_client):
+    # Every member row is shape-valid (passes the first-record gate) but semantically bad (an unparseable
+    # reference_range), so ingest skips ALL of them -> members==0. An upload that ingests NOBODY is a FAILED
+    # upload, not a 200 with an empty dataset: it 422s with the per-row detail AND the reserved folder is
+    # rolled back (no orphan dataset that only 409s on retry).
+    def _break(b):
+        b["panels"][0]["results"][0]["reference_range"] = "not-a-range"
+
+    data = _dataset_zip(["B1", "B2"], top="allbad", mutate=_break)
+    r = upload_client.post(
+        "/members/upload",
+        files={"file": ("allbad.zip", data, "application/zip")},
+        data={"name": "allbad"},
+    )
+    assert r.status_code == 422, r.text
+    failures = r.json()["detail"]["failures"]
+    assert failures and all(f["file"] == "members.json" for f in failures)
+    assert any("not-a-range" in f["detail"] for f in failures)  # per-row cause surfaced
     assert not (
-        upload_client.data_root / "sem"
-    ).exists()  # folder created only after a clean ingest
+        upload_client.data_root / "allbad"
+    ).exists()  # folder rolled back, no orphan
+    picker = {m["member_id"] for m in upload_client.get("/members").json()}
+    assert not ({"B1", "B2"} & picker)  # nothing ingested
 
 
 def test_upload_not_a_zip_returns_422(upload_client):
@@ -355,44 +495,45 @@ def test_upload_not_a_zip_returns_422(upload_client):
     assert r.status_code == 422
 
 
-def test_upload_single_object_accepted_as_one_member_dataset(upload_client):
-    # A bare member-bundle OBJECT (not an array) is members-shaped, so the content classifier accepts it
-    # as a one-member dataset — robustly, whether compact or pretty-printed (read_records handles `{`).
-    import io
-    import json
-
-    data = io.BytesIO(
-        json.dumps(_bundle("U30"), indent=2).encode()
-    )  # pretty-printed on purpose
+def test_upload_resolves_roles_by_extension_not_name(upload_client):
+    # Roles are bucketed by EXTENSION, not base name: a zip whose files carry arbitrary stems but the
+    # three required extensions (.json members, .jsonl eval, .csv panels) ingests, and each file is
+    # renamed to its CANONICAL on-disk name so every downstream reader stays name-based.
+    data = _zip_of(
+        {
+            "roster.json": _members_bytes(["AX1", "AX2"]),
+            "cases.jsonl": _valid_eval_bytes(["E1"], "AX1"),
+            "panel.csv": _valid_csv_bytes(["AX1", "AX2"]),
+        }
+    )
     r = upload_client.post(
-        "/members/upload", files={"file": ("one.json", data, "application/json")}
+        "/members/upload",
+        files={"file": ("holdoutA.zip", data, "application/zip")},
+        data={"name": "byext"},
     )
     assert r.status_code == 200, r.text
-    assert r.json()["member_ids"] == ["U30"]
-
-
-def test_upload_members_non_json_extension_resolves_by_content(upload_client):
-    # #8: discovery is by CONTENT, not extension — a members file under a non-.json name still resolves.
-    data = _zip_of({"roster.dat": _members_bytes(["AX1"]), "panel.csv": b"a,b\n1,2\n"})
-    r = upload_client.post(
-        "/members/upload", files={"file": ("odd.zip", data, "application/zip")}
-    )
-    assert r.status_code == 200, r.text
-    assert r.json()["member_ids"] == ["AX1"]
+    assert set(r.json()["member_ids"]) == {"AX1", "AX2"}
+    folder = upload_client.data_root / "byext"
+    assert (
+        folder / "members.json"
+    ).is_file()  # renamed to canonical, not the upload's name
+    assert (folder / "lab_panels.csv").is_file()
+    assert (folder / "eval_set.jsonl").is_file()
+    assert not (folder / "roster.json").exists()  # the arbitrary stem is not kept
 
 
 def test_upload_bom_members_and_eval(upload_client):
-    # #5: a UTF-8 BOM on the members AND eval files must not break classification or the eval load.
-    import json
-
+    # #5: a UTF-8 BOM on the members AND eval files must not break the format gate or the eval load. The
+    # bundle is a full zip: BOM'd .json members, BOM'd .jsonl eval, and a valid .csv (BOM tolerance must
+    # survive the gate AND the later load_supplied_cases read).
     from eval.adapter import load_supplied_cases
 
     bom = b"\xef\xbb\xbf"
     data = _zip_of(
         {
-            "m.json": bom + _members_bytes(["BX1"]),  # BOM'd array members
-            "e.json": bom
-            + json.dumps(_eval_records(["EB1"])).encode(),  # BOM'd array eval
+            "m.json": bom + _members_bytes(["BX1"]),  # BOM'd members
+            "e.jsonl": bom + _valid_eval_bytes(["EB1"], "BX1"),  # BOM'd eval
+            "p.csv": _valid_csv_bytes(["BX1"]),
         }
     )
     r = upload_client.post(
@@ -405,19 +546,6 @@ def test_upload_bom_members_and_eval(upload_client):
     assert [c.id for c in load_supplied_cases("bomset")] == [
         "EB1"
     ]  # BOM eval still loads
-
-
-def test_upload_jsonl_members_accepted(upload_client):
-    # #7: a JSONL-form members file (one bundle per line) is accepted, not rejected as "not valid JSON".
-    import json
-
-    jsonl = "\n".join(json.dumps(_bundle(m)) for m in ["JL1", "JL2"]).encode()
-    data = _zip_of({"members.jsonl": jsonl})
-    r = upload_client.post(
-        "/members/upload", files={"file": ("jl.zip", data, "application/zip")}
-    )
-    assert r.status_code == 200, r.text
-    assert set(r.json()["member_ids"]) == {"JL1", "JL2"}
 
 
 def test_upload_dot_entry_rejected_no_side_effects(upload_client):
@@ -481,16 +609,26 @@ def test_upload_corrupt_zip_entry_is_422_not_500(upload_client, compression):
 
 
 def test_upload_non_utf8_members_is_422_not_raw_error(upload_client):
-    # #X1: a non-UTF-8 (no-BOM) members file is not valid JSON (JSON must be Unicode); read_records must
-    # surface a clean ValueError -> 422, not let a raw UnicodeDecodeError escape.
-    import io
-
+    # #X1: a non-UTF-8 (no-BOM) .json members file is not valid JSON (JSON must be Unicode); read_records
+    # must surface a clean whole-file ValueError (row=None) -> 422, never a raw UnicodeDecodeError/500. The
+    # rest of the bundle is valid, so the failure is unambiguously the members read.
     # cp1252 bytes that are not valid UTF-8 (0x96 = en-dash in cp1252, an invalid UTF-8 start byte)
-    data = io.BytesIO(b'[{"member_id": "\x96bad"}]')
+    data = _zip_of(
+        {
+            "m.json": b'[{"member_id": "\x96bad"}]',
+            "e.jsonl": _valid_eval_bytes(["E1"], "X1"),
+            "p.csv": _valid_csv_bytes(["X1"]),
+        }
+    )
     r = upload_client.post(
-        "/members/upload", files={"file": ("m.json", data, "application/json")}
+        "/members/upload", files={"file": ("nonutf8.zip", data, "application/zip")}
     )
     assert r.status_code == 422  # clean validation error, never a 500/raw traceback
+    failures = r.json()["detail"]["failures"]
+    assert any(f["file"] == "members.json" and f["row"] is None for f in failures)
+    assert not (
+        upload_client.data_root / "nonutf8"
+    ).exists()  # rejected before any folder
 
 
 def test_read_records_wraps_non_utf8_as_plain_valueerror():
@@ -506,79 +644,17 @@ def test_read_records_wraps_non_utf8_as_plain_valueerror():
     assert "not valid JSON" in str(ei.value)
 
 
-def test_uploaded_jsonl_members_dataset_is_reingestable(upload_client):
-    # #2-followup: a JSONL/non-array members file persists verbatim; re-reading the dataset (reseed / make
-    # eval -> ingest_dataset) must succeed via the shared read_records, not crash on the non-array shape.
-    import json
-
-    from preprocessing.ingest import ingest_dataset
-
-    jsonl = "\n".join(json.dumps(_bundle(m)) for m in ["RT1", "RT2"]).encode()
-    r = upload_client.post(
-        "/members/upload",
-        files={
-            "file": ("jl.zip", _zip_of({"members.jsonl": jsonl}), "application/zip")
-        },
-        data={"name": "rtset"},
-    )
-    assert r.status_code == 200, r.text
-    # re-read the persisted dataset the way reseed / `DATASET=rtset make eval` would
-    con = db.connect(_DB_FILE)
-    try:
-        summary = ingest_dataset(con, "rtset")
-    finally:
-        con.close()
-    assert summary["members"] == 2  # round-trips, no "must be a JSON array" crash
-
-
-def test_upload_extra_cannot_clobber_canonical_file(upload_client):
-    # #3-followup: an unclassified extra named like a canonical file must NOT overwrite it on disk.
+def test_upload_duplicate_member_id_counts_distinct(upload_client):
+    # #10: a duplicate member_id in members.json must not inflate the members/scanned counts (upsert -> one).
     data = _zip_of(
         {
-            "roster.json": _members_bytes(
-                ["CL1"]
-            ),  # the real members -> canonical members.json
-            "members.json": b"junk, not json",  # non-JSON extra that shares the canonical name
+            "members.json": _members_bytes(["DUP", "DUP"]),
+            "eval_set.jsonl": _valid_eval_bytes(["E1"], "DUP"),
+            "lab_panels.csv": _valid_csv_bytes(["DUP"]),
         }
     )
     r = upload_client.post(
-        "/members/upload",
-        files={"file": ("clob.zip", data, "application/zip")},
-        data={"name": "clobset"},
-    )
-    assert r.status_code == 200, r.text
-    on_disk = (upload_client.data_root / "clobset" / "members.json").read_bytes()
-    assert (
-        b"CL1" in on_disk and b"junk" not in on_disk
-    )  # canonical survived, extra did not clobber
-
-
-def test_upload_members_only_then_make_eval_is_empty_not_crash(upload_client):
-    # #4: a members-only upload creates a dataset with no eval_set.jsonl; load_supplied_cases must return
-    # [] (a members-only dataset has no supplied cases), not crash with FileNotFoundError.
-    import io
-
-    from eval.adapter import load_supplied_cases
-
-    data = io.BytesIO(_members_bytes(["MO1"]))
-    r = upload_client.post(
-        "/members/upload",
-        files={"file": ("m.json", data, "application/json")},
-        data={"name": "memonly"},
-    )
-    assert r.status_code == 200, r.text
-    assert not (upload_client.data_root / "memonly" / "eval_set.jsonl").exists()
-    assert load_supplied_cases("memonly") == []
-
-
-def test_upload_duplicate_member_id_counts_distinct(upload_client):
-    # #10: a duplicate member_id in the array must not inflate the members/scanned counts (upsert -> one).
-    import io
-    import json
-
-    data = io.BytesIO(json.dumps([_bundle("DUP"), _bundle("DUP")]).encode())
-    r = upload_client.post(
-        "/members/upload", files={"file": ("dup.json", data, "application/json")}
+        "/members/upload", files={"file": ("dup.zip", data, "application/zip")}
     )
     assert r.status_code == 200, r.text
     body = r.json()
@@ -588,8 +664,16 @@ def test_upload_duplicate_member_id_counts_distinct(upload_client):
 
 
 def test_upload_dotted_path_member_file_kept(upload_client):
-    # #11: a legitimately dot-named bundle file is NOT discarded as junk (only __MACOSX/.DS_Store/._* are).
-    data = _zip_of({".v2/roster.json": _members_bytes(["DV1"])})
+    # #11: a legitimately dot-named bundle path is NOT discarded as junk (only __MACOSX/.DS_Store/._* are).
+    # The members .json sits under a `.v2/` folder; the eval/csv roles sit at the root (so nothing is
+    # stripped as a common top folder). Role resolution is by extension, so the dotted path still ingests.
+    data = _zip_of(
+        {
+            ".v2/roster.json": _members_bytes(["DV1"]),
+            "eval_set.jsonl": _valid_eval_bytes(["E1"], "DV1"),
+            "lab_panels.csv": _valid_csv_bytes(["DV1"]),
+        }
+    )
     r = upload_client.post(
         "/members/upload", files={"file": ("dotted.zip", data, "application/zip")}
     )
@@ -600,15 +684,12 @@ def test_upload_dotted_path_member_file_kept(upload_client):
 def test_upload_name_collides_with_existing_file_is_409_not_500(upload_client):
     # #2: a name that collides with an existing FILE (not just a dir) under the data root must be a clean
     # 409 with NO members ingested — create_dataset_dir's mkdir is the single, drift-free collision check.
-    import io
-
     (upload_client.data_root / "afile").write_text(
         "x"
     )  # a plain file, not a dataset dir
-    data = io.BytesIO(_members_bytes(["CF1"]))
     r = upload_client.post(
         "/members/upload",
-        files={"file": ("x.json", data, "application/json")},
+        files={"file": ("x.zip", _dataset_zip(["CF1"]), "application/zip")},
         data={"name": "afile"},
     )
     assert r.status_code == 409
@@ -653,76 +734,115 @@ def _eval_records(ids, member_id="AX1"):
     ]
 
 
-def test_upload_arbitrary_filenames_resolve_by_content(upload_client):
-    # The hold-out ships the same schemas under DIFFERENT names — discovery must be by content, not name.
-    import json
+def test_upload_eval_loads_through_harness_array_or_jsonl(upload_client):
+    # Criterion 4, END-TO-END: a valid JSONL eval file (one object per line) uploads and loads via the
+    # SAME harness adapter with identical case ids — upload WRITES the canonical eval_set.jsonl, the
+    # harness READS it.
+    from eval.adapter import load_supplied_cases
 
     data = _zip_of(
         {
-            "roster.json": _members_bytes(
-                ["AX1", "AX2"]
-            ),  # members — by profile/panels shape
-            "panel.csv": b"analyte,value\nHbA1c,5.4\n",  # panels — the lone CSV
-            "cases.json": json.dumps(
-                _eval_records(["E1"])
-            ).encode(),  # eval — the other JSON
+            "m.json": _members_bytes(["AX1"]),
+            "ev.jsonl": _valid_eval_bytes(["E0", "E1", "E2"], "AX1"),
+            "p.csv": _valid_csv_bytes(["AX1"]),
+        }
+    )
+    upload_client.post(
+        "/members/upload",
+        files={"file": ("jl.zip", data, "application/zip")},
+        data={"name": "evjsonl"},
+    )
+    assert [c.id for c in load_supplied_cases("evjsonl")] == ["E0", "E1", "E2"]
+
+
+def test_upload_eval_first_row_json_array_rejected(upload_client):
+    # Negative: the .jsonl eval role is gated line-by-line, so a first line that is a JSON ARRAY (not one
+    # EvalCaseInput object) fails the first-row format gate -> 422, before any side effect.
+    import json
+
+    array_line = json.dumps(
+        _eval_records(["E1"], "AX1")
+    ).encode()  # a whole array on line 1
+    data = _zip_of(
+        {
+            "m.json": _members_bytes(["AX1"]),
+            "ev.jsonl": array_line,
+            "p.csv": _valid_csv_bytes(["AX1"]),
         }
     )
     r = upload_client.post(
-        "/members/upload", files={"file": ("holdoutA.zip", data, "application/zip")}
-    )
-    assert r.status_code == 200, r.text
-    assert set(r.json()["member_ids"]) == {"AX1", "AX2"}
-    # files normalized to CANONICAL names on disk, regardless of what the upload called them
-    folder = upload_client.data_root / "holdoutA"
-    assert (folder / "members.json").is_file()
-    assert (folder / "lab_panels.csv").is_file()
-    assert (folder / "eval_set.jsonl").is_file()
-    assert not (folder / "roster.json").exists()  # renamed to canonical, not duplicated
-
-
-def test_upload_eval_loads_through_harness_array_or_jsonl(upload_client):
-    # Criterion 4, END-TO-END: the eval file as a JSON ARRAY (its name changed from .jsonl) must load via
-    # the SAME harness adapter as JSONL, with identical case ids — upload WRITES, the harness READS.
-    import json
-
-    from eval.adapter import load_supplied_cases
-
-    cases = _eval_records(["E0", "E1", "E2"])
-    upload_client.post(
         "/members/upload",
-        files={
-            "file": (
-                "arr.zip",
-                _zip_of(
-                    {
-                        "m.json": _members_bytes(["AX1"]),
-                        "ev.json": json.dumps(cases).encode(),
-                    }
-                ),
-                "application/zip",
-            )
-        },
+        files={"file": ("arr.zip", data, "application/zip")},
         data={"name": "evarr"},
     )
-    jsonl = "\n".join(json.dumps(c) for c in cases).encode()
-    upload_client.post(
-        "/members/upload",
-        files={
-            "file": (
-                "jl.zip",
-                _zip_of({"m.json": _members_bytes(["AX9"]), "ev.jsonl": jsonl}),
-                "application/zip",
-            )
-        },
-        data={"name": "evjsonl"},
+    assert r.status_code == 422
+    failures = r.json()["detail"]["failures"]
+    assert any(f["file"] == "eval_set.jsonl" for f in failures)
+    assert not (upload_client.data_root / "evarr").exists()
+
+
+_GOOD_CSV_HEADER = (
+    "member_id,panel_id,collected_date,analyte,value,unit,reference_range"
+)
+
+
+@pytest.mark.parametrize(
+    "csv_text, expect_detail",
+    [
+        # wrong header (missing the reference_range column) — the header check fires before any data row
+        (
+            "member_id,panel_id,collected_date,analyte,value,unit\nX1,X1-P1,2024-01-15,HbA1c,5.3,%\n",
+            "header must be exactly",
+        ),
+        # non-numeric value
+        (
+            _GOOD_CSV_HEADER + "\nX1,X1-P1,2024-01-15,HbA1c,notanum,%,<5.7\n",
+            "not numeric",
+        ),
+        # non-ISO collected_date
+        (
+            _GOOD_CSV_HEADER + "\nX1,X1-P1,15-01-2024,HbA1c,5.3,%,<5.7\n",
+            "not an ISO date",
+        ),
+        # wrong column count in the first data row (6 cells under the 7-column header)
+        (
+            _GOOD_CSV_HEADER + "\nX1,X1-P1,2024-01-15,HbA1c,5.3,%\n",
+            "expected 7 columns",
+        ),
+        # unparseable reference_range (parsed by the SAME parse_reference_range the ingest uses)
+        (
+            _GOOD_CSV_HEADER + "\nX1,X1-P1,2024-01-15,HbA1c,5.3,%,not-a-range\n",
+            "not a recognized range",
+        ),
+        # empty required field (member_id)
+        (
+            _GOOD_CSV_HEADER + "\n,X1-P1,2024-01-15,HbA1c,5.3,%,<5.7\n",
+            "must not be empty",
+        ),
+    ],
+)
+def test_upload_bad_csv_first_row_rejected_422(upload_client, csv_text, expect_detail):
+    # The lab-panels CSV first-row format gate — previously ZERO coverage while the members + eval gates
+    # were both tested. A malformed header or first data row must 422 with a lab_panels.csv failure carrying
+    # the specific cause, before any side effect (not a 500, not a silently-accepted bad CSV).
+    data = _zip_of(
+        {
+            "m.json": _members_bytes(["X1"]),
+            "ev.jsonl": _valid_eval_bytes(["E1"], "X1"),
+            "p.csv": csv_text.encode(),
+        }
     )
-    assert [c.id for c in load_supplied_cases("evarr")] == ["E0", "E1", "E2"]
-    assert [c.id for c in load_supplied_cases("evjsonl")] == [
-        "E0",
-        "E1",
-        "E2",
-    ]  # same, both forms
+    r = upload_client.post(
+        "/members/upload",
+        files={"file": ("badcsv.zip", data, "application/zip")},
+        data={"name": "badcsv"},
+    )
+    assert r.status_code == 422, r.text
+    failures = r.json()["detail"]["failures"]
+    assert any(
+        f["file"] == "lab_panels.csv" and expect_detail in f["detail"] for f in failures
+    )
+    assert not (upload_client.data_root / "badcsv").exists()
 
 
 def test_upload_opaque_member_id_roundtrips_through_scan(upload_client):
@@ -730,6 +850,7 @@ def test_upload_opaque_member_id_roundtrips_through_scan(upload_client):
     # assumption anywhere. The flagged HbA1c proves the full ingest -> auto-scan -> observations path.
     import io
     import json
+    import zipfile
 
     uid, uuid = "H-001", "550e8400-e29b-41d4-a716-446655440000"
     flagged = _bundle(
@@ -740,9 +861,14 @@ def test_upload_opaque_member_id_roundtrips_through_scan(upload_client):
             )
         ],
     )
-    data = io.BytesIO(json.dumps([flagged, _bundle(uuid)]).encode())
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("members.json", json.dumps([flagged, _bundle(uuid)]))
+        zf.writestr("eval_set.jsonl", _valid_eval_bytes(["E1"], uid))
+        zf.writestr("lab_panels.csv", _valid_csv_bytes([uid, uuid]))
     r = upload_client.post(
-        "/members/upload", files={"file": ("opaque.json", data, "application/json")}
+        "/members/upload",
+        files={"file": ("opaque.zip", buf.getvalue(), "application/zip")},
     )
     assert r.status_code == 200, r.text
     assert set(r.json()["member_ids"]) == {uid, uuid} and r.json()["scanned"] == 2
@@ -754,15 +880,18 @@ def test_upload_opaque_member_id_roundtrips_through_scan(upload_client):
 
 
 def test_upload_no_members_file_422_no_side_effects(upload_client):
-    # A bundle with no members-shaped JSON can't resolve -> 422, before any ingest or folder.
+    # Under the by-extension rules a `.json` file is bucketed as the MEMBERS role regardless of content, so
+    # an eval-shaped `cases.json` fills the members slot — but the required `.jsonl` role is missing, and
+    # that structural role check fires first. Either the missing role or the members first-row gate -> 422,
+    # before any ingest or folder.
     import json
 
     data = _zip_of(
         {
-            "panel.csv": b"a,b\n1,2\n",
+            "panel.csv": _valid_csv_bytes(["AX1"]),
             "cases.json": json.dumps(
                 _eval_records(["E1"])
-            ).encode(),  # eval-shaped, not members
+            ).encode(),  # eval-shaped, but the lone .json -> members role
         }
     )
     r = upload_client.post(
@@ -773,15 +902,76 @@ def test_upload_no_members_file_422_no_side_effects(upload_client):
 
 
 def test_upload_two_members_files_422_no_partial(upload_client):
-    # Two members-shaped JSON is ambiguous -> reject with no partial load.
-    data = _zip_of({"a.json": _members_bytes(["P1"]), "b.json": _members_bytes(["P2"])})
+    # Two .json files -> the members role is ambiguous by extension (expected exactly one) -> reject with no
+    # partial load. The OTHER two roles ARE present, so the duplicate-.json check is what fires in ISOLATION
+    # (not masked by a missing-role check firing first) — and the failure names the members role explicitly.
+    data = _zip_of(
+        {
+            "a.json": _members_bytes(["P1"]),
+            "b.json": _members_bytes(["P2"]),
+            "ev.jsonl": _valid_eval_bytes(["E1"], "P1"),
+            "p.csv": _valid_csv_bytes(["P1"]),
+        }
+    )
     r = upload_client.post(
         "/members/upload", files={"file": ("ambig.zip", data, "application/zip")}
     )
     assert r.status_code == 422
+    failures = r.json()["detail"]["failures"]
+    assert any(
+        f["file"] == "members.json" and "exactly one" in f["detail"] for f in failures
+    )
     picker = {m["member_id"] for m in upload_client.get("/members").json()}
     assert not ({"P1", "P2"} & picker)  # nothing ingested
     assert not (upload_client.data_root / "ambig").exists()
+
+
+def test_upload_duplicate_csv_role_rejected(upload_client):
+    # The "exactly one .csv" contract IN ISOLATION (all three roles present, but TWO .csv) — the panels role
+    # is ambiguous by extension -> 422, no side effect. Previously untested (the two-.json test above was
+    # confounded by also-missing roles, and neither a duplicate .csv nor .jsonl had any coverage).
+    data = _zip_of(
+        {
+            "m.json": _members_bytes(["D1"]),
+            "ev.jsonl": _valid_eval_bytes(["E1"], "D1"),
+            "a.csv": _valid_csv_bytes(["D1"]),
+            "b.csv": _valid_csv_bytes(["D1"]),
+        }
+    )
+    r = upload_client.post(
+        "/members/upload",
+        files={"file": ("dupcsv.zip", data, "application/zip")},
+        data={"name": "dupcsv"},
+    )
+    assert r.status_code == 422
+    failures = r.json()["detail"]["failures"]
+    assert any(
+        f["file"] == "lab_panels.csv" and "exactly one" in f["detail"] for f in failures
+    )
+    assert not (upload_client.data_root / "dupcsv").exists()
+
+
+def test_upload_duplicate_jsonl_role_rejected(upload_client):
+    # Same "exactly one" contract for the eval role: two .jsonl -> ambiguous -> 422, no side effect.
+    data = _zip_of(
+        {
+            "m.json": _members_bytes(["D1"]),
+            "a.jsonl": _valid_eval_bytes(["E1"], "D1"),
+            "b.jsonl": _valid_eval_bytes(["E2"], "D1"),
+            "p.csv": _valid_csv_bytes(["D1"]),
+        }
+    )
+    r = upload_client.post(
+        "/members/upload",
+        files={"file": ("dupjsonl.zip", data, "application/zip")},
+        data={"name": "dupjsonl"},
+    )
+    assert r.status_code == 422
+    failures = r.json()["detail"]["failures"]
+    assert any(
+        f["file"] == "eval_set.jsonl" and "exactly one" in f["detail"] for f in failures
+    )
+    assert not (upload_client.data_root / "dupjsonl").exists()
 
 
 @pytest.mark.parametrize("good", ["holdout", "data-2024", "set.v1", "A_b-9"])
@@ -869,6 +1059,66 @@ def test_post_feedback_unknown_member_404(client):
         json={"kind": "preference", "payload": {"text": "brief"}, "source": "member"},
     )
     assert r.status_code == 404
+
+
+def _incorrect_feedback(answer):
+    return {
+        "kind": "incorrect",
+        "target": "obs:x",
+        "payload": {
+            "question": "Tell me about my Fasting glucose",
+            "corrected_answer": answer,
+        },
+        "source": "clinician",
+    }
+
+
+def test_post_feedback_empty_corrected_answer_422_deterministically(client):
+    # The DETERMINISTIC bound runs before the judge, so an empty corrected answer 422s with no model call
+    # (no API key needed) — the cheap floor beneath the Haiku input-judge.
+    r = client.post("/members/C01/feedback", json=_incorrect_feedback("   "))
+    assert r.status_code == 422 and "empty" in r.json()["detail"]
+
+
+def test_post_feedback_maps_judge_unavailable_to_503_fail_closed(client, monkeypatch):
+    # Route wiring: when the Haiku judge can't run, validate_feedback raises LearnUnavailable and the route
+    # maps it to 503 — FAIL-CLOSED (retry, never store unjudged), the safe direction since the bar is the
+    # only off-eval-junk catch. (The real fail-closed path lives in test_learn.py; this pins the mapping.)
+    def _down(fb):
+        raise learn.LearnUnavailable(
+            "the feedback review service is unavailable; try again"
+        )
+
+    monkeypatch.setattr(learn, "validate_feedback", _down)
+    r = client.post(
+        "/members/C01/feedback", json=_incorrect_feedback("a well-formed answer here")
+    )
+    # 503 -> the route raised before db.insert_feedback, so nothing was stored.
+    assert r.status_code == 503
+
+
+def test_post_feedback_maps_a_judge_rejection_to_422(client, monkeypatch):
+    # Route wiring: when the judge deems a corrected answer unfit, validate_feedback returns its reason and
+    # the route maps it to a 422 with that reason (the judge itself is exercised in test_learn.py).
+    monkeypatch.setattr(
+        learn, "validate_feedback", lambda fb: "incoherent — not an answer"
+    )
+    r = client.post("/members/C01/feedback", json=_incorrect_feedback("makes no sense"))
+    assert r.status_code == 422 and r.json()["detail"] == "incoherent — not an answer"
+
+
+def test_post_feedback_non_incorrect_correction_stores_without_a_judge(client):
+    # A range_override is not an exemplar, so validate_feedback never calls the judge — it 200s even with
+    # no LLM configured (only 'incorrect' corrections are judged).
+    r = client.post(
+        "/members/C01/feedback",
+        json={
+            "kind": "suppress_marker",
+            "target": "LDL cholesterol",
+            "source": "clinician",
+        },
+    )
+    assert r.status_code == 200 and r.json()["feedback_id"]
 
 
 # ---- GET /members/{id}/trajectory (Phase 7) -------------------------------------------------------
@@ -967,3 +1217,28 @@ def test_reseed_restores_initial_members_and_drops_holdouts(client):
     assert "C01" in ids  # the deleted seeded member is back
     assert "T99" not in ids  # the uploaded holdout is dropped
     assert len(ids) == 15  # back to the initial state
+    # The v0 baseline prompt is materialized post-reseed (not left to a lazy /learn) — promoted, BASE
+    # text, no report yet — so the prompt store is never empty after a factory reset.
+    con = db.connect(_DB_FILE)
+    try:
+        rows = con.execute(
+            "SELECT version, status, eval_report_json FROM prompt_versions"
+        ).fetchall()
+    finally:
+        con.close()
+    assert [(r["version"], r["status"]) for r in rows] == [(0, "promoted")]
+    assert rows[0]["eval_report_json"] is None
+
+
+def test_cold_start_seeds_the_v0_baseline_prompt(client):
+    # The lifespan (cold start) MUST materialize v0. With the tightened _baseline_report (/learn no longer
+    # mints the baseline), this startup seed — api.py's learn.seed_baseline_prompt — is the ONLY guarantee
+    # the prompt store isn't empty on a fresh deploy. _reset_and_seed wipes prompt_versions (a true cold
+    # start); the TestClient context runs the lifespan, which seeds v0. Comment out that seed call and this
+    # test fails — it guards the production path the error-not-mint design now depends on.
+    con = db.connect(_DB_FILE)
+    try:
+        rows = con.execute("SELECT version, status FROM prompt_versions").fetchall()
+    finally:
+        con.close()
+    assert [(r["version"], r["status"]) for r in rows] == [(0, "promoted")]

@@ -73,6 +73,64 @@ def test_emit_escalation_is_idempotent():
     assert n == 1
 
 
+# ---- global queue ordering (GET /escalations) ----------------------------------------------------
+
+
+def test_get_all_escalations_ranks_severity_then_recency_across_members():
+    """The global triage worklist: most-severe first (urgent before clinician_review), then
+    most-recent first, spanning members. created_at is passed explicitly so the ordering is asserted
+    deterministically (not at the mercy of a wall clock). Contrast the per-member get_escalations,
+    which is oldest-first — this difference is intentional (a worklist, not a history)."""
+    con = _con()
+    for m in ("A", "B", "C"):
+        con.execute("INSERT INTO members (member_id, sex) VALUES (?, 'male')", (m,))
+    con.commit()
+    # (member, level, created_at, dedup_key) — deliberately interleaved so neither member nor
+    # insert order matches the expected output.
+    rows = [
+        (
+            "A",
+            "clinician_review",
+            "2024-01-01T00:00:00+00:00",
+            "data:A:m1:v1",
+        ),  # oldest
+        ("B", "urgent", "2024-02-01T00:00:00+00:00", "data:B:m2:v1"),  # only urgent
+        ("C", "clinician_review", "2024-03-01T00:00:00+00:00", "data:C:m3:v1"),
+        (
+            "A",
+            "clinician_review",
+            "2024-04-01T00:00:00+00:00",
+            "data:A:m4:v1",
+        ),  # newest c_r
+    ]
+    for member, level, created_at, key in rows:
+        db.emit_escalation(
+            con,
+            member_id=member,
+            kind="data_finding",
+            dedup_key=key,
+            level=level,
+            trigger_reason="t",
+            created_at=created_at,
+        )
+
+    queue = db.get_all_escalations(con)
+    # urgent first; then clinician_review newest→oldest. By dedup_key that is: B, A(04), C(03), A(01).
+    assert [e.dedup_key for e in queue] == [
+        "data:B:m2:v1",
+        "data:A:m4:v1",
+        "data:C:m3:v1",
+        "data:A:m1:v1",
+    ]
+    assert queue[0].level == "urgent"  # worst-first
+    assert {e.member_id for e in queue} == {"A", "B", "C"}  # genuinely cross-member
+    # the clinician_review tail is strictly recency-descending
+    cr = [e for e in queue if e.level == "clinician_review"]
+    assert [e.created_at for e in cr] == sorted(
+        (e.created_at for e in cr), reverse=True
+    )
+
+
 # ---- row <-> model round-trip --------------------------------------------------------------------
 
 
@@ -123,6 +181,85 @@ def test_member_round_trips_through_db():
 
 
 # ---- safety-critical: panic thresholds transcribed from config onto every range row --------------
+
+
+def test_reseed_transaction_rolls_back_to_prior_state_on_failure():
+    # B2: a mid-reseed failure (after the truncate, before the re-ingest completes) must leave the PRIOR
+    # populated DB, never a half-wiped one — the atomicity the old nuke_all lacked (it committed mid-op).
+    con = _con()
+    ingest_dataset(con)  # the supplied 15-member bundle
+    assert con.execute("SELECT COUNT(*) FROM members").fetchone()[0] == 15
+    with pytest.raises(RuntimeError, match="boom"):
+        with db.reseed_transaction(con):
+            db.clear_all_data(con)  # truncate every table (inside the transaction)
+            assert (
+                con.execute("SELECT COUNT(*) FROM members").fetchone()[0] == 0
+            )  # gone mid-transaction...
+            raise RuntimeError("boom mid-reseed")
+    # ...but the rollback restores them — the DB is never left empty for a concurrent reader.
+    assert con.execute("SELECT COUNT(*) FROM members").fetchone()[0] == 15
+
+
+def test_apply_migrations_backfills_escalation_status_on_an_old_db():
+    # §720 lifecycle: a DB created under the OLD schema.sql (escalations with no `status` column) must gain
+    # it on the next init_db, back-filling existing rows to 'open' — an additive ALTER, never a destructive
+    # rewrite. Simulate the pre-lifecycle shape, then run the migration directly.
+    import sqlite3
+
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    con.execute(  # the pre-lifecycle escalations shape: no `status`
+        "CREATE TABLE escalations (escalation_id TEXT PRIMARY KEY, member_id TEXT, kind TEXT, "
+        "dedup_key TEXT, level TEXT, observation_id TEXT, interaction_id TEXT, trigger_reason TEXT, "
+        "created_at TEXT)"
+    )
+    con.execute(
+        "INSERT INTO escalations (escalation_id, member_id, kind, dedup_key, level, trigger_reason, "
+        "created_at) VALUES ('e1','C01','data_finding','k1','urgent','why','2026-01-01')"
+    )
+    con.commit()
+    assert "status" not in {r[1] for r in con.execute("PRAGMA table_info(escalations)")}
+
+    db._apply_migrations(con)  # additive: ADD COLUMN status NOT NULL DEFAULT 'open'
+
+    assert "status" in {r[1] for r in con.execute("PRAGMA table_info(escalations)")}
+    assert (  # existing row back-filled in place (not rewritten / lost)
+        con.execute(
+            "SELECT status FROM escalations WHERE escalation_id='e1'"
+        ).fetchone()[0]
+        == "open"
+    )
+    db._apply_migrations(
+        con
+    )  # idempotent: a second run is a clean no-op (column already present)
+    assert "status" in {r[1] for r in con.execute("PRAGMA table_info(escalations)")}
+    assert (  # column + back-filled data survive the no-op second run (not just "didn't raise")
+        con.execute(
+            "SELECT status FROM escalations WHERE escalation_id='e1'"
+        ).fetchone()[0]
+        == "open"
+    )
+
+
+def test_count_prompt_versions_on_excludes_the_v0_baseline():
+    # C6: the seeded v0 baseline (version 0) is NOT a /learn run and must not consume one of the day's
+    # DAILY_LEARN_CAP slots (which silently dropped the cap 20 -> 19 on a reseed / cold-start day); only
+    # real candidates (version >= 1) count.
+    from health_intelligence import learn
+
+    con = _con()
+    learn.seed_baseline_prompt(con)  # v0 row, created_at = now
+    day = con.execute(
+        "SELECT substr(created_at, 1, 10) FROM prompt_versions WHERE version = 0"
+    ).fetchone()[0]
+    assert db.count_prompt_versions_on(con, day) == 0  # v0 excluded
+    con.execute(
+        "INSERT INTO prompt_versions (version, prompt_text, status, eval_report_json, created_at) "
+        "VALUES (1, 'x', 'rejected', NULL, ?)",
+        (day + "T12:00:00",),
+    )
+    con.commit()
+    assert db.count_prompt_versions_on(con, day) == 1  # a real candidate DOES count
 
 
 def test_reference_ranges_carry_config_panic():

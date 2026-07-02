@@ -6,7 +6,9 @@ rows, with the Vitamin-D multi-band — the flagged #1 parse risk — pinned exp
 no SQLite.
 """
 
-from preprocessing.ingest import parse_reference_range
+import json
+
+from preprocessing.ingest import parse_reference_range, read_records
 
 
 def test_parse_reference_range_all_five_shapes():
@@ -36,3 +38,37 @@ def test_vitamin_d_multiband_reduces_to_deficiency_floor():
     assert parse_reference_range(
         ">=30 sufficient; 20-29 insufficient; <20 deficient", "Vitamin D (25-OH)"
     ) == [("any", 20.0, None)]
+
+
+def test_read_records_reads_array_object_and_jsonl_shapes():
+    # read_records is the shared reader every persisted members.json is re-read through (reseed /
+    # `DATASET=x make eval`). An UPLOAD can persist a members file as a JSON array, a single object, OR
+    # JSONL (all shapes it accepts), so all three must round-trip to a list — a regression to the
+    # single-object wrapping (`obj if isinstance(obj, list) else [obj]`) or the JSONL branch would crash a
+    # reseed of such a dataset in production, uncovered since the upload-level tests for it were removed.
+    assert read_records(json.dumps([{"a": 1}, {"b": 2}]).encode()) == [
+        {"a": 1},
+        {"b": 2},
+    ]
+    assert read_records(json.dumps({"member_id": "Z1"}).encode()) == [
+        {"member_id": "Z1"}
+    ]  # a single object -> a one-record list
+    assert read_records(b'{"a": 1}\n{"b": 2}\n') == [
+        {"a": 1},
+        {"b": 2},
+    ]  # JSONL -> list
+    assert read_records(b'\xef\xbb\xbf[{"a": 1}]') == [{"a": 1}]  # BOM-tolerant
+
+
+def test_load_supplied_cases_missing_eval_file_degrades_to_empty(tmp_path, monkeypatch):
+    # A dataset folder with NO eval_set.jsonl must degrade to [] (not FileNotFoundError). `/learn`'s gate
+    # runs load_cases on the ACTIVE dataset, so an eval-less / hand-assembled dataset must not crash it —
+    # coverage lost when the members-only-upload test was removed (an upload now always writes an eval file,
+    # but a dataset assembled another way may not).
+    from eval.adapter import load_supplied_cases
+
+    monkeypatch.setenv("HEALTH_DATA_ROOT", str(tmp_path))
+    (
+        tmp_path / "noeval"
+    ).mkdir()  # a dataset folder that exists but carries no eval_set.jsonl
+    assert load_supplied_cases("noeval") == []

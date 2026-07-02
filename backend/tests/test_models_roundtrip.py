@@ -18,6 +18,7 @@ from health_intelligence import config
 from health_intelligence.models import (
     FLOOR_ORDER,
     SEVERITY_ORDER,
+    ComposeDraft,
     FloorLevel,
     HealthIntelligenceResponse,
     MarkerTrajectory,
@@ -191,6 +192,65 @@ def test_ingest_is_a_strict_format_check():
     mismatch["profile"]["member_id"] = "C99"
     with pytest.raises(ValidationError):
         MemberBundle.model_validate(mismatch)
+
+
+def test_compose_draft_rejects_an_empty_answer():
+    # answer is min_length=1: an empty answer must FAIL validation so a leaked-empty tool call becomes an
+    # LLMParseError -> the deterministic grounded fallback, never a blank member message. (Raw-output
+    # repair of a leaked envelope now lives at the llm.py seam; see tests/test_llm.py.)
+    with pytest.raises(ValidationError):
+        ComposeDraft.model_validate({"answer": "", "answer_disposition": "answered"})
+
+
+def test_compose_draft_requires_answer_and_disposition():
+    # The model is strict (no in-model repair): a bare answer with no disposition, or a call with no
+    # answer at all, must raise. The upstream llm.repair_compose_output fills a dropped disposition BEFORE
+    # this validates; the type itself stays a faithful declaration of the required shape.
+    with pytest.raises(ValidationError):
+        ComposeDraft.model_validate({"answer": "Real prose, but no disposition field."})
+    with pytest.raises(ValidationError):
+        ComposeDraft.model_validate({"cited_markers": ["HbA1c"]})
+
+
+def test_compose_draft_accepts_a_valid_draft():
+    d = ComposeDraft.model_validate(
+        {
+            "answer": "Your fasting glucose is above range and rising over 5 readings.",
+            "answer_disposition": "answered",
+            "cited_markers": ["Fasting glucose"],
+        }
+    )
+    assert d.cited_markers == ["Fasting glucose"] and d.uncertainty is None
+
+
+def test_ask_request_message_and_history_content_share_the_same_cap():
+    # The wedge guard: `message` is capped at the SAME max_length as ConversationTurn.content, so a message
+    # the server accepts can always be replayed back as a history turn (a smaller/absent message cap let a
+    # >cap message 422 every FOLLOWING turn and wedge the chat).
+    from health_intelligence.models import AskRequest, ConversationTurn
+
+    msg_cap = AskRequest.model_fields["message"].metadata
+    content_cap = ConversationTurn.model_fields["content"].metadata
+    # both carry a MaxLen(8000) constraint
+    assert any(getattr(m, "max_length", None) == 8000 for m in msg_cap)
+    assert any(getattr(m, "max_length", None) == 8000 for m in content_cap)
+    # an over-cap message is rejected; an at-cap one is accepted AND replayable as a turn
+    with pytest.raises(ValidationError):
+        AskRequest.model_validate({"message": "x" * 8001})
+    ok = AskRequest.model_validate({"message": "x" * 8000})
+    ConversationTurn(
+        role="user", content=ok.message
+    )  # replay never exceeds the content cap
+    # S3: the SAME symmetry at the low end — an EMPTY message is rejected, because ConversationTurn.content
+    # requires min_length=1, so an accepted-then-replayed empty turn would 422 every following turn.
+    assert any(getattr(m, "min_length", None) == 1 for m in msg_cap)
+    with pytest.raises(ValidationError):
+        AskRequest.model_validate({"message": ""})
+    # history list cap keeps the validated set bounded (headroom over the 20-turn slice)
+    with pytest.raises(ValidationError):
+        AskRequest.model_validate(
+            {"message": "hi", "history": [{"role": "user", "content": "y"}] * 41}
+        )
 
 
 def test_safety_axes_are_ordinally_ranked():

@@ -25,6 +25,7 @@
     --ink:#1A1916; --muted:#76726B; --faint:#9C988F;
     --line:#E6E2DA; --line-soft:#EFEBE3;
     --accent:#5B2A49; --accent-press:#491F3B; --accent-tint:#F3EBEF; --accent-ink:#FFFFFF;
+    --accent-blue:#5E7BB0;  /* brand blue (the member-trajectory line tone) — readable on white, used for GET verbs */
     --good:#5F9457; --sand:#D6C4AC; --periwinkle:#9FBBE9; --coral:#E06A45;
     /* calm, never klaxon — attention = honey, urgent = coral; always paired with icon+text (§8) */
     --amber-bg:#FBF1DC; --amber-line:#D9A53E; --amber-ink:#7E5C1B;
@@ -50,7 +51,9 @@
   ::selection { background: var(--accent-tint); }
 
   /* ---- header ---------------------------------------------------------------------------------- */
-  header { background: var(--panel); border-bottom: 1px solid var(--line); }
+  /* position+z-index so header sits in its own stacking context ABOVE main; without it, the
+     later-in-DOM observations panel paints over header's escaping tooltips/dropdown and clips them. */
+  header { position: relative; z-index: 20; background: var(--panel); border-bottom: 1px solid var(--line); }
   .topbar { display: flex; align-items: center; gap: 14px; padding: 13px 22px; flex-wrap: wrap; }
   .brand { display: inline-flex; align-items: center; gap: 11px; font-size: 17px; font-weight: 600; letter-spacing: -.02em; color: var(--ink); margin-right: auto; white-space: nowrap; }
   /* sample-data notice — a persistent warning glyph (full text on hover/focus via data-tip; aria-label for SR) */
@@ -112,8 +115,9 @@
     grid-template-columns: 0 0 minmax(0, 1fr) var(--gutter) clamp(220px, var(--obs-w), 40vw);
   }
   aside, .center { min-height: 0; overflow: auto; }
-  /* operator rail: held visually apart (warm utility tint). overflow-y:auto forces overflow-x:auto,
-     so route tooltips open full-width BELOW their button (see .cp-btn[data-tip]); children don't shrink. */
+  /* operator rail: held visually apart (warm utility tint). overflow-y:auto forces overflow-x:auto, so
+     it clips in-flow tooltips — route descriptions are drawn as a fixed-position .cp-tip to the RIGHT
+     (JS, escaping the clip) instead of an ::after; children don't shrink. */
   .control { display: flex; flex-direction: column; background: var(--panel-3); padding: 16px 14px; overflow-y: auto; }
   .control > * { flex-shrink: 0; }
   .center { display: flex; flex-direction: column; background: var(--bg); }
@@ -143,12 +147,28 @@
   }
 
   /* ---- control panel (operator — deliberately plain, held apart) -------------------------------- */
-  .operator-tag {
-    font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
-    background: var(--panel); border: 1px dashed #CDC6B8; border-radius: 9px; padding: 7px 10px; margin: 0 0 14px;
+  /* Drag-and-drop bundle upload. The primary path in browsers whose native file picker won't open
+     (a Chrome instance can silently refuse the OS file-selection dialog); a drop delivers the file
+     without ever invoking that dialog. Click is a fallback for browsers where the picker works. */
+  .dropzone {
+    display: block; width: 100%; text-align: center; cursor: pointer; margin: 0 0 6px;
+    border: 1px dashed #CDC6B8; border-radius: 10px; background: var(--panel);
+    padding: 10px 12px; font-size: 11.5px; line-height: 1.45; color: var(--faint);
+    transition: border-color .15s, background .15s, color .15s;
   }
+  .dropzone:hover { border-color: var(--faint); }
+  .dropzone.dragover { border-color: var(--accent); background: var(--panel-2); color: var(--accent); }
+  .dropzone strong { color: var(--accent); font-weight: 600; }
+  /* boot / data-load failure: a visible retry instead of a blank shell when the first fetch fails
+     (e.g. the page loaded while the dev server was restarting). */
+  .boot-error { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 28px 16px; text-align: center; }
+  .boot-retry {
+    border: 1px solid var(--line); background: var(--panel); border-radius: 10px;
+    padding: 8px 16px; font-size: 13px; font-weight: 500; color: var(--ink); cursor: pointer;
+  }
+  .boot-retry:hover { border-color: var(--faint); background: var(--panel-2); }
   .cp-group { margin-bottom: 14px; }
-  .cp-group h3 { font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--faint); font-weight: 600; margin-bottom: 7px; }
+  .cp-group h3 { font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--accent); font-weight: 600; margin-bottom: 7px; }
   .cp-btn {
     position: relative; display: block; width: 100%; text-align: left; margin-bottom: 6px;
     border: 1px solid var(--line); background: var(--panel); border-radius: 10px; padding: 8px 10px; font-size: 12.5px; font-weight: 500; color: var(--ink);
@@ -156,6 +176,7 @@
   }
   .cp-btn:hover { border-color: var(--faint); background: var(--panel-2); }
   .cp-btn .verb { font-size: 9px; font-weight: 700; letter-spacing: .05em; color: var(--accent); margin-right: 7px; }
+  .cp-btn .verb-get { color: var(--accent-blue); }   /* GET verbs in brand blue; POST stays accent purple (rule above) */
   .cp-btn.destructive .verb { color: var(--coral); }
   .cp-btn.destructive:hover { border-color: var(--coral); }
 
@@ -163,18 +184,47 @@
   [data-tip] { position: relative; }
   [data-tip]:hover::after, [data-tip]:focus-visible::after {
     content: attr(data-tip); position: absolute; left: calc(100% + 8px); top: 0; z-index: 50;
-    width: 230px; background: var(--ink); color: #F5F2EC; font-size: 11.5px; line-height: 1.45;
+    /* white-space:normal is required — the tooltip ::after inherits nowrap from hosts like
+       .mode-toggle button, which would defeat the fixed width and run the text off-screen. */
+    width: 230px; white-space: normal; background: var(--ink); color: #F5F2EC; font-size: 11.5px; line-height: 1.45;
     padding: 8px 10px; border-radius: 9px; box-shadow: var(--shadow); pointer-events: none;
   }
   .tip-below:hover::after, .tip-below:focus-visible::after { left: auto; right: 0; top: calc(100% + 6px); }
-  .cp-btn[data-tip]:hover::after, .cp-btn[data-tip]:focus-visible::after { left: 0; right: 0; top: calc(100% + 4px); width: auto; }
+  /* cp-btn route tooltips are rendered by JS as a fixed-position .cp-tip to the RIGHT (escaping the rail's
+     overflow clip), so the in-flow ::after is suppressed here to avoid a second, clipped tooltip. */
+  .cp-btn[data-tip]:hover::after, .cp-btn[data-tip]:focus-visible::after { content: none; }
+  .cp-tip {
+    position: fixed; z-index: 100; width: 240px; max-width: 42vw;
+    background: var(--ink); color: #F5F2EC; font-size: 11.5px; line-height: 1.45;
+    padding: 8px 10px; border-radius: 9px; box-shadow: var(--shadow);
+    pointer-events: none; opacity: 0; visibility: hidden; transition: opacity .12s ease;
+  }
+  .cp-tip.show { opacity: 1; visibility: visible; }
+  /* the leading route (METHOD /path) is emphasised in its verb colour — same semantic as the rail's
+     .verb/.verb-get, but lightened to read on the dark tooltip (the rail's #5B2A49 is too dark here). */
+  .cp-tip .cp-tip-route { font-weight: 700; }
+  .cp-tip .cp-tip-route.post { color: #D9A6C6; }  /* lightened --accent purple, readable on --ink */
+  .cp-tip .cp-tip-route.get  { color: #9FBBE9; }  /* --periwinkle, the on-dark twin of --accent-blue */
+  .cp-tip .cp-tip-route.danger { color: #EB9476; }  /* lightened --coral — destructive routes (matches the button verb) */
 
-  .readout-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--faint); font-weight: 600; margin: 16px 0 6px; }
+  .readout-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--accent); font-weight: 600; margin: 16px 0 6px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  #readout-toggle { display: inline-flex; align-items: center; justify-content: center; padding: 2px; border: none; background: none; color: var(--accent); cursor: pointer; border-radius: 4px; opacity: .7; }
+  #readout-toggle:hover { opacity: 1; background: rgba(0,0,0,.06); }
+  #readout-toggle svg { transition: transform .15s ease; }
+  #readout-toggle[aria-expanded="false"] svg { transform: rotate(180deg); }
+  .control.readout-collapsed #cp-readout { display: none; }
+  /* The whole control rail is the scroller (.control overflow-y:auto). The readout is NOT its own
+     scroll box: it grows with its content (e.g. a tall feedback form) and flexes UP to fill the slack,
+     so the rail scrolls as one — not just the readout. (flex-shrink:0 + overflow:visible keep it from
+     collapsing into a tiny internally-scrolling pane.) */
+  .control .readout-label { margin-top: 12px; }
   #cp-readout {
     background: #211E1A; color: #D6CFC4; border-radius: 12px; padding: 11px; font-size: 11.5px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    flex: 0 0 auto; max-height: 260px; overflow: auto;
+    flex: 1 0 auto; min-height: 240px; overflow: visible;
   }
+  /* default empty state ("—"): collapse to a small window rather than reserving the full readout height. */
+  #cp-readout.is-empty { flex: 0 0 auto; min-height: 0; padding: 8px 11px; color: #6E685E; text-align: center; }
 
   /* ---- feedback form (rendered into #cp-readout — styled for the dark readout) ------------------- */
   .cp-form { display: flex; flex-direction: column; gap: 8px; font-family: inherit; color: #E7E0D5; }
@@ -195,6 +245,21 @@
   .cp-form-status { font-size: 11px; line-height: 1.45; white-space: pre-wrap; }
   .cp-form-status.ok { color: #9BD3A0; }
   .cp-form-status.err { color: #E8A28C; }
+  /* confirm-gate popup for destructive routes (house style: a custom modal, never native confirm()) */
+  .cp-modal-backdrop { position: fixed; inset: 0; z-index: 1000; background: rgba(15,13,11,.5);
+    display: flex; align-items: center; justify-content: center; padding: 20px; }
+  .cp-modal { background: #211E1A; color: #E7E0D5; border: 1px solid #3A352E; border-radius: 12px;
+    padding: 18px; width: min(380px, 100%); box-shadow: 0 20px 60px rgba(0,0,0,.45); }
+  .cp-modal-title { font-size: 14px; font-weight: 700; color: #F0E9DD; margin-bottom: 8px; }
+  .cp-modal-body { font-size: 12px; line-height: 1.55; color: #B8B0A2; margin-bottom: 16px; }
+  .cp-modal-row { display: flex; gap: 8px; justify-content: flex-end; }
+  .cp-modal button { font: inherit; font-size: 12px; font-weight: 600; border-radius: 8px;
+    padding: 8px 14px; cursor: pointer; border: 0; }
+  .cp-modal button:disabled { opacity: .5; cursor: default; }
+  .cp-modal button.cp-confirm-go { background: var(--coral); color: #fff; }
+  .cp-modal button.cp-confirm-cancel { background: transparent; color: #C9C2B6; border: 1px solid #4A443B; }
+  .cp-modal-status { font-size: 11px; margin-top: 10px; min-height: 0; }
+  .cp-modal-status.err { color: #E8A28C; }
 
   /* ---- conversation ---------------------------------------------------------------------------- */
   #conversation-log { flex: 1; padding: 24px 26px; display: flex; flex-direction: column; gap: 16px; }
@@ -203,7 +268,14 @@
     align-self: flex-end; max-width: 78%; background: var(--accent); color: #fff;
     padding: 11px 15px; border-radius: 18px 18px 5px 18px; font-size: 14.5px; line-height: 1.5; box-shadow: var(--shadow-sm);
   }
-  .pending { align-self: flex-start; color: var(--muted); font-size: 13px; background: var(--panel); border: 1px solid var(--line); border-radius: 16px 16px 16px 5px; padding: 10px 14px; box-shadow: var(--shadow-sm); }
+  .pending { align-self: flex-start; color: var(--muted); font-size: 13px; background: var(--panel); border: 1px solid var(--line); border-radius: 16px 16px 16px 5px; padding: 10px 14px; box-shadow: var(--shadow-sm); display: inline-flex; align-items: center; gap: 9px; }
+  .think-dots { display: inline-flex; gap: 4px; flex: none; }
+  .think-dots span { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: thinkBounce 1.2s infinite ease-in-out both; }
+  .think-dots span:nth-child(2) { animation-delay: .16s; }
+  .think-dots span:nth-child(3) { animation-delay: .32s; }
+  @keyframes thinkBounce { 0%, 75%, 100% { transform: translateY(0); opacity: .3; } 35% { transform: translateY(-4px); opacity: .95; } }
+  .think-msg { transition: opacity .22s ease; min-width: 0; }
+  @media (prefers-reduced-motion: reduce) { .think-dots span { animation: none; opacity: .55; } .think-msg { transition: none; } }
 
   .answer-card {
     align-self: flex-start; max-width: 90%; background: var(--panel); border: 1px solid var(--line-soft);
@@ -221,6 +293,9 @@
   .answer-text hr { border: 0; border-top: 1px solid var(--line); margin: 13px 0; }
   .answer-text code { background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; padding: 0 5px; font-family: ui-monospace, Menlo, monospace; font-size: .92em; }
   .answer-text strong { font-weight: 600; }
+  /* Mode-1 deterministic answers get the same bold-purple marker/value treatment as the Observations
+     "why am I seeing this?" panel (highlightAnswerValues → highlightValues, class shared with .obs-val). */
+  .answer-text .obs-val { font-weight: 600; color: var(--accent); }
   .disp-tag { font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
   .uncertainty { margin-top: 10px; font-size: 12.5px; line-height: 1.5; color: var(--muted); border-left: 2px solid var(--sand); padding-left: 11px; }
 
@@ -296,27 +371,37 @@
   .obs-title { font-size: 13.5px; font-weight: 600; line-height: 1.4; margin: 6px 0; }
   .obs-item details > summary { cursor: pointer; font-size: 12px; font-weight: 500; color: var(--accent); list-style: none; }
   .obs-why { font-size: 12px; line-height: 1.5; color: var(--ink); margin-top: 6px; }
+  .obs-why .obs-val { font-weight: 600; color: var(--accent); }
 
-  /* ---- trajectory sparklines (shared rendering: the dark operator readout + the light Trajectory tab) -
-     base = dark operator readout; .traj-card re-skins the SAME markup for the right panel (see below). */
-  .spark-wrap { display: flex; flex-direction: column; gap: 12px; }
+  /* ---- trajectory sparklines (the member-facing Trajectory tab). Base .spark-* carries the structural
+     layout; .traj-card re-skins the SAME markup with the right-panel palette + a light svg background. */
   .spark-card { display: flex; flex-direction: column; gap: 4px; }
   .spark-head { display: flex; align-items: baseline; gap: 8px; }
-  .spark-name { font-weight: 600; color: #E7E0D5; }
-  .spark-flag { font-size: 10.5px; color: #E0B86A; }   /* honey out-of-range — icon+TEXT, never colour alone */
-  .spark-flag.panic { color: #E8957A; }                /* coral panic */
-  .spark-sub { color: #A59C8C; font-size: 10.5px; }
-  svg.spark { display: block; background: #191613; border-radius: 7px; }
+  .spark-name { font-weight: 600; }
+  .spark-flag { font-size: 10.5px; }   /* out-of-range — surfaced as icon+TEXT, never colour alone */
+  svg.spark { display: block; border-radius: 7px; }
 
-  /* right-panel Trajectory tab: .obs-item card chrome + light text over the SAME .spark-* markup; only the
-     svg background flips to light here (the operator readout keeps the dark svg.spark bg above). The spark
-     stroke/fill colours come from the JS palette (SPARK_LIGHT), so the drawing path stays shared. */
+  /* right-panel Trajectory tab: .obs-item card chrome + the panel palette over the SAME .spark-* markup
+     (colours + light svg bg). The stroke/fill colours come from the JS palette (SPARK_LIGHT). */
   .traj-card { gap: 7px; border: 1px solid var(--line-soft); border-radius: 14px; padding: 13px 14px; margin-bottom: 10px; background: var(--panel-2); }
   .traj-card .spark-name { color: var(--ink); font-size: 13.5px; }
   .traj-card .spark-sub { color: var(--muted); font-size: 11.5px; }
   .traj-card .spark-flag { color: var(--amber-ink); }
   .traj-card .spark-flag.panic { color: var(--red-ink); }
+  /* within range AND benign per the core — a circled green check, icon only (no words). The ✓ shape carries the
+     meaning, so it isn't colour-alone; gated on severity so an in-range adverse trend never gets a calm check. */
+  .traj-card .spark-ok { display: inline-flex; align-self: center; align-items: center; justify-content: center;
+    width: 15px; height: 15px; border-radius: 50%; border: 1.2px solid var(--good); color: var(--good);
+    font-size: 9px; font-weight: 700; line-height: 1; }
   .traj-card svg.spark { width: 100%; height: auto; background: #FBFAF7; }
+  /* per-reading disclosure (member Trajectory tab only) — exact dated values for the whole series. Mirrors
+     the Observations "why am I seeing this?" <details> affordance (same summary chrome, kept in sync). */
+  .traj-card details > summary { cursor: pointer; font-size: 11.5px; font-weight: 500; color: var(--accent); list-style: none; }
+  .traj-card details[open] > summary { margin-bottom: 6px; }
+  .traj-readings { display: flex; flex-direction: column; gap: 3px; }
+  .traj-reading { display: flex; justify-content: space-between; gap: 12px; font-size: 11.5px; line-height: 1.55; }
+  .traj-reading .tr-date { color: var(--muted); }
+  .traj-reading .tr-val { color: var(--ink); font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
@@ -359,11 +444,25 @@
   <main>
     <!-- LEFT · operator control panel (not member-facing) -->
     <aside class="control" aria-label="Operator control panel">
-      <p class="operator-tag">Operator only — not part of the member view</p>
+      <input id="upload-file" type="file" accept=".zip,application/zip" hidden />
+      <button type="button" id="upload-drop" class="dropzone"
+              aria-label="Upload a new valid .zip dataset holding a .json, a .jsonl, and a .csv file: drag it here, or click to choose a file"
+              title="A .zip of a training_data-shaped folder: one .json (members), one .jsonl (eval set), one .csv (lab panels). Validated on the first row of each; buggy later rows are skipped.">
+        <strong>Upload a new valid .zip dataset</strong><br>drag &amp; drop it here
+        <br><span style="font-size:11px;color:var(--muted)">needs a .json, a .jsonl &amp; a .csv</span>
+      </button>
       <div id="cp-groups"></div>
-      <input id="upload-file" type="file" accept=".zip,application/zip,application/json,.json" hidden />
-      <div class="readout-label">Route response</div>
-      <pre id="cp-readout" aria-live="polite">—</pre>
+      <div class="readout-label">
+        <span>Route response</span>
+        <button id="readout-toggle" type="button" aria-expanded="true" aria-controls="cp-readout"
+                title="Minimize" aria-label="Minimize route response">
+          <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+            <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6"
+                  stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+      <pre id="cp-readout" class="is-empty" aria-live="polite">—</pre>
     </aside>
 
     <div class="resizer" data-resize="control" role="separator" aria-orientation="vertical" tabindex="0"
@@ -376,7 +475,7 @@
         <div id="chips" role="group" aria-label="Suggested questions"></div>
         <form id="ask-form" hidden autocomplete="off">
           <input id="ask-input" type="text" placeholder="Ask about your results in your own words…"
-                 aria-label="Ask a question" />
+                 maxlength="8000" aria-label="Ask a question" />
           <button type="submit">Ask</button>
         </form>
       </div>
@@ -436,32 +535,33 @@
   // group (/learn, /feedback, /reset) is a Phase-7 drop-in — it appears here unchanged once those
   // routes scaffold; the panel is a projection of the routes that exist (architecture §56).
   const ROUTES = [
-    { group: "Data", label: "Upload bundle", verb: "POST", handler: () => $("#upload-file").click(),
-      tip: "POST /members/upload · upload a .zip of a dataset folder shaped like backend/data/training_data/ — a lab-panels CSV + a members JSON + an optional eval JSON. Files are matched by type/content, NOT filename (the members file is the JSON whose records carry profile/panels), so the hold-out's names may differ. Effect: the whole bundle is saved as a NEW dataset folder under backend/data/ (named after the zip; files normalized to canonical names), its members are added to the existing data (no reseed; a re-used id refreshes that member), and the new members are auto-scanned so their Observations show immediately. A bare members JSON is also accepted. A malformed/unresolvable file or a name that already exists shows the error here — the upload is the format check." },
     { group: "Data", label: "Reseed (factory)", verb: "POST", destructive: true, handler: reseed,
-      tip: "POST /admin/reseed · TRUNCATE all tables and re-ingest the original training_data members. Drops uploads + all learning/audit history. Fires immediately — red cue only, no confirm." },
-    { group: "Proactive", label: "Scan member", verb: "POST", handler: () => withMember(async (m) => { await runScan(m, true); await refreshEscalations(m); }),
-      tip: "POST /members/{id}/scan · run the proactive drift scan now and refresh the Observations panel." },
-    { group: "Proactive", label: "Scan all", verb: "POST", handler: scanAll,
-      tip: "POST /members/{id}/scan for every member in turn · run the proactive drift scan across all members and summarise the per-member result here." },
-    { group: "Proactive", label: "Observations", verb: "GET", handler: () => readoutRoute((m) => `/members/${enc(m)}/observations`),
-      tip: "GET /members/{id}/observations · the member's current proactive findings (raw JSON)." },
-    { group: "Proactive", label: "Suggestions", verb: "GET", handler: () => readoutRoute((m) => `/members/${enc(m)}/suggestions`),
-      tip: "GET /members/{id}/suggestions · the Mode-1 preset chips + pre-computed answers (raw JSON)." },
-    { group: "Proactive", label: "Clinician queue", verb: "GET", handler: () => readoutRoute((m) => `/members/${enc(m)}/escalations`),
-      tip: "GET /members/{id}/escalations · the clinician-review hand-off queue (raw JSON)." },
-    { group: "Proactive", label: "Trajectory", verb: "GET", handler: showTrajectory,
-      tip: "GET /members/{id}/trajectory · each marker's series with its Theil–Sen line + flagged points, drawn as sparklines (human verification of a finding). The LLM never sees this raw series." },
+      tip: "POST /admin/reseed · Wipe all tables and re-ingest the original training_data members. Drops uploads and all learning/audit history. Asks for confirmation before firing." },
+    { group: "Proactive", label: "Scan", verb: "POST", handler: scanAll,
+      tip: "POST /members/{id}/scan · Run the proactive drift scan across every member and summarise each result here." },
+    // Sample override lives HERE, next to Scan — NOT under Learning. It is a CORRECTION (range_override):
+    // it feeds the deterministic core (db.resolve_overrides → the next Scan/Ask), a different mechanism
+    // from the signal kinds /learn consumes. Grouping it by Scan (its effect surface) keeps the panel's
+    // two-mechanism split self-evident, so an override never reads as a /learn input.
+    { group: "Proactive", label: "Sample override", verb: "POST", handler: sampleOverride,
+      tip: "POST /members/{id}/feedback · Demo correction (range_override): re-bounds the selected member's first flagged marker — press Scan to watch its out-of-range flag clear. Feeds the deterministic core, not /learn. Undo with Reset learning." },
+    { group: "Proactive", label: "Member escalations", verb: "GET", handler: () => readoutRoute((m) => `/members/${enc(m)}/escalations`),
+      tip: "GET /members/{id}/escalations · The selected member's own escalation record (raw JSON) — the drill-in detail, not the queue." },
+    // NOTE: the remaining per-member GET reads (observations · suggestions · trajectory) are intentionally NOT
+    // surfaced as control-panel buttons — those endpoints still exist in the API and drive the member-facing
+    // panels; only their operator-console buttons are hidden.
+    // CLINICIAN — the human-in-the-loop surface: the global triage queue plus the per-finding corrections a
+    // clinician files against it (read the queue, then act on a finding via feedback / a range override).
+    { group: "Clinician", label: "Clinician queue", verb: "GET", handler: () => readoutRoute(() => `/escalations`),
+      tip: "GET /escalations · The global triage queue — every open escalation across all members, ranked worst-first (urgent → clinician_review) then newest (raw JSON). No member need be selected." },
+    { group: "Clinician", label: "Submit feedback", verb: "POST", handler: feedbackForm,
+      tip: "POST /members/{id}/feedback · Record a correction (range_override · suppress_marker · preference) or a signal (helpful · incorrect · escalation_accept|reject) on the selected member. Corrections re-resolve into the core on the next scan/ask; signals feed Run learn." },
     { group: "Learning", label: "Run learn", verb: "POST", handler: runLearn,
-      tip: "POST /learn · rule-assemble a candidate composer prompt from feedback signals and gate it through the eval harness; promote iff nothing regresses. Needs ANTHROPIC_API_KEY; can take a minute." },
-    { group: "Learning", label: "Submit feedback", verb: "POST", handler: feedbackForm,
-      tip: "POST /members/{id}/feedback · open a form to record a correction (range_override · suppress_marker · preference) or a signal (helpful · incorrect · escalation_accept|reject) on the selected member. Corrections re-resolve into the core on the next scan/ask; revert with Reset learning." },
-    { group: "Learning", label: "Sample override", verb: "POST", handler: sampleOverride,
-      tip: "POST /members/{id}/feedback · one-click demo: apply a sample clinician range-override to the selected member's first flagged marker; then run Scan member to see its out-of-range flag clear. Revert with Reset learning." },
+      tip: "POST /learn · Assemble a candidate composer prompt from feedback signals and gate it through the eval harness; promote only if nothing regresses. Needs ANTHROPIC_API_KEY; can take a minute." },
     { group: "Learning", label: "Reset learning", verb: "POST", destructive: true, handler: resetLearning,
-      tip: "POST /reset · deactivate all feedback overrides and revert the composer prompt to v0. Not a data wipe. Fires immediately — red cue only, no confirm." },
-    { group: "System", label: "Health", verb: "GET", handler: () => readoutRoute(() => `/health`),
-      tip: "GET /health · liveness check." },
+      tip: "POST /reset · Deactivate all feedback overrides and revert the composer prompt to v0. Not a data wipe. Asks for confirmation before firing." },
+    // NOTE: the GET /health liveness route is intentionally NOT surfaced as a control-panel button (it's the
+    // deploy health check, not an operator action). The endpoint still exists in the API; only the UI hides it.
   ];
 
   // ---- in-memory state (no browser storage; resets on reload — CLAUDE.md) -----------------------
@@ -488,10 +588,66 @@
   // ---- tiny helpers -----------------------------------------------------------------------------
   const $ = (sel) => document.querySelector(sel);
   const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
+  // Emphasize the marker name and the deterministic injected values in member explanation prose:
+  //   • the marker name — the "Your <name> <verb>" lead-in (e.g. "HbA1c", "Vitamin D (25-OH)")
+  //   • each value — a number (word-boundary-anchored, so "HbA1c"'s 1 is NOT a value), optional en-dash
+  //     range, and any trailing % or unit-with-slash ("6 %", "109 mg/dL", "70–99 mg/dL")
+  // Purely presentational: built with text nodes + <strong>, never innerHTML, so server text can't
+  // inject markup. Values landing inside the (already-bolded) name span are skipped.
+  const VALUE_RE = /\b\d[\d.,]*(?:\s*[–-]\s*\d[\d.,]*)?(?:\s*(?:%|[A-Za-z]+\/[A-Za-z]+))?/g;
+  // Marker name at the head of a member-facing sentence. The optional "most recent / latest" qualifier is
+  // matched but NOT captured, so the Mode-1 change drill-down ("Your most recent LDL cholesterol is …")
+  // bolds just the marker, not the qualifier; observation copy ("Your LDL cholesterol is …") is unchanged.
+  const NAME_RE = /^Your (?:most recent |latest )?(.+?) (?:has been|has moved|was|is)\b/;
+  // ISO dates ("recorded 2026-01-13") appear in the Mode-1 change drill-down but never in observation
+  // copy; they are NOT clinical values, so their digits are blocked from the value highlighter (which
+  // would otherwise bold fragments like "2026-01" and "13"). No-op for observation text (no dates there).
+  const DATE_RE = /\b\d{4}-\d{2}-\d{2}\b/g;
+  const highlightValues = (node, text) => {
+    const spans = [];
+    const blocked = [];
+    let dm;
+    DATE_RE.lastIndex = 0;
+    while ((dm = DATE_RE.exec(text)) !== null) blocked.push([dm.index, dm.index + dm[0].length]);
+    const nm = NAME_RE.exec(text);
+    // span from the captured group's actual position (not a fixed "Your ".length), so the optional
+    // qualifier above shifts the marker name correctly.
+    if (nm) { const s = nm[0].indexOf(nm[1]); spans.push([s, s + nm[1].length]); }
+    let m;
+    VALUE_RE.lastIndex = 0;
+    while ((m = VALUE_RE.exec(text)) !== null) {
+      const s = m.index, e = s + m[0].length;
+      if (spans.some(([a, b]) => s >= a && s < b)) continue;  // inside the name span — already bold
+      if (blocked.some(([a, b]) => s < b && e > a)) continue;  // overlaps a date → not a clinical value
+      spans.push([s, e]);
+    }
+    spans.sort((a, b) => a[0] - b[0]);
+    let last = 0;
+    for (const [s, e] of spans) {
+      if (s > last) node.appendChild(document.createTextNode(text.slice(last, s)));
+      node.appendChild(el("strong", "obs-val", text.slice(s, e)));
+      last = e;
+    }
+    if (last < text.length) node.appendChild(document.createTextNode(text.slice(last)));
+    return node;
+  };
+  // Apply the same leading-marker + value bold-purple treatment (highlightValues) to a DETERMINISTIC
+  // Mode-1 answer's already-rendered prose, per block (paragraph / list item). Scoped to the deterministic
+  // path only — never Mode-2 LLM markdown, which styles itself — and safe to rebuild each block from its
+  // textContent because deterministic template prose carries no inline markdown to lose.
+  const highlightAnswerValues = (container) => {
+    for (const block of container.querySelectorAll("p, li")) {
+      const text = block.textContent;
+      if (!text) continue;
+      block.textContent = "";
+      highlightValues(block, text);
+    }
+  };
   const enc = encodeURIComponent;
 
-  // ---- markdown → safe HTML (the Mode-2 LLM emits markdown; Mode-1 plain prose passes through as one
-  // paragraph). No external library — keeps the page a single static file with no build step. EVERYTHING
+  // ---- markdown → safe HTML (the Mode-2 LLM emits markdown; Mode-1 deterministic prose is mostly one
+  // paragraph but the "what's changed" overview emits a per-marker bullet list). No external library —
+  // keeps the page a single static file with no build step. EVERYTHING
   // is HTML-escaped FIRST, so the only tags in the output are the small, fixed set this renderer emits
   // (headings, strong/em/code, hr, lists, paragraphs); the model can never inject live markup.
   const mdEsc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -560,20 +716,45 @@
     // a production member build (operatorView=false) drops the WHOLE operator column, not just the
     // picker/trace/gutter — so the operator panel can't reach a member (#5).
     if (!operatorView) document.body.classList.add("member-only");
+    // Static UI (control panel + handlers) never depends on the network, so render it FIRST and
+    // unconditionally — a data-load failure must never leave the operator without the control rail.
     renderControlPanel();
     wireStaticHandlers();
     wireResizers();
-    await loadMembers();
+    // One silent auto-retry: the page can load in the ~1s window while the dev server is restarting
+    // (e.g. a --reload cycle), where the first /members fetch fails. A blank shell then looked like a
+    // broken build; instead we retry once, and only then surface a manual Retry (renderBootError).
+    if (!(await loadMembers())) {
+      await new Promise((r) => setTimeout(r, 1200));
+      await loadMembers();
+    }
   }
 
+  // Load the member roster. Returns whether it succeeded so boot() can auto-retry a transient failure.
   async function loadMembers(selectId) {
     const r = await api("GET", "/members");
-    if (!r.ok) { renderReadout(r.data); return; }
+    if (!r.ok) { renderReadout(r.data); renderBootError(r); return false; }
     state.members = r.data;
     renderMemberPicker();
     const target = selectId || (state.members[0] && state.members[0].member_id);
     if (target) await selectMember(target);
     else clearMemberView();   // roster empty (last member cleared) → don't leave a stale surface (#3)
+    return true;
+  }
+
+  // Visible fallback when the roster can't load — a message + Retry in the conversation column, instead
+  // of the blank shell a failed boot fetch used to leave. The control rail is already rendered by boot().
+  function renderBootError(r) {
+    const msg = (r && r.status === 0)
+      ? "Couldn't reach the server — it may be starting up or restarting."
+      : "Couldn't load members from the server.";
+    const box = el("div", "boot-error");
+    box.appendChild(el("div", "empty-hint", msg));
+    const btn = el("button", "boot-retry", "Retry");
+    btn.type = "button";
+    btn.addEventListener("click", () => { $("#conversation-log").replaceChildren(el("div", "empty-hint", "Retrying…")); loadMembers(); });
+    box.appendChild(btn);
+    $("#conversation-log").replaceChildren(box);
   }
 
   // member-load sequence: load EXISTING state only (observations + escalations + suggestions) — all
@@ -585,8 +766,8 @@
     state.loading = true;        // block asks until the member's safety state is loaded (#2)
     syncPicker();
     renderConversation(); renderRightTabs(); renderObservations(); renderTrajectoryTab(); renderEscalationFlag(); renderChips(); updateAskDisabled();
-    // (the Trajectory tab can't load until observations are in — both tabs gate on isAnalyzed() — so the
-    // trajectory fetch waits for the post-load block below, not here.)
+    // (the Trajectory tab fetches in the post-load block below, not here — it waits only for the member-load
+    // READS to settle so state.loading clears, NOT for a scan; the trajectory series is scan-independent.)
 
     const token = state.reqToken;
     // all three are READS (GET observations / escalations / suggestions); none triggers a scan.
@@ -596,9 +777,8 @@
     // honest surface: if a safety-critical load fetch failed, don't render a falsely-calm all-clear (#4)
     state.loadError = !(obsR.ok && escR.ok);
     renderObservations(); renderEscalationFlag(); updateAskDisabled();
-    // observations are now loaded → isAnalyzed() is accurate; keep-tab-and-refetch. ensureTrajectory paints the
-    // trajectory body itself, so call ONE or the other — never both (#11 double-paint). ensureTrajectory bails
-    // to the empty state if the member isn't analyzed.
+    // member-load READS settled → fetch the trajectory if its tab is open (scan-independent, no isAnalyzed gate).
+    // ensureTrajectory paints the trajectory body itself, so call ONE or the other — never both (#11 double-paint).
     if (state.rightTab === "trajectory") ensureTrajectory(); else renderTrajectoryTab();
   }
 
@@ -606,14 +786,6 @@
   async function loadObservations(id) {
     const r = await api("GET", `/members/${enc(id)}/observations`);
     if (r.ok && id === state.currentMember) { state.observations = r.data; renderObservations(); }
-    return r;
-  }
-
-  // The ONLY scan trigger — wired solely to the operator "Run scan" button (a member scan is manual-only).
-  async function runScan(id, toReadout) {
-    const r = await api("POST", `/members/${enc(id)}/scan`);
-    if (toReadout) renderReadout(r.data);
-    if (r.ok && id === state.currentMember) { state.observations = r.data; renderObservations(); invalidateTrajectory(); }
     return r;
   }
 
@@ -631,14 +803,26 @@
                         : { member_id: m.member_id, error: r.status });
       if (r.ok && m.member_id === state.currentMember) { state.observations = r.data; renderObservations(); invalidateTrajectory(); }
     }
-    if (state.currentMember) await refreshEscalations(state.currentMember);
+    // Refresh BOTH the escalation queue AND the Mode-1 chips/answers for the on-screen member: /suggestions
+    // is a LIVE re-analyze (already reflects overrides), it was just never re-fetched after a scan — so
+    // without this, feedback moved the observations panel but left Mode 1 showing its member-select cache.
+    if (state.currentMember)
+      await Promise.all([refreshEscalations(state.currentMember), refreshSuggestions(state.currentMember)]);
     const failed = results.filter((x) => x.error != null).length;
     renderReadout({ scanned: results.length, failed, results });
   }
 
   async function refreshEscalations(id) {
     const r = await api("GET", `/members/${enc(id)}/escalations`);
-    if (r.ok && id === state.currentMember) { state.activeEscalations = r.data; renderEscalationFlag(); }
+    // Keep ONLY 'open' escalations in client state: activeEscalations drives the member-facing flag,
+    // the transition bubble, and auto-view-flagged — all "active" concerns. A 'superseded' finding (an
+    // override cleared it on a re-scan) must not re-raise the member flag (that would re-create the very
+    // false-flag we're fixing). The per-member endpoint still returns superseded rows for the raw-JSON
+    // audit readout; only this in-memory active set is filtered.
+    if (r.ok && id === state.currentMember) {
+      state.activeEscalations = (r.data || []).filter((e) => e.status === "open");
+      renderEscalationFlag();
+    }
     return r;
   }
 
@@ -681,6 +865,37 @@
     const id = state.currentMember;
     if (!id || state.asking || state.loading) return;  // don't ask before the member's escalations load (#2)
     state.asking = true; updateAskDisabled();
+    // Multi-turn context: replay the last 10 COMPLETED exchanges (20 messages) so a short follow-up
+    // ("what's the highest risk?") resolves against what was said. Built from the log BEFORE the current
+    // message is pushed, so it excludes this turn. Walk backward and stop at the cap (cheap on a long
+    // log), pairing each assistant answer with its preceding member turn: a member turn with NO following
+    // answer — a failed/pending ask left in the log — is an orphan and is dropped, so it can't re-enter
+    // history as an unanswered question. Both Mode-1 (chip) and Mode-2 (free-form) turns are paired the
+    // same way (a unified transcript). State is in memory only; the server holds no conversation store.
+    // 20 messages = 10 exchanges; mirrors the backend's MAX_HISTORY_TURNS (pipeline.py), which re-caps
+    // authoritatively — this client cap only trims the payload, so a drift here is never a safety issue.
+    const HISTORY_MSG_CAP = 20;
+    // Clamp each replayed turn to the server's per-turn cap (ConversationTurn.content max_length). A rare
+    // long composer answer (near the token limit) could otherwise exceed it and 422 the whole next turn;
+    // clamping decouples "what a turn can contain" from "what history can carry", so replay never 422s.
+    const HISTORY_CONTENT_CAP = 8000;
+    const clamp = (s) => s.length > HISTORY_CONTENT_CAP ? s.slice(0, HISTORY_CONTENT_CAP) : s;
+    const paired = [];
+    // Pair each member turn with the assistant answer IMMEDIATELY following it, by checking adjacency
+    // directly (no carried state): an orphaned member (a failed/pending ask, no following answer) is
+    // skipped so it can't re-enter history as an unanswered question, and a stray assistant with no
+    // preceding member can never be mispaired — robust to any future turn shape. A turn counts only with
+    // a real non-empty string answer. Both Mode-1 (chip) and Mode-2 turns pair the same way (unified
+    // transcript). State is in memory only; the server holds no conversation store.
+    for (let i = state.log.length - 2; i >= 0 && paired.length < HISTORY_MSG_CAP; i--) {
+      const m = state.log[i], a = state.log[i + 1];
+      if (m.kind === "member" && m.text &&
+          a.kind === "assistant" && a.resp && typeof a.resp.answer === "string" && a.resp.answer) {
+        paired.push({ role: "assistant", content: clamp(a.resp.answer) });
+        paired.push({ role: "user", content: clamp(m.text) });
+      }
+    }
+    const trimmedHistory = paired.reverse();                 // back to oldest-first
     state.log.push({ kind: "member", text: message });
     const pending = { kind: "pending" };
     state.log.push(pending);
@@ -688,7 +903,7 @@
 
     const token = state.reqToken;
     const before = new Map(state.activeEscalations.map((e) => [e.escalation_id, e.level]));
-    const r = await api("POST", `/members/${enc(id)}/ask`, { message });
+    const r = await api("POST", `/members/${enc(id)}/ask`, { message, history: trimmedHistory });
     if (token !== state.reqToken) return; // member switched mid-flight
 
     const idx = state.log.indexOf(pending);
@@ -738,11 +953,13 @@
     state.readoutKey = path;
   }
 
-  // Upload a dataset bundle (a .zip of a training_data-shaped folder, or a bare members.json array) as
-  // multipart to POST /members/upload, surface the {members, results, ranges, member_ids} summary, and
-  // on success reload the picker onto the last ingested member. A 422 shows the validation error here
-  // (the upload is the format check, ui-ux §2). Multipart can't go through api() (which forces a JSON
-  // body), so this fetches directly; the browser sets the multipart boundary Content-Type itself.
+  // Upload a dataset bundle (a .zip of a training_data-shaped folder holding one .json members file, one
+  // .jsonl eval file, and one .csv panels file) as multipart to POST /members/upload, surface the
+  // {members, results, ranges, member_ids, skipped} summary, and on success reload the picker onto the
+  // last ingested member. A 422's structured detail.failures (each {file, row, field, detail}) is shown
+  // as a readable per-row list here — the upload is the format check (ui-ux §2). Multipart can't go
+  // through api() (which forces a JSON body), so this fetches directly; the browser sets the multipart
+  // boundary Content-Type itself.
   async function onUploadFile(file) {
     const fd = new FormData();
     fd.append("file", file, file.name);
@@ -751,12 +968,34 @@
     catch (e) { return renderReadout({ error: "Upload failed to reach the server", detail: String(e) }); }
     const raw = await res.text();
     try { data = raw ? JSON.parse(raw) : null; } catch { data = raw; }
-    renderReadout(data);
+    // A 422 carries {detail: {error, failures:[{file,row,field,detail}]}} — surface each failure at the
+    // file+row it occurred, most legibly, rather than as raw JSON. (A plain-string detail falls through.)
+    const fails = data && data.detail && Array.isArray(data.detail.failures) ? data.detail.failures : null;
+    const fmt = (rows) => rows.map((f) => {
+      const where = [f.file || "bundle", f.row != null ? `row ${f.row}` : null,
+                     f.member_id ? `member ${f.member_id}` : null, f.field || null]
+        .filter(Boolean).join(" · ");
+      return `• ${where}: ${f.detail}`;
+    }).join("\n");
+    if (!res.ok && fails) {
+      renderReadout(`Upload rejected — ${data.detail.error}:\n\n${fmt(fails)}`);
+      return;
+    }
+    // Partial success: some member rows were skipped at ingest (buggy LATER rows) — surface them the same
+    // legible way, above the summary, so a partial failure isn't buried in a JSON blob (the ask: always
+    // surface the reason). A clean upload (no skips) shows the raw summary.
+    const skipped = res.ok && data && Array.isArray(data.skipped) ? data.skipped : [];
+    if (skipped.length) {
+      renderReadout(`Ingested ${data.members} member(s); skipped ${skipped.length} malformed row(s):\n\n`
+        + fmt(skipped) + `\n\n` + JSON.stringify(data, null, 2));
+    } else {
+      renderReadout(data);
+    }
     const ids = data && data.member_ids;
     if (res.ok && ids && ids.length) await loadMembers(ids[ids.length - 1]);
   }
 
-  // ---- Phase 7 control-panel handlers (Learning group + Trajectory) -----------------------------
+  // ---- Phase 7 control-panel handlers (Proactive override · Clinician feedback · Learning) -------
   async function runLearn() {
     renderReadout("Running /learn — rule-assembling a candidate prompt and gating it through the eval harness. This calls the real LLM and can take a minute…");
     const r = await api("POST", "/learn");
@@ -765,7 +1004,7 @@
 
   // Demonstrate a clinician range-override: widen a marker's range. Fires directly and always — it
   // prefers a non-panic out-of-range marker (so a later scan visibly clears its flag), else just takes
-  // the first marker so the POST goes through regardless. Does NOT scan — run "Scan member" to see the
+  // the first marker so the POST goes through regardless. Does NOT scan — press "Scan" to see the
   // effect. Reverted by "Reset learning".
   async function sampleOverride() {
     if (!state.currentMember) return renderReadout({ error: "No member selected." });
@@ -785,7 +1024,7 @@
     const fb = { kind: "range_override", target: t.marker, payload, source: "clinician" };
     const r = await api("POST", `/members/${enc(m)}/feedback`, fb);
     renderReadout(r.ok ? { applied_override: fb, feedback_id: r.data.feedback_id,
-      note: `Override applied to ${t.marker} on ${m}. Run "Scan member" to see its flag change; revert with "Reset learning".` } : r.data);
+      note: `Override applied to ${t.marker} on ${m}. Run "Scan" to see its flag change; revert with "Reset learning".` } : r.data);
   }
 
   // ---- /feedback form: the full Feedback surface (correction kinds + signal kinds), rendered into the
@@ -800,16 +1039,48 @@
       hint: "Drop a marker entirely so the core never analyzes it. Inert against a panic floor (db.py)." },
     { kind: "preference", group: "Correction", target: "none", payload: "text",
       hint: "A composer tone hint joined to the Mode-2 prompt — never a number or the escalation floor." },
-    { kind: "helpful", group: "Signal", target: "finding", payload: "none", hint: "Positive signal on a finding; feeds /learn." },
-    { kind: "incorrect", group: "Signal", target: "finding", payload: "none", hint: "Negative signal on a finding; feeds /learn." },
+    { kind: "helpful", group: "Signal", target: "finding", payload: "none", hint: "Positive signal on a finding; feeds /learn (advisory — toggles no clause on its own)." },
+    { kind: "incorrect", group: "Signal", target: "answer", payload: "correction",
+      hint: "Correct a prior answer: pick the answered question, type the right answer. /learn folds {question, corrected_answer} in as a few-shot exemplar for the composer (architecture §58)." },
     { kind: "escalation_accept", group: "Signal", target: "finding", payload: "none", hint: "Confirm an escalation was warranted; feeds /learn." },
     { kind: "escalation_reject", group: "Signal", target: "finding", payload: "none", hint: "Mark an escalation as a false alarm; feeds /learn." },
   ];
 
-  function feedbackForm() {
+  async function feedbackForm() {
     if (!state.currentMember) return renderReadout({ error: "No member selected." });
     const m = state.currentMember;
-    const host = $("#cp-readout"); host.textContent = ""; state.readoutKey = null;
+    // Target options are sourced LIVE so the field is correct-by-construction, never open-ended: markers
+    // from the member's trajectory (available pre-scan), findings from the current observations (a scan
+    // must have run). A typed-in target matching nothing returns 200 but is silently inert on scan
+    // (db._apply_overrides) — the dropdown removes that whole failure mode.
+    const traj = await api("GET", `/members/${enc(m)}/trajectory`);
+    if (!traj.ok) return renderReadout(traj.data);  // surface the error (like sampleOverride), don't show an empty dropdown
+    const markerOpts = (traj.data || []).map((t) => ({ value: t.marker, text: t.marker }));
+    const findingOpts = [
+      ...(state.observations || []).map((o) => ({ value: o.observation_id, text: `${o.title} — ${o.severity}` })),
+      // A chat-driven (ask) escalation has NO observation row, so it never appears above — include those
+      // observation-less escalations too, else escalation_accept/reject can't be filed on a chat escalation
+      // from the UI at all. target is audit-only for escalation signals (learn counts by kind), so the
+      // escalation_id is a valid target; a SCAN escalation already appears via its observation (skip it).
+      ...(state.activeEscalations || [])
+        .filter((e) => !e.observation_id)
+        .map((e) => ({ value: e.escalation_id, text: `chat escalation — ${e.level}` })),
+    ];
+    // 'incorrect' corrects an ANSWERED question. Each suggested prompt is a {question, answer} pair, loaded
+    // on member-select (so no chat is needed first); selecting one auto-fills the question and the clinician
+    // types only the corrected answer. That {question, corrected_answer} is the payload assemble_candidate()
+    // turns into a few-shot exemplar (architecture §58) — the path that was non-functional when the form
+    // sent no payload. Keep the rich objects (question/answer) in scope; the <option> carries only value.
+    const answerOpts = (state.chips || []).map((sp) => ({
+      // Key on response_id: it is UNIQUE per suggested answer, whereas a finding_id can repeat across
+      // prompts that cite the same marker — and a duplicate value would make the by-value lookup auto-fill
+      // the wrong question. It's an audit-only target (learn ignores a signal's target).
+      value: sp.response?.metadata?.response_id || sp.prompt,
+      text: sp.prompt,
+      question: sp.prompt,
+      answer: sp.response?.answer || "",
+    }));
+    const host = $("#cp-readout"); host.textContent = ""; host.classList.remove("is-empty"); state.readoutKey = null;
     const form = el("form", "cp-form"); form.setAttribute("autocomplete", "off");
 
     const sel = (label, opts, val) => {
@@ -823,45 +1094,83 @@
     form.appendChild(el("div", "cp-form-hint", `Member: ${m}`));
     const kind = sel("Kind", FEEDBACK_KINDS.map((k) => ({ value: k.kind, text: `${k.kind} (${k.group})` })), "range_override");
     form.appendChild(kind.wrap);
-    const source = sel("Source", [{ value: "clinician", text: "clinician" }, { value: "member", text: "member" }, { value: "system", text: "system" }], "clinician");
-    form.appendChild(source.wrap);
+    // Operator-panel feedback is always clinician-sourced (the panel is the clinician's surface; there is
+    // no member-facing feedback path). 'member'/'system' stay valid model values for programmatic use, but
+    // a member-sourced CORRECTION would be inert (db.resolve_overrides honors clinician/system only), so
+    // offering them here would only invite a silent no-op — the source is fixed, not a field.
 
-    // payload/target inputs, shown/hidden per kind
-    const targetInput = el("input"); targetInput.placeholder = "marker key (e.g. HbA1c)";
-    const targetField = field("Target", targetInput);
+    // payload/target inputs, shown/hidden per kind. Target is a DROPDOWN (markers or findings per kind),
+    // not a free-text box — a non-matching target can no longer be entered.
+    const targetSel = el("select");
+    const targetField = field("Target", targetSel);
+    const setTargetOptions = (opts, placeholder) => {
+      targetSel.textContent = "";
+      const ph = el("option", null, placeholder); ph.value = ""; ph.disabled = true; ph.selected = true;
+      targetSel.appendChild(ph);
+      for (const o of opts) { const op = el("option", null, o.text); op.value = o.value; targetSel.appendChild(op); }
+    };
     const refLow = el("input"); refLow.type = "number"; refLow.step = "any"; refLow.placeholder = "ref_low";
     const refHigh = el("input"); refHigh.type = "number"; refHigh.step = "any"; refHigh.placeholder = "ref_high";
     const rangeRow = el("div", "cp-form-row");
     rangeRow.appendChild(field("Ref low", refLow)); rangeRow.appendChild(field("Ref high", refHigh));
     const prefText = el("textarea"); prefText.placeholder = "preference hint (tone only — never numbers)";
     const prefField = field("Preference text", prefText);
+    // 'incorrect' correction inputs: an auto-filled, read-only Question + the original answer for context,
+    // and the one thing the clinician types — the corrected answer.
+    const corrQ = el("input"); corrQ.disabled = true; corrQ.placeholder = "select an answered question above";
+    const corrOrig = el("div", "cp-form-hint");
+    const corrAnswer = el("textarea"); corrAnswer.placeholder = "the corrected answer (what the assistant should have said)";
+    const corrField = el("div");
+    corrField.appendChild(field("Question (auto-filled)", corrQ));
+    corrField.appendChild(corrOrig);
+    corrField.appendChild(field("Corrected answer", corrAnswer));
     const hint = el("div", "cp-form-hint");
     const status = el("div", "cp-form-status");
     const submit = el("button", null, "Submit feedback"); submit.type = "submit";
 
-    form.appendChild(targetField); form.appendChild(rangeRow); form.appendChild(prefField);
+    form.appendChild(targetField); form.appendChild(rangeRow); form.appendChild(prefField); form.appendChild(corrField);
     form.appendChild(hint); form.appendChild(submit); form.appendChild(status);
 
+    const optsFor = (t) => (t === "finding" ? findingOpts : t === "answer" ? answerOpts : markerOpts);
     const spec = () => FEEDBACK_KINDS.find((k) => k.kind === kind.s.value);
     function syncFields() {
       const k = spec();
       targetField.hidden = k.target === "none";
-      targetInput.placeholder = k.target === "finding" ? "finding_id" : "marker key (e.g. HbA1c)";
+      if (k.target === "marker")
+        setTargetOptions(markerOpts, markerOpts.length ? "Select a marker…" : "(this member has no markers)");
+      else if (k.target === "finding")
+        setTargetOptions(findingOpts, findingOpts.length ? "Select a finding…" : '(no findings or escalations yet — run "Scan" or ask a question)');
+      else if (k.target === "answer")
+        setTargetOptions(answerOpts, answerOpts.length ? "Select an answered question…" : "(no answers yet — ask a question or run a scan first)");
       rangeRow.hidden = k.payload !== "range";
       prefField.hidden = k.payload !== "text";
+      corrField.hidden = k.payload !== "correction";
       hint.textContent = k.hint;
       status.textContent = ""; status.className = "cp-form-status";
+      syncAnswerFill();
+    }
+    function syncAnswerFill() {  // auto-fill the read-only question + original answer from the picked answer
+      const opt = answerOpts.find((o) => o.value === targetSel.value);
+      corrQ.value = opt ? opt.question : "";
+      corrOrig.textContent = opt ? `Current answer: ${opt.answer}` : "";
     }
     kind.s.addEventListener("change", syncFields);
+    targetSel.addEventListener("change", syncAnswerFill);
     syncFields();
 
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const k = spec();
-      const target = targetInput.value.trim();
+      const target = targetSel.value;
       let payload = null;
-      if (k.target !== "none" && !target)
-        return setStatus(status, "err", `${k.kind} needs a ${k.target === "finding" ? "finding_id" : "marker"} target — without it the feedback matches nothing and silently no-ops.`);
+      if (k.target !== "none" && !target) {
+        const empty = { marker: "this member has no markers to target.",
+          finding: 'no findings or escalations to signal on — run "Scan" or ask a question first.',
+          answer: "no answers to correct yet — ask a question or run a scan first." };
+        return setStatus(status, "err", optsFor(k.target).length === 0
+          ? empty[k.target]
+          : `select ${k.target === "answer" ? "an answer" : "a " + k.target} from the Target dropdown.`);
+      }
       if (k.payload === "range") {
         const lo = refLow.value.trim(), hi = refHigh.value.trim();
         if (!lo && !hi) return setStatus(status, "err", "range_override needs at least one of ref_low / ref_high.");
@@ -870,18 +1179,31 @@
         const t = prefText.value.trim();
         if (!t) return setStatus(status, "err", "preference needs some text.");
         payload = { text: t };
+      } else if (k.payload === "correction") {
+        const opt = answerOpts.find((o) => o.value === target);  // target is set (passed the check above)
+        const corrected = corrAnswer.value.trim();
+        if (!corrected) return setStatus(status, "err", "type the corrected answer.");
+        payload = { question: opt.question, corrected_answer: corrected };  // → assemble_candidate few-shot exemplar
       }
-      const fb = { kind: k.kind, target: k.target === "none" ? null : target, payload, source: source.s.value };
+      const fb = { kind: k.kind, target: k.target === "none" ? null : target, payload, source: "clinician" };
       submit.disabled = true; setStatus(status, "", "Submitting…");
       const r = await api("POST", `/members/${enc(m)}/feedback`, fb);
       submit.disabled = false;
       if (r.ok) {
         const note = k.payload === "range" || k.kind === "suppress_marker"
-          ? ' Run "Scan member" to see the flag change; revert with "Reset learning".'
-          : ' Feeds the next "Run learn" gate.';
+          ? ' Run "Scan" to see the flag change; revert with "Reset learning".'
+          : k.payload === "correction"
+            ? ' Press "Run learn" to fold this correction into the composer prompt (gated by the eval harness).'
+            : ' Feeds the next "Run learn" gate.';
         setStatus(status, "ok", `Recorded ${k.kind} (feedback_id ${r.data.feedback_id}).${note}`);
       } else {
-        setStatus(status, "err", typeof r.data === "string" ? r.data : JSON.stringify(r.data));
+        // Prefer FastAPI's {detail} STRING (the input bar's "rephrase this" reason on a 422); fall back to
+        // readable JSON for the other shapes — notably Pydantic body-validation errors, whose `detail` is an
+        // ARRAY (stringifying the array directly would render "[object Object]").
+        const detail = r.data && r.data.detail;
+        const msg = typeof detail === "string" ? detail
+          : typeof r.data === "string" ? r.data : JSON.stringify(r.data);
+        setStatus(status, "err", msg);
       }
     });
     host.appendChild(form);
@@ -889,38 +1211,113 @@
 
   function setStatus(node, cls, msg) { node.className = "cp-form-status" + (cls ? " " + cls : ""); node.textContent = msg; }
 
-  // Reset learning + factory reseed fire DIRECTLY (no confirm) — the operator panel is an unrestricted
-  // API console; whatever the route returns is shown in the readout.
-  async function resetLearning() {
-    const r = await api("POST", "/reset");
-    renderReadout(r.data);
-    if (state.currentMember) await refreshEscalations(state.currentMember);  // a READ; no scan (run one to see flag changes)
+  // Reset learning + factory reseed are irreversible-from-the-UI, so each routes through a confirm
+  // popup before firing (house style: a custom modal overlay, never native confirm() — the panel owns
+  // its own dialog). The wrappers below ARE the ROUTES handlers; the do* functions carry the actual
+  // call, run only on Confirm. On confirm, run() renders the route result into the readout as usual.
+  function confirmDestructive({ title, body, confirmLabel, run }) {
+    const backdrop = el("div", "cp-modal-backdrop");
+    const modal = el("div", "cp-modal");
+    modal.setAttribute("role", "dialog"); modal.setAttribute("aria-modal", "true"); modal.setAttribute("aria-label", title);
+    const status = el("div", "cp-modal-status");
+    const row = el("div", "cp-modal-row");
+    const cancel = el("button", "cp-confirm-cancel", "Cancel"); cancel.type = "button";
+    const go = el("button", "cp-confirm-go", confirmLabel); go.type = "button";
+    let busy = false;  // a destructive request is in flight
+    // Escape / backdrop-click must NOT dismiss while busy: there is no AbortController, so the request runs
+    // to completion regardless — dismissing would read as "cancelled" while the wipe proceeds, and a later
+    // error would write to the detached status node (never shown). Cancel is disabled while busy, so only
+    // these two paths need the guard.
+    const close = () => { if (busy) return; backdrop.remove(); document.removeEventListener("keydown", onKey); };
+    const onKey = (e) => { if (e.key === "Escape") close(); };
+    cancel.addEventListener("click", close);
+    backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(); });  // click outside the card dismisses
+    go.addEventListener("click", async () => {
+      busy = true;
+      go.disabled = cancel.disabled = true; status.className = "cp-modal-status"; status.textContent = "Working…";
+      try { await run(); busy = false; close(); }  // route result lands in the readout; then dismiss the popup
+      catch (e) { busy = false; status.className = "cp-modal-status err"; status.textContent = String(e); go.disabled = cancel.disabled = false; }
+    });
+    row.appendChild(cancel); row.appendChild(go);
+    modal.appendChild(el("div", "cp-modal-title", title));
+    modal.appendChild(el("div", "cp-modal-body", body));
+    modal.appendChild(row); modal.appendChild(status);
+    backdrop.appendChild(modal);
+    document.body.appendChild(backdrop);
+    document.addEventListener("keydown", onKey);
+    cancel.focus();  // focus the SAFE default (not the destructive action) for keyboard flow
   }
 
-  async function reseed() {
+  function resetLearning() {
+    confirmDestructive({
+      title: "Reset all learning?",
+      body: "Deactivates every feedback override and reverts the composer prompt to v0. Not a data wipe — feedback rows and prompt-version history are preserved — but it cannot be undone from the UI.",
+      confirmLabel: "Reset learning",
+      run: doResetLearning,
+    });
+  }
+  async function doResetLearning() {
+    const r = await api("POST", "/reset");
+    renderReadout(r.data);
+    // /reset now RE-SCANS (server-side) the members whose overrides it reverted, so the clinician queue,
+    // observations, and Mode-1 chips actively revert. Reload the current member's view to reflect it.
+    if (state.currentMember) {
+      await Promise.all([
+        loadObservations(state.currentMember),
+        refreshEscalations(state.currentMember),
+        refreshSuggestions(state.currentMember),
+      ]);
+      invalidateTrajectory();
+      if (state.rightTab === "trajectory") ensureTrajectory(); else renderTrajectoryTab();
+    }
+  }
+
+  function reseed() {
+    confirmDestructive({
+      title: "Factory reseed?",
+      body: "Wipes every table and re-ingests the original training_data members. Permanently drops all uploaded datasets, feedback, learning, and audit history, restoring the initial 15 members. This cannot be undone.",
+      confirmLabel: "Reseed (delete all)",
+      run: doReseed,
+    });
+  }
+  async function doReseed() {
     const r = await api("POST", "/admin/reseed");
     renderReadout(r.data);
     clearMemberView(); await loadMembers();  // picker repopulates with the restored 15
   }
 
-  // ---- trajectory sparklines (shared by the dark operator readout AND the light Trajectory tab) -------
+  // ---- trajectory sparklines (the member-facing Trajectory tab) ----------------------------------------
   const SVGNS = "http://www.w3.org/2000/svg";
   const svg = (tag, attrs) => { const n = document.createElementNS(SVGNS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); return n; };
-  // the only thing that differs between the two surfaces is the colour palette (svg stroke/fill attrs) — the
-  // geometry is identical. DARK = the existing operator-readout colours (byte-identical to before); LIGHT =
-  // right-panel colours (the svg *background* is handled by CSS: svg.spark vs .traj-card svg.spark).
-  const SPARK_DARK  = { band: "#2C2823", trend: "#8A8276", line: "#9FBBE9", point: "#9FBBE9", flagAmber: "#E0B86A", flagPanic: "#E8957A" };
-  const SPARK_LIGHT = { band: "#ECE7DD", trend: "#B7B1A6", line: "#5E7BB0", point: "#5E7BB0", flagAmber: "#D9A53E", flagPanic: "#E06A45" };
+  // the right-panel palette (svg stroke/fill attrs); the svg *background* is handled by CSS (.traj-card
+  // svg.spark). `sparkSvg` still takes a `palette` arg so the geometry stays separable from the colours.
+  const SPARK_LIGHT = { good: "#5F9457", bad: "#E06A45", axis: "#9A9382", trend: "#B7B1A6", line: "#5E7BB0", point: "#5E7BB0", flagAmber: "#D9A53E", flagPanic: "#E06A45" };
+  // trim a reference bound to a short axis label: integers as-is, else one decimal, no trailing zero ("18.5", "100", "5.7").
+  // Show the TRUE bound, matching the backend member_explanation format (templates._fmt_num = f"{x:g}"):
+  // toFixed(1) rounded a real 2-decimal bound (creatinine 0.74/1.35) to a value the deterministic core
+  // never produced (0.7/1.4), disagreeing with the narrated "0.74–1.35". toPrecision(6) trims float noise,
+  // then Number→String drops trailing zeros — "0.74", "1.35", "100", "5.7" — the {:g} equivalent.
+  const fmtBound = (v) => String(Number(v.toPrecision(6)));
   const SEV_RANK = { urgent: 3, attention: 2, notable: 1, info: 0 };  // Trajectory-tab ordering: flagged markers first
+  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  // format an ISO "YYYY-MM-DD" as "12 Feb 2024" by parts (NOT new Date(): that parses as UTC midnight and can
+  // shift a day in a negative-offset timezone — these are calendar dates, never instants).
+  function fmtReadingDate(iso) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || "");
+    return m ? `${parseInt(m[3], 10)} ${MONTHS[+m[2] - 1]} ${m[1]}` : (iso || "—");
+  }
 
-  // A member is "analyzed" once a scan has produced observations. BOTH right-panel tabs gate on this one
-  // condition so they wait for the scan together — never trajectory-full while observations-empty. Until
-  // then both show the same empty state. (A member with any flagged marker WILL raise an observation when
-  // scanned, so this also means the Trajectory tab never asserts a flag the Observations tab doesn't.)
+  // A member is "analyzed" once a scan has produced observations. ONLY the Observations tab gates on this —
+  // it is the proactive surface ("we flagged this for you"), so it waits for the scan and shows NO_RESULTS_MSG
+  // until one runs. The Trajectory tab does NOT gate: it is the inspection surface, drawn from GET /trajectory
+  // (live analyze(), scan-independent), and renders the raw series + its core flags even before a scan —
+  // sparkCard still surfaces out-of-range/panic as icon+text, so a pre-scan trajectory is MORE truthful, never
+  // a falsely-calm one. The tabs are deliberately decoupled (Trajectory can show a flag pre-scan that
+  // Observations will only echo once scanned).
   // Copy note: deliberately NOT "Not analyzed yet" — that would be false for a scanned-clean member (a calm
   // member's scan correctly writes zero observations), and would contradict an active care-team flag. This
   // wording is honest whether the member is unscanned OR scanned-with-nothing-notable.
-  const NO_RESULTS_MSG = "No results to show yet — run a scan to refresh.";
+  const NO_RESULTS_MSG = "No results to show yet — insights appear here once your latest lab results have been reviewed.";
   function isAnalyzed() { return state.observations.length > 0; }
 
   // shared 'message + Retry chip' empty-state builder (#10) — used by the load-error and trajectory-error paths.
@@ -931,58 +1328,65 @@
     host.appendChild(retry);
   }
 
-  async function showTrajectory() {
-    if (!state.currentMember) return renderReadout({ error: "No member selected." });
-    const path = `/members/${enc(state.currentMember)}/trajectory`;
-    if (state.readoutKey === path) { renderReadout("—"); return; }  // second click toggles back to default
-    const r = await api("GET", path);
-    if (!r.ok) return renderReadout(r.data);
-    renderTrajectory(r.data);
-    state.readoutKey = path;  // toggle armed, like readoutRoute (renderReadout disarms it on any other write)
-  }
-
-  function renderTrajectory(markers) {
-    const host = $("#cp-readout");
-    host.textContent = "";
-    if (!markers || !markers.length) { host.textContent = "No markers."; return; }
-    const wrap = el("div", "spark-wrap");
-    for (const t of markers) wrap.appendChild(sparkCard(t, SPARK_DARK, false));
-    host.appendChild(wrap);
-  }
-
-  // one card for one marker's series. `palette` colours the svg; `light` swaps in right-panel card chrome
-  // (.traj-card) and the spec caption (no trend suffix). The dark/operator path passes (SPARK_DARK, false).
-  function sparkCard(t, palette, light) {
-    const card = el("div", light ? "spark-card traj-card" : "spark-card");
+  // one card for one marker's series (the member-facing Trajectory tab). The caption is exactly the spec line
+  // (no trend suffix), and a per-reading disclosure echoes the exact dated values beneath it.
+  function sparkCard(t) {
+    const card = el("div", "spark-card traj-card");
     const vals = t.readings.map((r) => r.value);
     const panic = t.flags.find((f) => f.startsWith("panic"));
     const flag = panic || t.flags.find((f) => f === "above_range" || f === "below_range");
+    const rr = t.reference_range || {};
+    const oneSided = (rr.ref_low == null) !== (rr.ref_high == null);  // exactly one bound → "threshold", not "range"
     const head = el("div", "spark-head");
     head.appendChild(el("span", "spark-name", t.marker));
     if (flag) {  // surface out-of-range/panic status as icon+TEXT, not colour alone — and not trend-only
       const lab = el("span", "spark-flag" + (panic ? " panic" : ""));
-      lab.textContent = `${panic ? "‼" : "⚑"} ${flag.replace("_", " ")}`;
+      const text = panic ? flag.replace("_", " ")
+        : oneSided ? flag.replace("_range", " threshold") : flag.replace("_", " ");
+      lab.textContent = `${panic ? "‼" : "⚑"} ${text}`;
       head.appendChild(lab);
+    } else if ((rr.ref_low != null || rr.ref_high != null) && t.severity === "info") {
+      // within its bound(s) AND benign per the deterministic core → a circled green check, icon only. Only when
+      // the marker HAS a bound to be "in range" against, and only at severity "info" — an in-range value with an
+      // escalating adverse trend (severity ≥ notable) must NOT get a calm check (Escalation ≠ out-of-range, but
+      // in-range CAN escalate). A boundless marker asserts nothing either way, so gets no check.
+      const ok = el("span", "spark-ok");
+      ok.textContent = "✓";
+      ok.setAttribute("title", oneSided ? "within threshold" : "within range");
+      ok.setAttribute("aria-label", oneSided ? "within threshold" : "within range");
+      head.appendChild(ok);
     }
     card.appendChild(head);
-    card.appendChild(sparkSvg(t, vals, !!panic, !!flag, palette));
+    card.appendChild(sparkSvg(t, vals, !!panic, !!flag, SPARK_LIGHT));
     const last = t.readings[t.readings.length - 1];
     const lastVal = last ? last.value : "—";
-    if (light) {  // the member-facing caption is exactly the spec line — no trend suffix
-      card.appendChild(el("div", "spark-sub", `${vals.length} readings · latest ${lastVal}${t.unit ? " " + t.unit : ""}`));
-    } else {
-      // operator readout keeps the richer caption: show the Theil–Sen direction where one is asserted; for a
-      // sub-n_min series (no MK verdict) say so explicitly, so the absent trend line reads as honest abstention.
-      const dir = t.trend
-        ? (t.trend.slope != null ? ` · ${t.trend.direction}` : "")
-        : " · trend not computed (short series)";
-      card.appendChild(el("div", "spark-sub", `${vals.length} readings · latest ${lastVal} ${t.unit || ""}${dir}`));
-    }
+    card.appendChild(el("div", "spark-sub", `${vals.length} readings · latest ${lastVal}${t.unit ? " " + t.unit : ""}`));
+    // per-reading disclosure: the exact dated value for every reading, so the sparkline isn't the only way to
+    // read the numbers. Pure echo of /trajectory readings (the member's own measured inputs) — no recomputed
+    // classification, so it asserts nothing the deterministic core didn't produce. Chronological, matching the
+    // chart's left→right order.
+    if (t.readings.length) card.appendChild(readingsDetails(t));
     return card;
   }
 
+  // collapsible list of the exact dated value for every reading in a marker's series (member Trajectory tab).
+  // Echoes t.readings verbatim (date + value + unit) — no classification, ordered oldest→newest like the chart.
+  function readingsDetails(t) {
+    const d = el("details");
+    d.appendChild(el("summary", null, `All ${t.readings.length} readings`));
+    const list = el("div", "traj-readings");
+    for (const r of t.readings) {
+      const row = el("div", "traj-reading");
+      row.appendChild(el("span", "tr-date", fmtReadingDate(r.date)));
+      row.appendChild(el("span", "tr-val", `${r.value}${t.unit ? " " + t.unit : ""}`));
+      list.appendChild(row);
+    }
+    d.appendChild(list);
+    return d;
+  }
+
   function sparkSvg(t, vals, panic, flagged, palette) {
-    const W = 240, H = 46, pad = 5, n = vals.length;
+    const W = 240, H = 46, pad = 5, axisW = 32, n = vals.length;  // axisW: left gutter reserved for the bound numbers
     const rr = t.reference_range || {};
     const domain = [...vals];
     if (t.theil_sen) for (const p of t.theil_sen) domain.push(p.value);
@@ -990,11 +1394,31 @@
     if (rr.ref_high != null) domain.push(rr.ref_high);
     let lo = Math.min(...domain), hi = Math.max(...domain);
     if (hi === lo) { hi += 1; lo -= 1; }
-    const x = (i) => (n <= 1 ? W / 2 : pad + (i / (n - 1)) * (W - 2 * pad));
+    const plotL = axisW, plotR = W - pad;  // the plot area sits right of the axis gutter
+    const x = (i) => (n <= 1 ? (plotL + plotR) / 2 : plotL + (i / (n - 1)) * (plotR - plotL));
     const y = (v) => H - pad - ((v - lo) / (hi - lo)) * (H - 2 * pad);
     const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, class: "spark", width: W, height: H, role: "img", "aria-label": `${t.marker} trend over ${n} readings` });
-    if (rr.ref_low != null && rr.ref_high != null)  // the normal band, faint
-      s.appendChild(svg("rect", { x: 0, y: y(rr.ref_high), width: W, height: Math.max(1, y(rr.ref_low) - y(rr.ref_high)), fill: palette.band }));
+    // reference regions: the good (in-range) area green, the bad (out-of-range) area red, both at 0.1 opacity.
+    // The range's SHAPE defines "good" = inside — no adverse-direction config needed: only-ref_high ⇒ good is
+    // below it (LDL <100), only-ref_low ⇒ good is above it (Vitamin D ≥20), both ⇒ good is the band between.
+    // y() maps higher value → smaller y (top), so "above ref_high" is 0→y(ref_high) and "below ref_low" is y(ref_low)→H.
+    const region = (yTop, yBot, fill) => s.appendChild(svg("rect",
+      { x: plotL, y: yTop, width: plotR - plotL, height: Math.max(0, yBot - yTop), fill, "fill-opacity": "0.1" }));
+    const bounds = [];
+    if (rr.ref_high != null) { region(0, y(rr.ref_high), palette.bad); bounds.push(rr.ref_high); }  // above upper bound = bad
+    if (rr.ref_low != null) { region(y(rr.ref_low), H, palette.bad); bounds.push(rr.ref_low); }      // below lower bound = bad
+    if (rr.ref_low != null || rr.ref_high != null)  // the good area is what's left, open on any side with no bound
+      region(rr.ref_high != null ? y(rr.ref_high) : 0, rr.ref_low != null ? y(rr.ref_low) : H, palette.good);
+    for (const b of bounds) {  // a hairline divider + its numeric label at each bound
+      s.appendChild(svg("line", { x1: plotL, y1: y(b), x2: plotR, y2: y(b), stroke: palette.axis, "stroke-width": "0.5", "stroke-opacity": "0.6" }));
+      axisLabel(b);
+    }
+    // left-axis numeric label for a bound, right-aligned in the gutter at the bound's height
+    function axisLabel(v) {
+      const txt = svg("text", { x: axisW - 4, y: y(v) + 2.8, "text-anchor": "end", "font-size": "8", fill: palette.axis });
+      txt.textContent = fmtBound(v);
+      s.appendChild(txt);
+    }
     if (t.theil_sen && t.theil_sen.length === 2)  // the already-computed Theil–Sen line, dashed
       s.appendChild(svg("line", { x1: x(0), y1: y(t.theil_sen[0].value), x2: x(n - 1), y2: y(t.theil_sen[1].value), stroke: palette.trend, "stroke-width": 1, "stroke-dasharray": "3 3" }));
     s.appendChild(svg("polyline", { points: vals.map((v, i) => `${x(i)},${y(v)}`).join(" "), fill: "none", stroke: palette.line, "stroke-width": 1.5 }));
@@ -1006,8 +1430,8 @@
   }
 
   // ---- right-panel tabs: Observations (default) | Trajectory ------------------------------------
-  // The Trajectory tab is a SECOND member-facing surface of GET /trajectory (the operator readout is the
-  // first). It is presentation only — the LLM never consumes this; the model sees only the collapsed verdict.
+  // The Trajectory tab is the member-facing surface of GET /trajectory. It is presentation only — the LLM
+  // never consumes this; the model sees only the collapsed verdict.
   function selectRightTab(tab) {
     state.rightTab = tab;
     renderRightTabs();
@@ -1026,8 +1450,10 @@
   // fetch the per-member trajectory once and cache it (state.trajectory). Guarded by trajToken so a result
   // that lands after a member switch OR a scan-invalidation is dropped (never paints a stale/wrong series).
   async function ensureTrajectory() {
-    // don't fetch (or show) trajectory until the member is analyzed — both tabs wait for the scan together
-    if (!state.currentMember || !isAnalyzed()) { renderTrajectoryTab(); return; }
+    // trajectory is live-derived from analyze() (GET /trajectory) and is scan-independent — fetch as soon as a
+    // member is selected, never wait for a scan. Only the Observations tab gates on isAnalyzed(); the tabs are
+    // deliberately decoupled (the Trajectory tab is the inspection surface, shown even before a scan).
+    if (!state.currentMember) { renderTrajectoryTab(); return; }
     if (state.trajLoading || state.trajectory !== null) { renderTrajectoryTab(); return; }
     state.trajLoading = true; state.trajError = false;
     renderTrajectoryTab();  // loading indicator
@@ -1055,13 +1481,13 @@
     if (state.loadError)  // member-load failed → honest, never a false "run a scan" (matches Observations, #4)
       return appendRetry(host, "⚠ Couldn't load your results — check your connection.", () => { if (state.currentMember) selectMember(state.currentMember); });
     if (state.loading) { host.appendChild(el("div", "obs-sub", "Loading…")); return; }  // member-load in flight → not a false "run a scan" (#4)
-    if (!isAnalyzed()) { host.appendChild(el("div", "obs-sub", NO_RESULTS_MSG)); return; }  // wait for the scan, with Observations
+    // no isAnalyzed() gate here — trajectory is scan-independent and shown pre-scan; only Observations waits for the scan.
     if (state.trajLoading) { host.appendChild(el("div", "obs-sub", "Loading your trends…")); return; }
     if (state.trajError) return appendRetry(host, "⚠ Couldn't load trends.", ensureTrajectory);
     if (state.trajectory === null) return;  // not fetched yet (tab hidden) — leave the body empty
     if (!state.trajectory.length) { host.appendChild(el("div", "obs-sub", "No markers to show.")); return; }
     // already sorted at cache time (flagged markers first, #12) — just render.
-    for (const t of state.trajectory) host.appendChild(sparkCard(t, SPARK_LIGHT, true));
+    for (const t of state.trajectory) host.appendChild(sparkCard(t));
   }
 
   // ============================== RENDER ==========================================================
@@ -1071,11 +1497,15 @@
     for (const g of groups) {
       const sec = el("div", "cp-group");
       sec.appendChild(el("h3", null, g));
+      // The upload dropzone lives at the TOP of the Data group, above the Reseed button. It's authored as
+      // static markup (so wireStaticHandlers can bind its drag/drop by id) and relocated here into the
+      // group. Safe because renderControlPanel runs exactly once (boot); it is not a re-render target.
+      if (g === "Data") sec.appendChild($("#upload-drop"));
       for (const route of ROUTES.filter((r) => r.group === g)) {
         const b = el("button", "cp-btn" + (route.destructive ? " destructive" : ""));
         b.setAttribute("data-tip", route.tip);        // the styled hover tooltip
         b.setAttribute("aria-label", `${route.label}. ${route.tip}`); // screen-reader text (no title= → no duplicate native tooltip)
-        b.appendChild(el("span", "verb", route.verb));
+        b.appendChild(el("span", "verb verb-" + route.verb.toLowerCase(), route.verb));  // verb-get / verb-post → colour by method
         b.appendChild(document.createTextNode(route.label));
         b.addEventListener("click", route.handler);
         sec.appendChild(b);
@@ -1083,6 +1513,50 @@
       host.appendChild(sec);
     }
   }
+
+  // Route-button tooltips: ONE fixed-position box so the description sits to the RIGHT of the button and
+  // ESCAPES the rail's overflow clip (.control scrolls → overflow-x computes to auto, which would clip an
+  // in-flow ::after; cp-btn opts out of the ::after in CSS). Delegated, so it survives renderControlPanel()
+  // re-renders, and keyboard :focus shows it too; it detaches on rail scroll / resize.
+  (function routeTooltips() {
+    const tip = el("div", "cp-tip");
+    document.body.appendChild(tip);
+    let cur = null;
+    const show = (btn) => {
+      const text = btn.getAttribute("data-tip");
+      if (!text) return;
+      cur = btn;
+      // emphasise the leading route (METHOD /path) in its verb colour; rest stays plain text (both via
+      // textContent, so no injection). e.g. "POST /members/{id}/feedback · open a form…".
+      tip.textContent = "";
+      const routeMatch = text.match(/^(GET|POST|PUT|PATCH|DELETE)\s+(\/\S*)/);
+      if (routeMatch) {
+        // destructive routes borrow the button's coral verb colour; otherwise colour by HTTP method
+        const tone = btn.classList.contains("destructive") ? "danger" : routeMatch[1].toLowerCase();
+        const route = el("span", "cp-tip-route " + tone, routeMatch[0]);
+        tip.appendChild(route);
+        tip.appendChild(document.createTextNode(text.slice(routeMatch[0].length)));
+      } else {
+        tip.textContent = text;
+      }
+      tip.classList.add("show"); // shown first so offsetHeight measures the wrapped height
+      const r = btn.getBoundingClientRect();
+      const m = 8;
+      let top = r.top;
+      if (top + tip.offsetHeight > window.innerHeight - m)
+        top = Math.max(m, window.innerHeight - m - tip.offsetHeight); // clamp long tips into view
+      tip.style.left = Math.round(r.right + 8) + "px";
+      tip.style.top = Math.round(top) + "px";
+    };
+    const hide = () => { cur = null; tip.classList.remove("show"); };
+    const btnAt = (e) => (e.target.closest ? e.target.closest(".cp-btn[data-tip]") : null);
+    document.addEventListener("mouseover", (e) => { const b = btnAt(e); if (b && b !== cur) show(b); });
+    document.addEventListener("mouseout", (e) => { const b = btnAt(e); if (b && !b.contains(e.relatedTarget)) hide(); });
+    document.addEventListener("focusin", (e) => { const b = btnAt(e); if (b) show(b); });
+    document.addEventListener("focusout", (e) => { if (btnAt(e)) hide(); });
+    document.addEventListener("scroll", hide, true); // the rail scrolls → detach the fixed tip
+    window.addEventListener("resize", hide);
+  })();
 
   // ---- custom member dropdown (see .dropdown CSS for why it isn't a native <select>) ---------------
   const memberLabel = (m) => `${m.member_id} · ${m.sex}${m.age != null ? ", " + m.age : ""}`;
@@ -1218,6 +1692,36 @@
   // for an assistant card, whether a takeover was added). An unchanged turn returns its EXISTING node,
   // which replaceChildren moves rather than recreates — so an expanded <details> (evidence / trace)
   // survives the next turn's render instead of snapping shut (#6).
+  // Animated "thinking" bubble: bouncing dots + a message that cycles through the deterministic
+  // steps the service actually performs on an /ask (load labs → analyze → narrate). Purely cosmetic —
+  // it does NOT reflect live backend progress (the call is a single round-trip), it sets the *expectation*
+  // of grounded work. The interval self-cleans once the node is swapped out of the DOM (isConnected),
+  // so there is no teardown to wire from onAsk. turnNode caches this node by sig, so the same element
+  // (and its running interval) is reused across re-renders instead of being recreated.
+  const THINKING_STEPS = [
+    "Checking your labs",
+    "Consulting clinician notes",
+    "Reviewing your trajectory",
+    "Formulating a response",
+  ];
+  function thinkingNode() {
+    const wrap = el("div", "pending");
+    const dots = el("div", "think-dots");
+    dots.append(el("span"), el("span"), el("span"));
+    const msg = el("span", "think-msg", THINKING_STEPS[0]);
+    wrap.append(dots, msg);
+    let i = 0;
+    const tick = setInterval(() => {
+      // stop once swapped for the answer, OR once we reach the final step — "Formulating a
+      // response" then holds until the real answer replaces the bubble (no looping back).
+      if (!wrap.isConnected || i >= THINKING_STEPS.length - 1) { clearInterval(tick); return; }
+      i += 1;
+      msg.style.opacity = "0";
+      setTimeout(() => { msg.textContent = THINKING_STEPS[i]; msg.style.opacity = "1"; }, 220);
+    }, 3000);
+    return wrap;
+  }
+
   function turnNode(turn) {
     const sig = turn.kind === "assistant"
       ? `a:${turn.isTransition}:${turn.takeoverLevel}`
@@ -1226,7 +1730,7 @@
     if (cached && cached.sig === sig) return cached.node;
     let node;
     if (turn.kind === "member") node = el("div", "member-bubble", turn.text);
-    else if (turn.kind === "pending") node = el("div", "pending", "…thinking");
+    else if (turn.kind === "pending") node = thinkingNode();
     else if (turn.kind === "error") node = el("div", "answer-card refused", turn.text);
     else node = renderAnswerCard(turn);
     _turnNodes.set(turn, { node, sig });
@@ -1254,6 +1758,11 @@
     if (disp.tag) card.appendChild(el("div", "disp-tag", disp.tag));
     const answer = el("div", "answer-text");
     answer.innerHTML = mdToHtml(resp.answer || "");   // safe: mdToHtml escapes first, emits a fixed tag set
+    // Bold-purple the marker name + values in a Mode-1 chip answer, matching the Observations panel.
+    // Gated on turn.askedPrompt (set only for Mode-1 chip turns), so the Mode-2 LLM's own markdown and the
+    // gate-routed safety templates (crisis / seek-care — their emergency numbers must not be restyled) are
+    // left untouched.
+    if (turn.askedPrompt) highlightAnswerValues(answer);
     card.appendChild(answer);
     if (resp.uncertainty) card.appendChild(el("div", "uncertainty", resp.uncertainty));
 
@@ -1348,7 +1857,7 @@
       d.appendChild(el("summary", null, "why am I seeing this?"));
       // member audience: deterministic plain-language explanation (states the range, never the
       // statistics). The clinician trigger_reason stays on the operator console (raw-JSON readouts).
-      d.appendChild(el("div", "obs-why", obs.member_explanation));
+      d.appendChild(highlightValues(el("div", "obs-why"), obs.member_explanation));
       item.appendChild(d);
       host.appendChild(item);
     }
@@ -1356,7 +1865,10 @@
 
   function renderReadout(data) {
     state.readoutKey = null;  // any non-toggle write disarms the toggle, so the next route click shows output
-    $("#cp-readout").textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+    const el = $("#cp-readout");
+    const text = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+    el.textContent = text;
+    el.classList.toggle("is-empty", text === "—");  // collapse to a small window in the default empty state
   }
 
   function updateAskDisabled() {
@@ -1479,12 +1991,35 @@
     });
     $("#mode1-btn").addEventListener("click", () => setMode(1));
     $("#mode2-btn").addEventListener("click", () => setMode(2));
+    $("#readout-toggle").addEventListener("click", (e) => {
+      const collapsed = document.querySelector(".control").classList.toggle("readout-collapsed");
+      const btn = e.currentTarget;
+      btn.setAttribute("aria-expanded", String(!collapsed));
+      btn.title = collapsed ? "Expand" : "Minimize";
+      btn.setAttribute("aria-label", (collapsed ? "Expand" : "Minimize") + " route response");
+    });
     // right-panel tabs: switch bodies; activating the Observations tab while flagged also pulses the flagged
     // cards (the old flag-click affordance, shared by click + keyboard via showObservationsTab, #7).
     $("#tab-obs").addEventListener("click", showObservationsTab);
     $("#tab-traj").addEventListener("click", () => selectRightTab("trajectory"));
     $(".rp-tabs").addEventListener("keydown", onRightTabKey);
     $("#upload-file").addEventListener("change", (e) => { if (e.target.files[0]) onUploadFile(e.target.files[0]); e.target.value = ""; });
+    // Drag-and-drop bundle upload — the picker-independent path (see .dropzone CSS). A dropped file
+    // reaches us via dataTransfer WITHOUT the OS file-selection dialog, so upload works even where a
+    // browser silently refuses to open that dialog. Click stays as the fallback for browsers where it works.
+    const drop = $("#upload-drop");
+    drop.addEventListener("click", () => $("#upload-file").click());
+    const swallow = (e) => { e.preventDefault(); e.stopPropagation(); };
+    ["dragenter", "dragover"].forEach((ev) => drop.addEventListener(ev, (e) => { swallow(e); drop.classList.add("dragover"); }));
+    ["dragleave", "dragend"].forEach((ev) => drop.addEventListener(ev, (e) => { swallow(e); drop.classList.remove("dragover"); }));
+    drop.addEventListener("drop", (e) => {
+      swallow(e); drop.classList.remove("dragover");
+      const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (f) onUploadFile(f);
+    });
+    // A miss (drop anywhere else on the page) must not make the browser navigate to / open the file.
+    window.addEventListener("dragover", (e) => e.preventDefault());
+    window.addEventListener("drop", (e) => e.preventDefault());
     $("#ask-form").addEventListener("submit", (e) => {
       e.preventDefault();
       const v = $("#ask-input").value.trim();

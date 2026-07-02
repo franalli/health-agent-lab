@@ -12,7 +12,7 @@ import sqlite3
 import pytest
 from builders import fresh_con, make_bundle, make_panel, make_result
 
-from health_intelligence import db, pipeline
+from health_intelligence import db, pipeline, safety
 from health_intelligence.analysis import analyze
 from health_intelligence.config import ANALYSIS_CONFIG
 from health_intelligence.models import Feedback
@@ -106,6 +106,37 @@ def test_suppress_marker_drops_it_from_the_analysis():
     assert any(m.marker == "HbA1c" for m in a.markers)  # siblings untouched
 
 
+def test_suppress_is_inert_against_a_below_range_panic_floor():
+    # SAFETY, complementing the unisex Potassium case (above-range, panic_HIGH): a female member at
+    # Hemoglobin 6.0 is a BELOW-range panic, so this exercises the OTHER operator in
+    # `db._latest_breaches_panic` (`latest < panic_low`, which the high-panic Potassium test does not). It
+    # ingests a SEX-SPLIT range so the female sex-row branch of the sex->'any' resolution is actually TAKEN
+    # (not the 'any' fallback a scalar range would leave) — note panic bounds are unisex in config, so this
+    # exercises the resolution BRANCH + the low operator, not a sex-DIFFERENT panic. A clinician suppress
+    # must leave the floor at `urgent` (inert vs panic); the pre-fix bug dropped it to `none`. Asserted
+    # through the real analyze + data_floor so the check can't drift from analysis._flags.
+    con = fresh_con()
+    hb_split = "13.5-17.5 (male) / 12.0-15.5 (female)"  # creates female/male rows, not one 'any' row
+    panels = [
+        make_panel(f"P{i}", d, [make_result("Hemoglobin", 6.0, "g/dL", hb_split)])
+        for i, d in enumerate(
+            ["2024-01-01", "2024-07-01", "2025-01-01", "2025-07-01", "2026-01-01"]
+        )
+    ]
+    ingest_bundle(con, make_bundle("HB1", panels, sex="female", age=40))
+
+    def _floor():
+        return safety.data_floor(_analysis(con, "HB1"))
+
+    assert _floor() == "urgent"  # Hb 6.0 < panic_low, resolved via her FEMALE range row
+    db.insert_feedback(
+        con,
+        "HB1",
+        Feedback(kind="suppress_marker", target="Hemoglobin", source="clinician"),
+    )
+    assert _floor() == "urgent"  # inert against the panic floor (was 'none' pre-fix)
+
+
 def test_latest_active_range_override_wins():
     con = fresh_con()
     _seed(con)
@@ -182,6 +213,42 @@ def test_get_active_signals_excludes_overrides():
     ]  # the override is not a learn signal
 
 
+def test_count_active_corrections_excludes_signals():
+    """The mirror of the above for the OTHER path: count the correction/preference kinds (what
+    resolve_overrides / get_active_preferences consume), never the learn signals — this count powers
+    /learn's diagnostic empty-signals no-op."""
+    con = fresh_con()
+    _seed(con)
+    assert db.count_active_corrections(con) == 0
+    db.insert_feedback(
+        con,
+        "M1",
+        Feedback(
+            kind="range_override",
+            target="LDL cholesterol",
+            payload={"ref_high": 200.0},
+            source="clinician",
+        ),
+    )
+    db.insert_feedback(
+        con,
+        "M1",
+        Feedback(kind="preference", payload={"text": "be brief"}, source="member"),
+    )
+    db.insert_feedback(
+        con,
+        "M1",
+        Feedback(
+            kind="incorrect",
+            target="f:x",
+            payload={"question": "q", "corrected_answer": "a"},
+            source="clinician",
+        ),
+    )
+    # range_override + preference count; the incorrect SIGNAL does not
+    assert db.count_active_corrections(con) == 2
+
+
 # ---- the scan reconciles its observation set after an override (the prune) ------------------------
 
 
@@ -251,9 +318,18 @@ def test_override_keeps_an_escalation_pinned_observation():
             source="clinician",
         ),
     )
-    # the analytical flag is gone, but the escalation-pinned observation + the durable task remain
-    assert any("Potassium" in t for t in _scan_titles(con, "M1"))
-    assert db.get_escalations(con, "M1")
+    # After the override the analytical flag is gone. The observation ROW is KEPT by the escalation RESTRICT
+    # FK + the urgent task is durable — but the member-facing projection now HIDES a cleared finding (E2), so
+    # the scan titles drop it; check the kept row + the still-OPEN urgent task at the DB/queue layer.
+    assert "Potassium" not in " ".join(
+        _scan_titles(con, "M1")
+    )  # panel hides the cleared finding (re-scan)
+    assert any(
+        "Potassium" in o.title for o in db.get_observations(con, "M1")
+    )  # row KEPT (escalation FK)
+    assert any(
+        e.level == "urgent" and e.status == "open" for e in db.get_all_escalations(con)
+    )  # the durable urgent task remains on the active queue
 
 
 # ---- review-fix regressions ----------------------------------------------------------------------

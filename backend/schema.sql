@@ -137,7 +137,16 @@ CREATE TABLE escalations (
     observation_id TEXT REFERENCES observations(observation_id),  -- set when kind='data_finding'
     interaction_id TEXT REFERENCES interactions(response_id),     -- set when kind='chat' (triggering turn)
     trigger_reason TEXT NOT NULL,                -- human-readable why (marker drift / message flag)
-    created_at     TEXT NOT NULL
+    created_at     TEXT NOT NULL,
+    -- lifecycle status. 'open' = on the active clinician queue; 'superseded' = a re-scan found the
+    -- underlying finding cleared (e.g. a /feedback override removed the flag), so it leaves the active
+    -- queue but the row is KEPT for audit (never deleted). Set by the scan's reconcile (db.reconcile_
+    -- escalation_status), symmetric (re-opens if the finding returns). The global queue shows only 'open';
+    -- an 'urgent' escalation is NEVER superseded (only the softer 'clinician_review' tier auto-clears): a
+    -- deliberate range_override panic re-bound can clear the flag, but a fired urgent stays queued until a
+    -- human resolves it (suppress itself is panic-inert). §720 lifecycle.
+    -- Appended LAST to match the ALTER TABLE ADD COLUMN migration's column order for pre-existing DBs.
+    status         TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','superseded'))
 );
 CREATE INDEX idx_escalations_member ON escalations(member_id, created_at);
 

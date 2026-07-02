@@ -23,6 +23,7 @@ import hashlib
 import json
 import pathlib
 import sqlite3
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime
 
 from health_intelligence.config import CONFIG_VERSION
@@ -117,19 +118,33 @@ def connect(db_path=None) -> sqlite3.Connection:
     con = sqlite3.connect(path, check_same_thread=False)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
+    # Concurrency hardening (sync routes run in anyio's threadpool, one connection per request — see the
+    # check_same_thread note above): WAL lets a reader proceed against the last committed snapshot while a
+    # writer commits (instead of blocking), and busy_timeout turns an immediate SQLITE_BUSY (→ a 500) under
+    # write contention into a short wait-and-retry. Both are idempotent per connection; WAL is a silent
+    # no-op on ``:memory:``. Together with the atomic reseed (``reseed_transaction``), a concurrent request
+    # during a reseed/upload never sees a HALF-WIPED DB, and waits the write out rather than erroring — up to
+    # the 5s busy_timeout (ample for the 15-member seed). This is a bounded-wait mitigation, NOT an absolute
+    # guarantee: a write lock held past 5s (a far larger dataset / very slow disk) still surfaces SQLITE_BUSY.
+    con.execute("PRAGMA busy_timeout = 5000")
+    con.execute("PRAGMA journal_mode = WAL")
     return con
 
 
 def init_db(con: sqlite3.Connection, schema_path: pathlib.Path = SCHEMA_PATH) -> None:
-    """Idempotently ensure the nine tables exist. schema.sql uses bare ``CREATE TABLE`` (no
-    ``IF NOT EXISTS``), so guard on presence: if all nine are already there, no-op; else run the
-    script. schema.sql is the locked persistence contract — never edited here. Safe to call on
-    every startup (Phase 8 relies on this)."""
+    """Idempotently ensure the nine tables exist, then apply additive column migrations. schema.sql uses
+    bare ``CREATE TABLE`` (no ``IF NOT EXISTS``), so guard on presence: if all nine are already there, skip
+    creation; else run the script. schema.sql stays the FRESH-DB contract — never edited here — and
+    :func:`_apply_migrations` brings a DB created under an OLDER schema.sql up to date (e.g. adds
+    ``escalations.status``) non-destructively. Safe to call on every startup (Phase 8 relies on this)."""
     existing = {
         r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
     present = _EXPECTED_TABLES & existing
     if present == _EXPECTED_TABLES:
+        _apply_migrations(
+            con
+        )  # existing DB: bring its columns up to the current schema
         return
     if present:
         # A prior executescript was interrupted (disk full / killed) after some of the bare
@@ -140,6 +155,27 @@ def init_db(con: sqlite3.Connection, schema_path: pathlib.Path = SCHEMA_PATH) ->
         )
     con.executescript(pathlib.Path(schema_path).read_text())
     con.commit()
+    _apply_migrations(
+        con
+    )  # fresh DB already has every column (no-op) — keeps the path uniform
+
+
+def _apply_migrations(con: sqlite3.Connection) -> None:
+    """Additive, idempotent column migrations for a DB created under an EARLIER schema.sql (which is the
+    fresh-DB contract). Each guards on ``PRAGMA table_info`` so it no-ops once the column exists (a fresh DB,
+    or a second startup). ``ADD COLUMN`` with a ``NOT NULL DEFAULT`` back-fills existing rows in place
+    (verified) — never a destructive rewrite. Commits its own change (mirrors init_db's commit).
+
+    Migrations (append-only — never reorder or remove one):
+      - ``escalations.status`` ('open'|'superseded', default 'open') — the Phase-7 §720 escalation
+        lifecycle: a re-scan supersedes an escalation whose finding a /feedback override cleared."""
+    esc_cols = {r[1] for r in con.execute("PRAGMA table_info(escalations)")}
+    if "status" not in esc_cols:
+        con.execute(
+            "ALTER TABLE escalations ADD COLUMN status TEXT NOT NULL DEFAULT 'open' "
+            "CHECK (status IN ('open','superseded'))"
+        )
+        con.commit()
 
 
 # --------------------------------------------------------------------------------------------------
@@ -395,6 +431,7 @@ def replace_member(
     results: list[LabResult],
     ranges: list[ReferenceRange],
     notes: list[Note],
+    commit: bool = True,
 ) -> None:
     """Persist one member's normalized data, replacing any prior version in a single transaction.
 
@@ -404,9 +441,15 @@ def replace_member(
     ``interactions``/``observations``/``escalations``/``feedback`` survive a re-ingest. The owned
     children (``lab_results``/``notes``) are deleted then reinserted with deterministic PKs;
     ``reference_ranges`` are global (identical across members) and upserted by ``range_id``.
+
+    ``commit=False`` runs the writes WITHOUT committing, so the caller's transaction owns the commit —
+    used by the atomic reseed (``reseed_transaction``), where every member + the v0 seed must land in one
+    all-or-nothing unit. The default keeps the per-member commit the normal seed/upload path relies on.
     """
     mid = profile.member_id
-    with con:  # atomic: commit on success, rollback on any exception
+    with (
+        con if commit else nullcontext()
+    ):  # commit here, or defer to the caller's transaction
         con.execute("DELETE FROM lab_results WHERE member_id = ?", (mid,))
         con.execute("DELETE FROM notes WHERE member_id = ?", (mid,))
         con.execute(
@@ -707,6 +750,55 @@ def prune_observations(
     con.execute(sql, params)
 
 
+def reconcile_escalation_status(
+    con: sqlite3.Connection,
+    member_id: str,
+    data_version: str,
+    live_escalation_ids: set[str],
+) -> None:
+    """Reconcile the member's ``data_finding`` escalation statuses against THIS scan — the escalation-queue
+    peer of :func:`prune_observations` (Phase-7 §720 lifecycle). ``live_escalation_ids`` is the set of
+    escalation_ids the scan just emitted (one per currently-raised marker, at its CURRENT
+    ``compute_marker_version``). For each escalation whose observation is at the CURRENT ``data_version``:
+    ``open`` if the scan just re-emitted it (``escalation_id in live_escalation_ids``) OR it is ``urgent``
+    (see SAFETY), else ``superseded`` — so a re-scan after a ``/feedback`` override that CLEARED a
+    ``clinician_review`` flag drops that escalation off the active queue (:func:`get_all_escalations` shows
+    ``open`` only) while the row is KEPT for audit. SYMMETRIC: remove the override, re-scan, the marker is
+    raised again at its original ``marker_version`` → its (INSERT-OR-IGNORE deduped) row is emitted again →
+    back to ``open``. Does NOT commit (runs inside the scan transaction).
+
+    Keyed on the emitted ESCALATION identity (not the observation): a stale ``clinician_review`` twin the
+    scan did NOT re-emit (a ``range_override`` that changed a still-raised marker's ``marker_version``, or a
+    cleared finding) is superseded. Reconciled in PYTHON off the set (not a SQL ``IN``) so the headline
+    empty-set case (an override cleared the member's ONLY finding → nothing emitted) is not a ``... IN ()``
+    syntax error (the footgun :func:`prune_observations` also guards). Scoped to the current ``data_version``
+    via the JOIN, so escalations pinned to a PRIOR version (genuine historical events) are untouched.
+
+    SAFETY — an ``urgent`` (panic) escalation is NEVER superseded, full stop: a fired urgent stays on the
+    queue until a HUMAN resolves it (the deferred manual-resolve step). Only the softer ``clinician_review``
+    tier auto-clears. ACCEPTED consequence: a ``range_override`` that changes a STILL-urgent marker's
+    ``marker_version`` leaves the old AND new urgent both ``open`` — a duplicate the human-resolve lifecycle
+    will clean up; a safe-direction over-show (a clinician sees a finding twice, never MISSES one). A
+    conditional supersede of the stale urgent twin was tried and REVERTED: keyed on emitted-obs-ids it could
+    HIDE a downgraded urgent (panic → clinician_review via a partial re-bound fills the obs-id set) or
+    resurrect a superseded twin when the marker later fully clears — both worse than the duplicate. Never
+    trade 'urgent never hidden' for de-duplication (the reconcile-finder repro that proved it)."""
+    rows = con.execute(
+        "SELECT e.escalation_id, e.level FROM escalations e "
+        "JOIN observations o ON o.observation_id = e.observation_id "
+        "WHERE e.member_id = ? AND e.kind = 'data_finding' AND o.data_version = ?",
+        (member_id, data_version),
+    ).fetchall()
+    for r in rows:
+        # A stale clinician_review the scan didn't re-emit is superseded; an urgent is NEVER superseded (a
+        # fired urgent stays until a human resolves it — never trade 'urgent never hidden' for de-duplication).
+        keep_open = r["escalation_id"] in live_escalation_ids or r["level"] == "urgent"
+        con.execute(
+            "UPDATE escalations SET status = ? WHERE escalation_id = ?",
+            ("open" if keep_open else "superseded", r["escalation_id"]),
+        )
+
+
 def get_observations(
     con: sqlite3.Connection, member_id: str, *, data_version: str | None = None
 ) -> list[Observation]:
@@ -740,28 +832,69 @@ def get_observations(
     return obs
 
 
+#: The escalation SELECT column list, in ``_escalation_from_row``'s read order — ONE home for the two reads
+#: (:func:`get_escalations` + :func:`get_all_escalations`), so a new column (as ``status`` was) is a single
+#: edit here + the row-mapper, never a per-query one that leaves the other read short a key.
+_ESCALATION_COLUMNS = (
+    "escalation_id, member_id, kind, dedup_key, level, observation_id, "
+    "interaction_id, trigger_reason, created_at, status"
+)
+
+
+def _escalation_from_row(r: sqlite3.Row) -> Escalation:
+    """Row → ``Escalation`` (the two-layers mapping; shared by the per-member and global reads)."""
+    return Escalation(
+        escalation_id=r["escalation_id"],
+        member_id=r["member_id"],
+        kind=r["kind"],
+        dedup_key=r["dedup_key"],
+        level=r["level"],
+        observation_id=r["observation_id"],
+        interaction_id=r["interaction_id"],
+        trigger_reason=r["trigger_reason"],
+        created_at=r["created_at"],
+        status=r["status"],
+    )
+
+
 def get_escalations(con: sqlite3.Connection, member_id: str) -> list[Escalation]:
-    """The member's clinician-review queue (read projection), oldest first. Escalations are durable —
-    never replaced by a re-scan — so this returns the full standing set across data_versions."""
+    """One member's clinician-review record (read projection), oldest first — the per-member DRILL-IN
+    shown when already viewing that member, NOT the queue. Returns the full standing set across
+    data_versions AND all lifecycle statuses ('open' + 'superseded'), so it doubles as the audit view: a
+    re-scan RECONCILES an escalation's ``status`` (a clinician_review finding an override cleared flips to
+    'superseded'; an urgent one never does) but never DELETES the row. The cross-member triage queue —
+    active ('open') only — is :func:`get_all_escalations`."""
     rows = con.execute(
-        "SELECT escalation_id, member_id, kind, dedup_key, level, observation_id, interaction_id, "
-        "trigger_reason, created_at FROM escalations WHERE member_id = ? ORDER BY created_at, escalation_id",
+        f"SELECT {_ESCALATION_COLUMNS} FROM escalations WHERE member_id = ? "
+        "ORDER BY created_at, escalation_id",
         (member_id,),
     ).fetchall()
-    return [
-        Escalation(
-            escalation_id=r["escalation_id"],
-            member_id=r["member_id"],
-            kind=r["kind"],
-            dedup_key=r["dedup_key"],
-            level=r["level"],
-            observation_id=r["observation_id"],
-            interaction_id=r["interaction_id"],
-            trigger_reason=r["trigger_reason"],
-            created_at=r["created_at"],
-        )
-        for r in rows
-    ]
+    return [_escalation_from_row(r) for r in rows]
+
+
+def get_all_escalations(con: sqlite3.Connection) -> list[Escalation]:
+    """The GLOBAL clinician-review queue across ALL members — the triage worklist (``GET /escalations``).
+    Escalation exists to make sure a human sees something they didn't know to look for, so the queue is
+    cross-member by design: a per-member read can only be opened by someone already on that patient, which
+    is the one case escalation must not depend on.
+
+    Ordered FOR triage — most-severe first (``urgent`` before ``clinician_review``), then most-RECENT
+    first, then ``escalation_id`` as a stable tie-break. This DELIBERATELY differs from the per-member
+    :func:`get_escalations` (oldest-first chronological history): the worklist answers "what's outstanding
+    across the panel, worst first?", so severity then recency lead — do not "fix" it to match. A pure read,
+    filtered to ``status='open'`` — the ACTIVE worklist (§720 lifecycle): a 'superseded' escalation (its
+    clinician_review finding cleared by a /feedback override, per the scan's reconcile) drops OFF this queue
+    but its row persists for audit (via :func:`get_escalations`). An 'urgent' escalation is never superseded,
+    so a panic can never be cleared off this queue by a suppress. Rows are never deleted.
+
+    Scope note: "all members" is the whole tenant here because the prototype has no clinician identity; in
+    a real deployment this is a ``clinician_id``/panel scope, or it leaks other panels' members (§15)."""
+    rows = con.execute(
+        f"SELECT {_ESCALATION_COLUMNS} FROM escalations WHERE status = 'open' "
+        "ORDER BY CASE level WHEN 'urgent' THEN 0 WHEN 'clinician_review' THEN 1 ELSE 2 END, "
+        "created_at DESC, escalation_id"
+    ).fetchall()
+    return [_escalation_from_row(r) for r in rows]
 
 
 # --------------------------------------------------------------------------------------------------
@@ -769,6 +902,48 @@ def get_escalations(con: sqlite3.Connection, member_id: str) -> list[Escalation]
 # plugs in (Phase 7). Built now so analysis.py never reaches the DB. MUST return NEW lists (never
 # mutate the caller's inputs in place). Phase 2: feedback is empty, so it is a faithful pass-through.
 # --------------------------------------------------------------------------------------------------
+
+
+def _resolve_range(
+    ranges: list[ReferenceRange], marker: str, sex: str
+) -> ReferenceRange | None:
+    """The marker's reference range for a member of ``sex`` — the ``sex`` row, else the ``'any'`` fallback —
+    mirroring ``analysis._range_for`` inline so db.py never imports ``analysis`` (the documented purity
+    edge). The SINGLE home for a resolution both :func:`_latest_breaches_panic` (the panic-inert suppress
+    guard) and the ``range_override`` inherit path in :func:`_apply_overrides` need; one function means a
+    future change to the fallback tiers (e.g. an ``'other'``/``'unknown'`` rung, or age-banding) can't drift
+    the two apart."""
+    cands = [rg for rg in ranges if rg.marker == marker]
+    return next((rg for rg in cands if rg.sex == sex), None) or next(
+        (rg for rg in cands if rg.sex == "any"), None
+    )
+
+
+def _latest_breaches_panic(
+    marker: str,
+    results: list[LabResult],
+    ranges: list[ReferenceRange],
+    *,
+    sex: str,
+) -> bool:
+    """Does ``marker``'s LATEST reading breach its panic bound? Replicates ``analysis._flags``' panic test
+    EXACTLY — ``latest < panic_low`` / ``latest > panic_high`` on ``series[-1]`` (the reading with the max
+    ``panel_date``, matching ``analysis._series``' ``sorted(key=panel_date)[-1]``), against the range
+    resolved by the member's ``sex`` (then ``'any'``). Inline — the same no-``analysis``-import purity edge
+    the range inheritance in :func:`_apply_overrides` uses — so ``suppress_marker`` can stay INERT against a
+    panic floor without db.py importing the core. Err-SAFE: no results / no range -> ``False`` (analysis
+    would produce no panic flag either), so an ambiguous case ALLOWS the suppress and never wrongly blocks
+    one. A ``test_db`` regression pins this against the real ``safety.data_floor`` so it can't drift."""
+    marker_results = [r for r in results if r.marker == marker]
+    if not marker_results:
+        return False
+    latest = sorted(marker_results, key=lambda r: r.panel_date)[-1].value
+    rng = _resolve_range(ranges, marker, sex)
+    if rng is None:
+        return False
+    return (rng.panic_low is not None and latest < rng.panic_low) or (
+        rng.panic_high is not None and latest > rng.panic_high
+    )
 
 
 def _apply_overrides(
@@ -795,7 +970,10 @@ def _apply_overrides(
       (e.g. Hemoglobin/HDL/Ferritin/Creatinine) inherits the member's OWN band, not an arbitrary sex's.
       (Resolved inline rather than calling ``analysis._range_for`` to keep db.py's no-``analysis`` purity.)
     * ``suppress_marker`` — drop the marker's results AND ranges, so the core never analyzes it (it
-      vanishes from the trajectory): quiets an expected-abnormal marker without touching the safety rule.
+      vanishes from the trajectory): quiets an expected-abnormal marker. INERT against a panic floor — a
+      marker whose LATEST value breaches its panic bound is NOT dropped (:func:`_latest_breaches_panic`), so
+      a suppress can never lower the deterministic floor urgent -> none; only a deliberate ``range_override``
+      panic re-bound may clear a panic.
 
     ``preference`` and the signal kinds never reach here — they are filtered out at the SQL in
     :func:`resolve_overrides` (preference is a compose hint via :func:`get_active_preferences`; signals
@@ -807,16 +985,23 @@ def _apply_overrides(
         if not fb.target:
             continue  # overrides target a marker; a signal (helpful/incorrect/...) has no analysis effect
         if fb.kind == "suppress_marker":
+            # SAFETY — suppress is INERT against a panic floor (the invariant the operator UI + the
+            # `suppress_marker` docstring below both promise). Suppress quiets an expected-abnormal marker's
+            # range/trend flagging, but must NOT hide a PANIC-level value: dropping a panic marker removes it
+            # from analyze(), so `safety.data_floor` would fall urgent -> none and a later /ask would not
+            # escalate a life-threatening result. So skip the drop when the marker's LATEST value breaches
+            # its panic bound. Only a DELIBERATE `range_override` panic re-bound may clear a panic (that path
+            # is intended — `test_clearing_override_keeps_escalation_pinned_panic_observation` — and is left
+            # untouched here). Checked against the CURRENT `out_ranges`, so a re-bound-then-suppress composes.
+            if _latest_breaches_panic(fb.target, out_results, out_ranges, sex=sex):
+                continue  # leave the panic marker in analysis -> the deterministic floor holds
             out_results = [r for r in out_results if r.marker != fb.target]
             out_ranges = [rg for rg in out_ranges if rg.marker != fb.target]
         elif fb.kind == "range_override" and fb.payload:
             # Inherit omitted bounds from the member's ACTUAL band: the (marker, sex) row, then the
-            # (marker, 'any') fallback — the same resolution analysis._range_for uses, replicated here so
-            # db.py never imports analysis (the documented purity edge).
-            cands = [rg for rg in out_ranges if rg.marker == fb.target]
-            existing = next((rg for rg in cands if rg.sex == sex), None) or next(
-                (rg for rg in cands if rg.sex == "any"), None
-            )
+            # (marker, 'any') fallback — the same resolution analysis._range_for uses, via the shared
+            # _resolve_range helper (db.py's inline mirror, so it never imports analysis — the purity edge).
+            existing = _resolve_range(out_ranges, fb.target, sex)
             p = fb.payload
             # ``p.get(key, fallback)`` returns the supplied value even when it is explicitly None (a
             # one-sided override), and falls back to the existing bound only when the key is omitted.
@@ -985,6 +1170,33 @@ def get_active_signals(con: sqlite3.Connection) -> list[Feedback]:
     ]
 
 
+def count_active_corrections(con: sqlite3.Connection) -> int:
+    """Count active CORRECTION/preference rows (range_override/suppress_marker/preference) across all
+    members — the input the DETERMINISTIC correction path consumes (:func:`resolve_overrides` /
+    :func:`get_active_preferences`), which is a separate path from the /learn SIGNALS read by
+    :func:`get_active_signals`. Lets ``learn.run_learn``'s empty-signals no-op tell the operator that
+    feedback *exists* but is on the other path (it feeds the next Scan/Ask, not /learn) — so an applied
+    override no longer reads as "/learn picks up nothing"."""
+    return con.execute(
+        "SELECT COUNT(*) FROM feedback WHERE active = 1 "
+        "AND kind IN ('range_override', 'suppress_marker', 'preference')"
+    ).fetchone()[0]
+
+
+def members_with_active_overrides(con: sqlite3.Connection) -> list[str]:
+    """Member ids carrying an ACTIVE analysis-affecting override (``range_override`` / ``suppress_marker``)
+    — exactly the members whose scan artifacts (observations + the escalation queue) a ``POST /reset`` will
+    change when it deactivates those overrides. The reset route reads this BEFORE resetting, then re-scans
+    those members so the persisted queue actively reverts (a superseded escalation re-opens, a pruned
+    observation returns) instead of lagging until someone manually re-scans. ``preference`` and the signal
+    kinds are excluded: they never touch analysis, so deactivating them changes no scan artifact."""
+    rows = con.execute(
+        "SELECT DISTINCT member_id FROM feedback "
+        "WHERE active = 1 AND kind IN ('range_override', 'suppress_marker')"
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
 def reset_learning(con: sqlite3.Connection) -> dict[str, int]:
     """The ``POST /reset`` revert (architecture §9/§688): deactivate ALL feedback (``active=0``) and
     revert every learned prompt above the v0 baseline (``promoted`` OR ``rejected``) to
@@ -994,7 +1206,7 @@ def reset_learning(con: sqlite3.Connection) -> dict[str, int]:
     baseline must be re-gateable (not stuck cached as 'rejected') if its feedback is re-posted — the
     symmetric case to a reverted promotion. This is the learning-revert, NOT a data wipe: the feedback
     rows and prompt history are preserved (the trail stays), every member and the dataset untouched. The
-    factory reset is the separate :func:`nuke_all` (``POST /admin/reseed``). Returns affected-row counts."""
+    factory reset is the separate :func:`clear_all_data` (``POST /admin/reseed``). Returns affected-row counts."""
     with con:
         fb = con.execute("UPDATE feedback SET active = 0 WHERE active = 1").rowcount
         pv = con.execute(
@@ -1057,10 +1269,14 @@ def next_prompt_version(con: sqlite3.Connection) -> int:
 
 
 def count_prompt_versions_on(con: sqlite3.Connection, date_prefix: str) -> int:
-    """How many prompt_versions rows carry ``created_at`` on ``date_prefix`` (``YYYY-MM-DD``) — the
-    learn DAILY-CAP backstop. Debounced short-circuits write no row, so they don't count (free)."""
+    """How many CANDIDATE prompt_versions rows (``version >= 1``) carry ``created_at`` on ``date_prefix``
+    (``YYYY-MM-DD``) — the learn DAILY-CAP backstop. Debounced short-circuits write no row, so they don't
+    count (free). ``version = 0`` (the v0 baseline seeded by startup / reseed) is EXCLUDED: it is not a
+    ``/learn`` run, so on a fresh-DB / reseed / cold-start day it must not consume one of the day's slots
+    (which silently dropped the cap 20 → 19)."""
     return con.execute(
-        "SELECT COUNT(*) AS c FROM prompt_versions WHERE substr(created_at, 1, 10) = ?",
+        "SELECT COUNT(*) AS c FROM prompt_versions "
+        "WHERE version >= 1 AND substr(created_at, 1, 10) = ?",
         (date_prefix,),
     ).fetchone()["c"]
 
@@ -1086,43 +1302,98 @@ def insert_prompt_version(
         )
 
 
+def write_baseline_prompt(
+    con: sqlite3.Connection, *, prompt_text: str, commit: bool = True
+) -> None:
+    """Upsert the v0 baseline row (``version=0``, always ``status='promoted'``, no report) — the SINGLE
+    writer of version 0, distinct from :func:`insert_prompt_version`'s ``version>=1`` candidates. This is
+    the SEED path only (startup / reseed); the report is attached LAZILY and separately by the first
+    ``/learn`` via :func:`set_prompt_report`, which is why this never takes a report.
+
+    The ``DO UPDATE`` keeps v0's ``prompt_text`` synced to the incoming base (so a redeploy that edits
+    ``BASE_COMPOSE_SYSTEM`` on a persisted disk re-syncs v0 — NOT a learned vN>0, which is a frozen
+    snapshot of the base-at-assembly and only picks up a new base on a re-learn). It is text-aware about
+    the report so v0 can never carry a report that measures a DIFFERENT prompt text: when the text is
+    UNCHANGED an idempotent re-seed PRESERVES an already-attached report (must not clobber it to NULL);
+    when the text CHANGED it DROPS the now-stale report (→ NULL) so the next ``/learn`` recomputes the
+    baseline against the new text. ``created_at`` is set only on first insert. The caller passes
+    ``prompt_text`` (``learn`` owns the ``llm.BASE_COMPOSE_SYSTEM`` constant) so this module stays free of
+    an ``llm`` import. ``commit=False`` defers the commit to the caller's transaction (the atomic reseed)."""
+    created_at = datetime.now(UTC).isoformat()
+    with con if commit else nullcontext():
+        con.execute(
+            "INSERT INTO prompt_versions (version, prompt_text, status, eval_report_json, created_at) "
+            "VALUES (0, ?, 'promoted', NULL, ?) "
+            "ON CONFLICT(version) DO UPDATE SET "
+            "  prompt_text = excluded.prompt_text, "
+            "  status = 'promoted', "
+            "  eval_report_json = CASE "
+            "    WHEN excluded.prompt_text = prompt_versions.prompt_text "
+            "      THEN prompt_versions.eval_report_json "  # unchanged text: keep any lazily-attached report
+            "    ELSE NULL END",  # changed text: drop the now-stale report
+            (prompt_text, created_at),
+        )
+
+
+def set_prompt_report(
+    con: sqlite3.Connection, version: int, eval_report_json: str
+) -> None:
+    """Attach (or replace) the eval report on an existing ``prompt_versions`` row (commits). The
+    report-attach seam ``learn._baseline_report`` uses to cache the lazily-computed baseline report onto
+    the ACTIVE prompt's row (v0, or a learned vN) — version-general, unlike :func:`write_baseline_prompt`
+    which only writes v0. It only touches ``eval_report_json`` (never ``prompt_text``/``status``), so it
+    cannot introduce the text/report mismatch the seed path guards against. A no-op if ``version`` absent."""
+    with con:
+        con.execute(
+            "UPDATE prompt_versions SET eval_report_json = ? WHERE version = ?",
+            (eval_report_json, version),
+        )
+
+
 # --------------------------------------------------------------------------------------------------
 # Factory reset (Phase 7) — the destructive clean-slate behind ``POST /admin/reseed`` (architecture
-# §688/§756), DISTINCT from reset_learning's learning-only revert. A full NUKE: drop every table, then
-# recreate the canonical schema; the route then re-ingests the training_data bundle (the back-edge to
-# preprocessing stays in api.py, not here).
+# §688/§756), DISTINCT from reset_learning's learning-only revert. The whole wipe + re-ingest + v0 seed
+# runs as ONE atomic transaction (``reseed_transaction`` + ``clear_all_data``) so a concurrent request
+# never reads a half-wiped DB; the back-edge to preprocessing (re-ingest) stays in api.py, not here.
 # --------------------------------------------------------------------------------------------------
 
 
-def nuke_all(con: sqlite3.Connection) -> None:
-    """Full factory NUKE — DROP every table, then recreate the canonical schema from ``schema.sql``.
-
-    Stronger than a row-level truncate: it removes the tables themselves (and their rowid sequences and
-    indexes), returning the DB to a pristine, freshly-initialised state, and it is robust to ANY table
-    that exists — including a stray/renamed one a hardcoded delete-list would miss. FK enforcement is
-    toggled OFF around the drops (set outside a transaction, where the PRAGMA takes effect) so drop order
-    is irrelevant; :func:`init_db` then rebuilds every table. The caller (``POST /admin/reseed``)
-    re-ingests ``training_data`` afterwards, so the DB ends as a clean 15-member factory state."""
+@contextmanager
+def reseed_transaction(con: sqlite3.Connection):
+    """One ATOMIC transaction for the whole ``POST /admin/reseed`` (truncate → re-ingest → v0 seed): a
+    concurrent request on another connection sees the pre-reseed state or the post-reseed state, never a
+    half-wiped DB (the old ``nuke_all`` committed mid-op, between DROP and re-ingest, exposing an empty DB
+    — and DROP+recreate can't be made atomic here because ``init_db``'s ``executescript`` force-commits a
+    pending transaction). FK enforcement is turned OFF on THIS connection only (per-connection; readers
+    keep theirs) so truncate order is irrelevant, and everything commits once at the end / rolls back to
+    the prior populated state on any error. The ``foreign_keys`` PRAGMA must be toggled with no active
+    transaction, so it brackets the ``with`` body (which the caller fills with ``commit=False`` writes)."""
     con.execute(
         "PRAGMA foreign_keys = OFF"
-    )  # must be set with NO active transaction to take effect
+    )  # per-connection; must be set with NO active transaction
     try:
-        tables = [
-            r[0]
-            for r in con.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-            )
-        ]
-        for t in tables:
-            con.execute(f'DROP TABLE IF EXISTS "{t}"')  # noqa: S608 — names from sqlite_master, not input
-        con.commit()
+        yield
+        con.commit()  # the single all-or-nothing commit for the whole reseed
+    except Exception:
+        con.rollback()  # any failure reverts to the prior populated state, not an empty DB
+        raise
     finally:
         con.execute(
             "PRAGMA foreign_keys = ON"
         )  # restore the per-connection invariant connect() sets
-    init_db(
-        con
-    )  # recreate every table from the canonical schema.sql (none exist -> full rebuild)
+
+
+def clear_all_data(con: sqlite3.Connection) -> None:
+    """TRUNCATE — ``DELETE`` every row from every table — the destructive half of the reseed, run INSIDE
+    :func:`reseed_transaction` (which owns the commit and has FK enforcement off, so table order is
+    irrelevant). Truncate, not DROP+recreate: the schema is already correct (``init_db`` owns it) and
+    ``DELETE`` composes inside a transaction, whereas ``executescript`` (which recreating the schema needs)
+    force-commits a pending transaction and would break the reseed's atomicity. Robust to ANY table that
+    exists (names read live from ``sqlite_master``), like the old drop-list was."""
+    for (name,) in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    ).fetchall():
+        con.execute(f'DELETE FROM "{name}"')  # noqa: S608 — names from sqlite_master, not input
 
 
 # --------------------------------------------------------------------------------------------------

@@ -37,6 +37,7 @@ from health_intelligence.models import (
 )
 from preprocessing.datasets import DEFAULT_DATASET
 from preprocessing.ingest import (
+    BundleValidationError,
     ingest_bundle,
     ingest_dataset,
     ingest_uploaded_dataset,
@@ -100,6 +101,16 @@ async def lifespan(app: FastAPI):
                     "startup: seeded %d members from the active dataset",
                     outcome["members"],
                 )
+        # Materialize the v0 composer baseline so prompt_versions is never empty (the operator UI shows
+        # the active baseline; /learn back-fills its eval report lazily). Idempotent — a no-op on a warm
+        # restart, and a one-time back-fill for DBs seeded before this landed. NON-fatal like the seed:
+        # a failure here leaves the pipeline's implicit BASE fallback intact, so the app still serves.
+        try:
+            learn.seed_baseline_prompt(con)
+        except Exception:
+            logger.exception(
+                "startup: failed to seed the v0 baseline prompt (composer falls back to BASE)"
+            )
     finally:
         con.close()
     yield
@@ -139,7 +150,7 @@ def post_member(
 
 
 @app.post("/members/upload")
-async def upload_dataset(
+def upload_dataset(
     file: UploadFile = File(...),
     name: str | None = Form(None),
     con: sqlite3.Connection = Depends(get_con),
@@ -148,13 +159,11 @@ async def upload_dataset(
     the control panel's **Upload bundle**. The multi-member, persisted sibling of ``POST /members``.
 
     BODY: ``multipart/form-data`` with ``file`` (required) and an optional ``name`` (the new dataset
-    folder's name; defaults to the uploaded file's stem). ``file`` is either a **.zip** of a folder
-    shaped like ``backend/data/training_data/`` — one CSV (lab panels) + the members JSON + an optional
-    eval JSON — or a bare members-shaped ``.json``. Files are discovered by **type/content, not
-    filename** (a hold-out ships identical schemas under possibly-different names): the lone ``.csv`` is
-    the panels; the JSON whose records carry ``profile``/``panels`` is the members file, the other is the
-    eval set. They're written to disk under their **canonical** names, so the rest of the system stays
-    name-based.
+    folder's name; defaults to the uploaded file's stem). ``file`` MUST be a **.zip** of a folder shaped
+    like ``backend/data/training_data/`` carrying exactly three files **by extension** — one ``.json``
+    (members), one ``.jsonl`` (eval set), one ``.csv`` (lab panels) — under any base names (a hold-out
+    ships stable extensions, only the base names differ), plus optional extras (e.g. a ``README.md``).
+    They're written to disk under their **canonical** names, so the rest of the system stays name-based.
 
     EFFECT (see ``ingest_uploaded_dataset``): (1) every member is ingested **additively** — added on top
     of the existing members (``member_id`` opaque, any ID space), a re-used id refreshing that member's
@@ -163,15 +172,27 @@ async def upload_dataset(
     (``DATASET=<name> make eval``). Then each newly ingested member is **auto-scanned** so its
     Observations match its live Trajectory immediately (reseed deliberately does NOT auto-scan).
 
-    This doubles as the format check: a bad zip / an unresolvable bundle (no or several members-shaped
-    JSON) / a malformed member that fails the firewall (``ValueError``) or Pydantic shape
-    (``ValidationError``) -> **422**; a name that collides with an existing dataset (``FileExistsError``)
-    -> **409** (uploads never overwrite). The bundle is classified before any side effect and shape is
-    validated up front (no partial load); the semantic-partial-set caveat of ``ingest_members`` applies. Returns ``{dataset, members, results, ranges, member_ids, files, scanned}``. NOTE: on the
-    free/ephemeral Render tier both the DB rows and the new folder live only until the next cold start
-    (the durable paid-disk upgrade persists them — point ``HEALTH_DB_PATH`` and ``HEALTH_DATA_ROOT`` at
-    the disk; §15)."""
-    data = await file.read()
+    This doubles as the format check, surfaced at file+row granularity: a missing or duplicated required
+    file, or a FIRST-RECORD format failure in any of the three files (member bundle / eval case / CSV panel
+    row), returns **422** with ``detail = {"error", "failures": [{file, row, field, detail}]}`` — the
+    problems found across all three first-record gates at once, before any side effect (no partial load). It
+    is a first-record gate, NOT a whole-file scan: later rows are not rejected here (a buggy later member row
+    is skipped at ingest, later eval/CSV rows ride through unchecked). A bad zip or a non-zip upload is
+    likewise a **422**; a name that collides with an existing dataset (``FileExistsError``) -> **409**
+    (uploads never overwrite). A buggy *later* member row is skipped (not fatal), but a bundle in which EVERY
+    member row is skipped ingests nobody — that is a failed upload, so it **422**s with the per-row skip
+    detail and the reserved folder is rolled back (never a 200 with an empty dataset). The
+    semantic-partial-set caveat of ``ingest_members`` still applies to a firewall parse error the row check
+    can't pre-empt. Returns
+    ``{dataset, members, results, ranges, member_ids, files, scanned}``. NOTE: on the free/ephemeral
+    Render tier both the DB rows and the new folder live only until the next cold start (the durable
+    paid-disk upgrade persists them — point ``HEALTH_DB_PATH`` and ``HEALTH_DATA_ROOT`` at the disk; §15)."""
+    # SYNC route on purpose: the whole pipeline below (zip decompression, first-record bundle gating, disk
+    # writes, per-member DB ingest, and the per-member auto-scan) is synchronous CPU/IO work. As `async def`
+    # it ran inline on the event loop and stalled every concurrent request — including member `/ask` and the
+    # `GET /health` Render polls. A plain `def` makes Starlette run it in the threadpool, like every other
+    # route here; `file.file.read()` is the sync read of the SpooledTemporaryFile (no `await` needed).
+    data = file.file.read()
     try:
         result = ingest_uploaded_dataset(
             con, data=data, filename=file.filename, name=name
@@ -180,6 +201,12 @@ async def upload_dataset(
         # name collides with an existing dataset/file — caught BEFORE the generic OSError below (it is an
         # OSError subclass); raised by create_dataset_dir's mkdir BEFORE any DB write, so no side effects.
         raise HTTPException(status_code=409, detail=str(e)) from e
+    except BundleValidationError as e:
+        # Row-level format failures — matched BEFORE the generic ValueError below (it is a subclass) so the
+        # structured per-row failures ride the wire, not a flattened string. FastAPI serializes the dict.
+        raise HTTPException(
+            status_code=422, detail={"error": str(e), "failures": e.failures}
+        ) from e
     except (ValueError, ValidationError) as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     except OSError as e:
@@ -233,11 +260,25 @@ def get_observations(
         ) from None
 
 
+@app.get("/escalations", response_model=list[Escalation])
+def get_all_escalations(
+    con: sqlite3.Connection = Depends(get_con),
+) -> list[Escalation]:
+    """The GLOBAL clinician-review queue across all members — the triage worklist, ranked worst-first
+    (urgent before clinician_review), then most recent. This is *the* hand-off surface: escalation means
+    "make sure a human sees this", which a per-member read can't guarantee (it requires already knowing
+    which patient to open). The per-member route below is the drill-in, not the queue. Scope: "all
+    members" is the whole tenant in this prototype (no clinician identity); production would scope it to a
+    clinician's panel (db.get_all_escalations · §15)."""
+    return db.get_all_escalations(con)
+
+
 @app.get("/members/{member_id}/escalations", response_model=list[Escalation])
 def get_escalations(
     member_id: str, con: sqlite3.Connection = Depends(get_con)
 ) -> list[Escalation]:
-    """Read the member's clinician-review queue (the standing hand-off artifacts)."""
+    """Per-member DRILL-IN: one member's standing escalation record, shown when already viewing that
+    member. NOT the triage queue — that is the global ``GET /escalations`` above."""
     # Existence check so an unknown member 404s like /scan and /observations — db.get_escalations would
     # otherwise return [] for a typo'd id, and an empty review queue reads as 'all clear' on a safety
     # surface (it must not be confused with 'member not found').
@@ -274,7 +315,7 @@ def post_ask(
     compose/template -> validate -> escalate). Uses the default LLM provider; degrades to the
     deterministic spine if it is unavailable, so this never 500s on a missing key. 404 if absent."""
     try:
-        return pipeline.ask(con, member_id, req.message)
+        return pipeline.ask(con, member_id, req.message, history=req.history)
     except KeyError:
         raise HTTPException(
             status_code=404, detail=f"member {member_id!r} not found"
@@ -294,9 +335,19 @@ def post_feedback(
 ) -> dict[str, str]:
     """Record a correction (range_override / suppress_marker / preference) or a signal (helpful /
     incorrect / escalation_accept|reject). Overrides re-resolve into the core's inputs on the next
-    scan/ask (both modes); signals feed ``/learn``. 404 if the member is absent."""
+    scan/ask (both modes); signals feed ``/learn``. 404 if the member is absent. For an ``incorrect``
+    correction, the learning input bar (``learn.validate_feedback``) screens the corrected answer so junk
+    never sits in the table as a future few-shot exemplar (the "learns too literally" fix): **422** if it
+    is unfit (empty / oversized, or the Haiku judge finds a stated numeric cutoff / escalation-softening /
+    incoherence), **503 fail-closed** if the judge can't run (retry — an unjudged answer is never stored)."""
     if db.get_member(con, member_id) is None:
         raise HTTPException(status_code=404, detail=f"member {member_id!r} not found")
+    try:
+        reason = learn.validate_feedback(fb)
+    except learn.LearnUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    if reason is not None:
+        raise HTTPException(status_code=422, detail=reason)
     return {"feedback_id": db.insert_feedback(con, member_id, fb)}
 
 
@@ -322,9 +373,19 @@ def get_trajectory(
 def post_reset(con: sqlite3.Connection = Depends(get_con)) -> dict:
     """Erase learning -> v0 (architecture §9): deactivate all feedback and revert promoted prompts to the
     baseline. NOT a data wipe — the dataset, members, and the learning trail are preserved (that is
-    ``/admin/reseed``)."""
+    ``/admin/reseed``).
+
+    RE-SCANS the members whose overrides it just deactivated (``db.members_with_active_overrides``, read
+    BEFORE the reset), so the persisted observations + clinician queue ACTIVELY revert — a superseded
+    escalation re-opens, a pruned observation returns — instead of lagging until someone re-scans by hand
+    (the symmetric counterpart to the feedback UI's 'Run Scan' nudge; the reconcile is reachable only from a
+    scan). Best-effort like the upload auto-scan: a member's scan failing is logged, not fatal to the reset."""
+    affected = db.members_with_active_overrides(con)  # BEFORE reset clears them
     counts = db.reset_learning(con)
-    return {"learning_reset": True, **counts}
+    rescanned = pipeline.scan_members(
+        con, affected
+    )  # re-open / restore the reverted artifacts
+    return {"learning_reset": True, "rescanned": rescanned, **counts}
 
 
 @app.post("/learn")
@@ -345,14 +406,26 @@ def post_learn(con: sqlite3.Connection = Depends(get_con)) -> dict:
 @app.post("/admin/reseed")
 def post_reseed(con: sqlite3.Connection = Depends(get_con)) -> dict:
     """Factory reset (demo hygiene; distinct from ``/reset``): flush the whole app back to its initial
-    state — a full NUKE (DROP + recreate every table via ``db.nuke_all``), then re-ingest the shipped
-    ``training_data`` bundle (architecture §756: "the training_data bundle only"). Pinned to
-    ``DEFAULT_DATASET`` deliberately, NOT the active ``DATASET`` env, so a factory reset always restores
-    the original 15 members regardless of which bundle is selected; uploaded holdouts, feedback, learning,
-    and the audit trail are all dropped, and the prompt reverts to the v0 baseline (empty
-    ``prompt_versions`` → composer falls back to BASE). An operator op, not a member feature."""
-    db.nuke_all(con)
-    summary = ingest_dataset(con, DEFAULT_DATASET)
+    state — TRUNCATE every table, then re-ingest the shipped ``training_data`` bundle (architecture §756:
+    "the training_data bundle only"). Pinned to ``DEFAULT_DATASET`` deliberately, NOT the active ``DATASET``
+    env, so a factory reset always restores the original 15 members regardless of which bundle is selected;
+    uploaded holdouts, feedback, learning, and the audit trail are all dropped, and the prompt reverts to
+    the v0 baseline — re-materialized as a single promoted ``prompt_versions`` row carrying
+    ``BASE_COMPOSE_SYSTEM`` (so the store is never empty; its eval report is attached lazily by the first
+    ``/learn``). An operator op, not a member feature.
+
+    ATOMIC: the truncate + re-ingest + v0 seed run as ONE transaction (``db.reseed_transaction``, with the
+    ingest/seed passing ``commit=False``), so a concurrent request on another threadpool connection reads
+    the pre-reseed or post-reseed state, never a half-wiped DB, and any mid-reseed failure rolls back to
+    the prior populated state rather than leaving the DB empty."""
+    with db.reseed_transaction(con):
+        db.clear_all_data(
+            con
+        )  # truncate every table (FK-off inside the transaction, so order is free)
+        summary = ingest_dataset(con, DEFAULT_DATASET, commit=False)
+        learn.seed_baseline_prompt(
+            con, commit=False
+        )  # v0 baseline, so the prompt store isn't empty
     return {"reseeded": True, **summary}
 
 

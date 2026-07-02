@@ -42,3 +42,5 @@ backend/eval/reports/
 # negation keeps it obvious. Force-add (git add -f) a folder here only to intentionally ship a new dataset.
 backend/data/*/
 !backend/data/training_data/
+backend/data/eval_data.zip
+ui-working.png

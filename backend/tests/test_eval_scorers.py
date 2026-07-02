@@ -509,3 +509,46 @@ def test_report_no_response_case_is_red():
     )
     assert rep.no_response_cases() == ["Z"]
     assert rep.is_red()
+
+
+# ---- feedback input-judge battery (judge_eval.py) -------------------------------------------------
+
+
+def test_judge_battery_cases_are_held_out_of_the_judge_prompt():
+    # C16: no battery answer may echo a worked example quoted in the judge's own system prompt, or the case
+    # measures prompt-RECALL, not classification (the self-confirming-battery fix). Enforce it so a future
+    # edit re-adding a prompt-quoted answer trips here. TWO checks, because the prompt quotes examples at two
+    # length scales and a single rule misses one of them:
+    #   (a) SUBSTRING match for the distinctive (>= 12 char) phrases — natural short clinical wording
+    #       ("your GP") would false-positive as a substring, so those are length-gated out here.
+    #   (b) EXACT match for EVERY quoted fragment regardless of length — this is what catches the SHORT
+    #       junk-reject exemplars the prompt quotes verbatim ("asdf", "idk", "n/a", "wrong"), which (a) skips.
+    #       Without it, a future edit re-adding one of those as a junk-reject case would regrow the
+    #       contamination undetected (the judge could recall that answer verbatim from its own system prompt).
+    import re
+
+    from eval.judge_eval import JUDGE_CASES
+    from health_intelligence import learn
+
+    quoted = [f.strip().lower() for f in re.findall(r'"([^"]+)"', learn._JUDGE_SYSTEM)]
+    assert quoted  # sanity: the prompt really does quote examples
+    long_frags = [f for f in quoted if len(f) >= 12]
+    for _q, answer, _fit, tag in JUDGE_CASES:
+        low = answer.strip().lower()
+        echoed = [f for f in long_frags if f in low] + [f for f in quoted if f == low]
+        assert not echoed, (
+            f"battery case {tag!r} echoes judge-prompt example(s) {echoed}: {answer!r}"
+        )
+
+
+def test_judge_section_disambiguates_pending_failed_and_skipped():
+    # C1: a keyed provider failure must NOT be recorded in the durable artifact as a keyless skip, and an
+    # interrupted (pending) run must read as interrupted — three distinct states from the same None result.
+    from eval.judge_eval import to_dict, to_markdown_section
+
+    assert to_dict(None) == {"skipped": True}
+    assert to_dict(None, failed=True) == {"failed": True}
+    assert to_dict(None, pending=True) == {"pending": True}
+    assert "SKIPPED" in to_markdown_section(None)
+    assert "FAILED" in to_markdown_section(None, failed=True)
+    assert "PENDING" in to_markdown_section(None, pending=True)

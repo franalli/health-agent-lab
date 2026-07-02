@@ -56,12 +56,34 @@ CONFIG_VERSION = "v0"
 # --------------------------------------------------------------------------------------------------
 
 #: Composition model (architecture §5). D1 leaves the LLM a *language* job, not a reasoning one, so
-#: a mid-tier model is the right tool. Pinned verbatim — do not silently upgrade.
-COMPOSE_MODEL = "claude-sonnet-4-6"
+#: the mid/balanced tier is the right tool. Pinned verbatim — do not silently upgrade.
+#: Sonnet 5 is a "5-generation" model: it rejects sampling params (temperature/top_p/top_k → 400) and
+#: defaults adaptive thinking ON. The composer therefore omits temperature and explicitly disables
+#: thinking (see ``llm._ADAPTIVE_ONLY_MODELS``) — the forced-tool structured-output call is incompatible
+#: with thinking being active, and that forced call IS our determinism/structuring mechanism.
+COMPOSE_MODEL = "claude-sonnet-5"
 
 #: Input-gate intent classifier (architecture §2: "a small model, temp 0, few-shot"). The doc names
 #: a small model without pinning one; confirm this choice when the gate is built (Phase 4).
 GATE_MODEL = "claude-haiku-4-5"
+
+#: Feedback input-judge (Phase 7 self-improvement): a small model that classifies whether a clinician's
+#: corrected answer is a FIT few-shot exemplar (coherent / on-style / states no numeric cutoff / does not
+#: reassure about a flagged value). Same Haiku tier as the gate — a bounded temp-0 classifier — and
+#: DELIBERATELY not the deterministic core: the input bar is a QUALITY filter, not the safety boundary
+#: (the always-on validator floors escalation under any prompt regardless). Same id as GATE_MODEL, so the
+#: PRICING entry below already covers it.
+JUDGE_MODEL = "claude-haiku-4-5"
+
+#: Models on the "5-generation" request surface: they reject sampling params (temperature/top_p/top_k
+#: with a 400) and default adaptive thinking ON. ``llm.structured`` keys its request shape on membership
+#: here (omit temperature + explicitly disable thinking) — a per-model CAPABILITY, deliberately NOT the
+#: compose/gate ROLE, so it lives next to the model pins it classifies. This is an explicit allow-list, NOT
+#: derived from ``COMPOSE_MODEL`` (the compose role is 5-gen TODAY, but that is a coincidence, not a rule):
+#: swapping ``COMPOSE_MODEL`` above to another 5-gen id that is NOT listed here would 400 on temperature, so
+#: a model swap MUST update BOTH the pin and this set (both now in this one file). Extend when a new model
+#: joins that surface (Opus 4.7+, Fable 5, …); an old-gen id must NOT be added (it would lose its temp 0).
+ADAPTIVE_ONLY_MODELS: frozenset[str] = frozenset({"claude-sonnet-5"})
 
 #: ``model_version`` stamped on a Mode-1 response — no model ran, but the schema column is NOT NULL and
 #: the reproducibility tuple must be whole. Mode 1's tuple is (data, config, template); this sentinel
@@ -75,22 +97,33 @@ MODEL_VERSION_DETERMINISTIC = "deterministic"
 # published per-MTok rate used to stamp ``cost_usd`` on every interaction.
 # --------------------------------------------------------------------------------------------------
 
-#: Pinned at 0 for both the gate and the composer — the determinism the architecture claims is
-#: *of substance* (temp 0 + the pure core), with only prose phrasing free to vary (§7).
+#: The gate's sampling temperature, pinned at 0 (it is the determinism-sensitive enum classifier, and
+#: Haiku 4.5 still honors sampling params). The composer no longer takes a temperature: Sonnet 5 rejects
+#: sampling params (5-gen surface), so ``llm.structured`` omits it for that model and disables thinking
+#: instead. The substance-determinism claim now rests on the pure core + the gate's temp 0 + the
+#: forced-tool structured output; only the composer's prose phrasing is free to vary (§7).
 LLM_TEMPERATURE = 0
 
 #: The gate emits one enum value, so a tiny budget suffices; the composer emits a short answer +
 #: uncertainty + the cited-marker keys (the deterministic core already did the analysis, §5). The
 #: compose budget carries headroom over the ~300–800-token target so a thorough multi-marker answer
 #: plus the forced-tool JSON overhead doesn't truncate mid-structure (a truncated tool call would be an
-#: ``LLMParseError`` — handled by the retry/fallback, but cheaper to make rare).
+#: ``LLMParseError`` — handled by the retry/fallback, but cheaper to make rare). Sonnet 5 uses a heavier
+#: tokenizer (~30% more tokens than Sonnet 4.6 for the same text), so the compose budget is widened to
+#: keep that headroom over the ~300–800-token target; with thinking disabled there are no thinking tokens
+#: competing for the budget, so this caps the structured answer alone.
 GATE_MAX_TOKENS = 256
-COMPOSE_MAX_TOKENS = 1536
+#: The feedback judge emits a bool + a one-line reason, so a small budget suffices (like the gate).
+JUDGE_MAX_TOKENS = 256
+COMPOSE_MAX_TOKENS = 2048
 
 #: Per-model ($/MTok input, $/MTok output) — published rates, used by ``llm.cost_usd`` to stamp
 #: each interaction's cost. Keyed by the pinned model ids above.
 PRICING: dict[str, tuple[float, float]] = {
-    COMPOSE_MODEL: (3.0, 15.0),  # Claude Sonnet 4.6
+    COMPOSE_MODEL: (
+        3.0,
+        15.0,
+    ),  # Claude Sonnet 5 (standard rate; intro $2/$10 through 2026-08-31)
     GATE_MODEL: (1.0, 5.0),  # Claude Haiku 4.5
 }
 
@@ -145,6 +178,41 @@ EMERGENCY_PHRASES: tuple[str, ...] = (
     "vomiting blood",
     "anaphylaxis",
     "anaphylactic",
+)
+
+#: Locale emergency contacts (**Switzerland**) surfaced in URGENT responses: the deterministic
+#: ``seek_care``/``crisis`` templates (the *guaranteed* acute path — they fire off the
+#: ``EMERGENCY_PHRASES`` floor even when the LLM is down or jailbroken) and, as softer copy on top, the
+#: composer's urgent branch. **Presentation-layer only** — consumed by ``llm``/``templates``, NEVER by
+#: ``analyze`` — so this is not a clinical threshold and does NOT bump ``CONFIG_VERSION`` (the analytical
+#: contract is untouched). Curated + regression-pinned here like ``EMERGENCY_PHRASES`` all the same,
+#: because an emergency reply that prints the WRONG number is a safety defect. Numbers verified against
+#: official Swiss guidance (ch.ch): 144 = ambulance/medical, 112 = pan-European (valid in CH), 143 = Die
+#: Dargebotene Hand (24/7 emotional-support / crisis line). Changing these is a safety change.
+#:
+#: OPERATIONAL NOTE (emergency-number change): the deterministic ``seek_care``/``crisis`` templates read
+#: these live, so the GUARANTEED acute path is always current. The composer's urgent-branch copy is DIFF-
+#: erent: ``EMERGENCY_MEDICAL_CONTACT`` is interpolated into ``llm.BASE_COMPOSE_SYSTEM`` and frozen into
+#: each promoted ``prompt_versions`` row. Startup/reseed re-syncs v0, but a promoted learned vN is a frozen
+#: snapshot, so on a DURABLE-disk deploy a stale number can persist in an active vN. After changing a
+#: number, run ``POST /reset`` (reverts learned prompts to v0, which re-syncs) or ``POST /admin/reseed`` so
+#: no promoted vN carries the old copy. (No-op on the free/ephemeral tier — the DB re-seeds each cold start.)
+EMERGENCY_MEDICAL_NUMBER = "144"  # Swiss ambulance / medical emergency (Sanitätsnotruf)
+EMERGENCY_EU_NUMBER = "112"  # pan-European emergency, also valid in Switzerland
+CRISIS_LINE_NUMBER = (
+    "143"  # Die Dargebotene Hand — Swiss 24/7 crisis / emotional-support line
+)
+
+#: Ready-to-render contact sentences, composed once so the template copy and the prompt copy can't drift
+#: to different numbers. The medical line leads with 144 (ambulance); the crisis line leads with 143 but
+#: still points to 144/112 for immediate physical danger (a crisis caller may also be in acute danger).
+EMERGENCY_MEDICAL_CONTACT = (
+    f"In Switzerland, call {EMERGENCY_MEDICAL_NUMBER} for an ambulance, "
+    f"or {EMERGENCY_EU_NUMBER} (the Europe-wide emergency number)."
+)
+CRISIS_CONTACT = (
+    f"In Switzerland you can reach Die Dargebotene Hand on {CRISIS_LINE_NUMBER} any time, "
+    f"or call {EMERGENCY_MEDICAL_NUMBER} (or {EMERGENCY_EU_NUMBER}) if you are in immediate danger."
 )
 
 # --------------------------------------------------------------------------------------------------

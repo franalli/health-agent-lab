@@ -1,7 +1,7 @@
 # Health Intelligence Service — the intended interface (CLAUDE.md "Commands"). Run from backend/.
 # uv owns the venv + dependency resolution; every target runs inside it.
 
-.PHONY: init-db seed run serve test eval lint hooks help
+.PHONY: init-db seed run serve test eval eval-judge lint hooks help
 .DEFAULT_GOAL := help
 
 # Shared uvicorn invocation; `run` (dev) and `serve` (prod-mode) differ only in port/reload/workers.
@@ -33,3 +33,6 @@ lint:  ## run all pre-commit checks (ruff lint+format, gitleaks) over the whole 
 
 eval:  ## run the evaluation harness → markdown + JSON report under eval/reports/ (Mode 2 needs ANTHROPIC_API_KEY)
 	uv run python -m eval
+
+eval-judge:  ## accuracy gate for the feedback input-judge (real Haiku; needs ANTHROPIC_API_KEY; no key -> SKIP)
+	uv run python -m eval.judge_eval

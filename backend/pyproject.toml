@@ -19,6 +19,9 @@ dev = [
     "httpx>=0.28.1",
     "pre-commit>=4.6.0",      # git hook runner — config at repo root (.pre-commit-config.yaml)
     "ruff>=0.15.20",           # linter + formatter; pinned again in .pre-commit-config.yaml for the hook
+    "watchfiles>=1.0.0",      # uvicorn --reload's real file watcher (dev only). Plain `uvicorn` omits it, so
+                              # `make run --reload` silently fell back to unreliable stat-polling and served
+                              # stale code; this makes reload actually restart the worker on a backend edit.
 ]
 
 [tool.ruff]

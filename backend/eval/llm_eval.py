@@ -5,7 +5,10 @@ for trace inspection: inputs (the member's question + context), the model output
 the deterministic escalation), latency/tokens/cost from the response metadata, and the deterministic
 scorer verdicts attached as **feedback** — so a reviewer can eye per-case behaviour and run-over-run
 drift in one place. The scorers stay the source of truth for pass/fail; LangSmith is the lens, not the
-gate, and the local markdown + JSON report stays canonical.
+gate, and the local markdown + JSON report stays canonical. Two sinks mirror the canonical report:
+`trace_run` (the composer/gate eval cases) and `trace_judge_run` (the Haiku feedback input-judge
+battery, each case a run whose `fit_correct` feedback is 1.0 iff the verdict matched its label) — so
+nothing in the local report is missing from LangSmith and there is no discrepancy to reconcile.
 
 It is **tracing-only**: it wraps the harness's ALREADY-MADE service calls (this module is the *only*
 importer of `langsmith` — the provider stays behind `llm.py`, no LangChain, and the live `/ask` path is
@@ -18,8 +21,13 @@ swallowed, never breaking the (canonical) local run.
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 from eval.types import Case, CaseResponses, ScorerResult
+from health_intelligence.config import JUDGE_MODEL
+
+if TYPE_CHECKING:
+    from eval.judge_eval import JudgeEvalResult
 
 #: Default project name; override with LANGSMITH_PROJECT.
 _DEFAULT_PROJECT = "health-intelligence-eval"
@@ -34,6 +42,25 @@ def project_name() -> str:
     return os.environ.get("LANGSMITH_PROJECT", _DEFAULT_PROJECT)
 
 
+def _open_sink():
+    """Construct a synchronous LangSmith ``Client`` + the ``RunTree`` class, or ``None`` if the SDK import
+    or client construction fails. Shared by ``trace_run`` and ``trace_judge_run`` so both sinks guard
+    construction identically (a misconfigured endpoint is never fatal). ``auto_batch_tracing=False`` posts
+    runs SYNCHRONOUSLY, so every error surfaces in the per-case try/except — no background ingest thread
+    that would 403 at interpreter exit and crash the process even though the canonical report already
+    wrote."""
+    try:
+        from langsmith import Client
+        from langsmith.run_trees import RunTree
+
+        return Client(auto_batch_tracing=False), RunTree
+    except Exception as e:  # noqa: BLE001 — SDK import OR client construction; never fatal
+        print(
+            f"  [langsmith] sink unavailable ({type(e).__name__}: {e}); skipping trace sink."
+        )
+        return None
+
+
 def trace_run(
     triples: list[tuple[Case, CaseResponses, list[ScorerResult]]],
     *,
@@ -45,20 +72,10 @@ def trace_run(
     the canonical local run."""
     if not is_enabled():
         return 0
-    try:
-        from langsmith import Client
-        from langsmith.run_trees import RunTree
-
-        # init inside the guard (a misconfigured endpoint must not be fatal); auto_batch_tracing=False
-        # posts runs SYNCHRONOUSLY, so every error surfaces in the per-case try/except below — no
-        # background ingest thread that would 403 at interpreter exit and crash the process (exit != 0)
-        # even though the canonical report already wrote.
-        client = Client(auto_batch_tracing=False)
-    except Exception as e:  # noqa: BLE001 — SDK import OR client construction; never fatal
-        print(
-            f"  [langsmith] sink unavailable ({type(e).__name__}: {e}); skipping trace sink."
-        )
+    opened = _open_sink()
+    if opened is None:
         return 0
+    client, RunTree = opened
 
     project = project_name()
     n = 0
@@ -128,4 +145,63 @@ def trace_run(
                 break
     if n:
         print(f"  [langsmith] traced {n} cases to project {project!r}.")
+    return n
+
+
+def trace_judge_run(result: JudgeEvalResult | None) -> int:
+    """Stream the feedback input-judge battery to LangSmith — the sibling of :func:`trace_run` for the
+    Haiku QUALITY gate, so the local report and LangSmith carry the SAME per-case data (no discrepancy to
+    reconcile). Each case becomes one ``llm`` run whose ``fit_correct`` feedback is 1.0 iff the judge's
+    verdict matched the label. Returns the number of cases traced (0 when the sink is off, unavailable, or
+    the run was SKIPPED). Never raises — a trace failure must not fail the canonical local run."""
+    if result is None or not is_enabled():
+        return 0
+    opened = _open_sink()
+    if opened is None:
+        return 0
+    client, RunTree = opened
+
+    project = project_name()
+    n = 0
+    for i, c in enumerate(result.cases):
+        try:
+            rt = RunTree(
+                name=f"judge:{c.tag}:{i}",
+                run_type="llm",
+                project_name=project,
+                client=client,  # type: ignore[call-arg]  # synchronous → no bg thread
+                inputs={
+                    "question": c.question,
+                    "corrected_answer": c.answer,
+                    "tag": c.tag,
+                },
+                outputs={
+                    "fit": c.got_fit,
+                    "expected_fit": c.want_fit,
+                    "reason": c.reason,
+                },
+                extra={"metadata": {"kind": "feedback_judge", "model": JUDGE_MODEL}},
+            )
+            rt.end()
+            rt.post()
+            client.create_feedback(
+                run_id=rt.id,
+                key="fit_correct",
+                score=1.0 if c.passed else 0.0,
+                comment=f"want_fit={c.want_fit} got_fit={c.got_fit}: {c.reason}",
+            )
+            n += 1
+        except Exception as e:  # noqa: BLE001 - one bad case must not abort the sink
+            print(
+                f"  [langsmith] failed to trace judge:{c.tag}:{i}: {type(e).__name__}: {str(e)[:140]}"
+            )
+            if n == 0:
+                # First trace failed → systematic config/auth (see trace_run); skip the rest.
+                print(
+                    "  [langsmith] first judge trace failed — skipping the sink. Check LANGSMITH_API_KEY, "
+                    "and set LANGSMITH_ENDPOINT to your region if non-US."
+                )
+                break
+    if n:
+        print(f"  [langsmith] traced {n} judge cases to project {project!r}.")
     return n
