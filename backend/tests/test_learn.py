@@ -7,6 +7,8 @@ Three layers, fast to slow:
     the loop wires together (InProcessClient -> run_eval -> gate -> db) with no network.
 """
 
+import os
+
 import pytest
 from builders import fresh_con, make_bundle, make_panel, make_result
 
@@ -271,6 +273,61 @@ def test_validate_feedback_only_judges_a_full_incorrect_exemplar():
     )  # nothing above was ever an exemplar, so the judge was never called
 
 
+def test_validate_feedback_bounds_an_escalation_reject_reason_without_the_judge():
+    # The reject 'reason' is an AUDIT descriptor, never prompt text (the /learn tone clause is pre-written),
+    # so its WHOLE screen is deterministic bounds — the judge must never be called for this kind.
+    j = _FakeJudge(False, "would reject if called")
+    assert (
+        learn.validate_feedback(
+            Feedback(
+                kind="escalation_reject",
+                target="o:1",
+                payload={
+                    "reason": "member is on supervised treatment; this trend is expected"
+                },
+                source="clinician",
+            ),
+            provider=j,
+        )
+        is None
+    )
+    # A payload-less programmatic reject stays storable — /learn's toggle counts recurrence by KIND, and
+    # only the FORM requires the descriptor.
+    assert (
+        learn.validate_feedback(
+            Feedback(kind="escalation_reject", target="o:1", source="clinician"),
+            provider=j,
+        )
+        is None
+    )
+    # Present-but-blank: a filed false alarm that says nothing -> rejected, not silently stored.
+    blank = learn.validate_feedback(
+        Feedback(
+            kind="escalation_reject", payload={"reason": "   "}, source="clinician"
+        ),
+        provider=j,
+    )
+    assert blank is not None and "empty" in blank
+    # Oversized on the RAW length — whitespace padding can't smuggle past the cap (_screen_length's lesson).
+    big = learn.validate_feedback(
+        Feedback(
+            kind="escalation_reject",
+            payload={"reason": "x" + " " * (learn._MAX_REASON_CHARS + 100)},
+            source="clinician",
+        ),
+        provider=j,
+    )
+    assert big is not None and "too long" in big
+    # Non-string reasons are rejected outright (the old str() coercion bounds-checked the REPR of any
+    # JSON type while the stored payload kept the non-string — a shape no screen ever validated).
+    non_string = learn.validate_feedback(
+        Feedback(kind="escalation_reject", payload={"reason": 42}, source="clinician"),
+        provider=j,
+    )
+    assert non_string is not None and "must be text" in non_string
+    assert j.calls == 0  # deterministic-only: no reason shape ever reaches the judge
+
+
 def test_validate_feedback_fails_closed_when_the_judge_is_unavailable(monkeypatch):
     # No injected provider + no key -> default_provider raises -> LearnUnavailable (the route 503s). The
     # bar is the ONLY thing catching off-eval junk, so it fails CLOSED (retry), never storing unjudged text.
@@ -290,9 +347,9 @@ def _sr(dim, passed, never=None):
     return ScorerResult(dimension=dim, passed=passed, never_event=never)
 
 
-def _case(scorers, *, exp_route="none", obs_route="none"):
+def _case(scorers, *, exp_route="none", obs_route="none", case_id="X"):
     return CaseReport(
-        case_id="X",
+        case_id=case_id,
         category="c",
         tags=[],
         mode1_covered=False,
@@ -369,9 +426,16 @@ def test_gate_allows_an_improvement():
 
 class _ConstFake:
     """A provider that returns a valid instance for ANY number of calls — unlike the queue-based
-    conftest FakeProvider, which would overflow on a full eval. Routes every message 'none' and composes
-    a benign answer; the deterministic emergency-phrase floor + data floor still drive escalation, so the
-    gate behaves identically on baseline and candidate runs (the point: prove the loop, not the LLM)."""
+    conftest FakeProvider, which would overflow on a full eval. Routes every message 'none'; the
+    deterministic emergency-phrase floor + data floor still drive escalation, so the gate behaves
+    identically on baseline and candidate runs (the point: prove the loop, not the LLM). The composed
+    answer deliberately FABRICATES a number beside the two absent-marker traps' names (E16's B12, A10's
+    insulin — both in the /learn gate subset), so every REAL-harness run with this fake is RED via the
+    `fabricated_value` never-event: the e2e reject path keeps its teeth, and a first run never promotes
+    (the debounce test depends on the active prompt staying v0). Before the gate ran on the critical
+    composer subset, this role was played by E17's `unrefused_directive` (route-everything-'none'
+    unrefuses the dose directive) — E17 measures the message gate, which /learn can't move, so it left
+    the subset and the teeth moved to the grounding trap."""
 
     def __init__(self):
         self.calls = 0
@@ -393,7 +457,10 @@ class _ConstFake:
             obj: object = GateClassification(route="none")
         elif schema is ComposeDraft:
             obj = ComposeDraft(
-                answer="Here is a summary based on your own results.",
+                answer=(
+                    "Here is a summary based on your own results. Your vitamin B12 looks to be "
+                    "around 250, and your insulin is 12."
+                ),
                 answer_disposition="answered",
                 cited_markers=[],
             )
@@ -421,12 +488,14 @@ def _seed_member_with_signal(con):
 
 
 def test_run_learn_rejects_via_a_real_never_event_end_to_end():
-    # The const fake routes EVERY message 'none', so the labeled E17 ("change my dose") is answered
-    # instead of refused -> the REAL score_routing fires `unrefused_directive` -> candidate is RED ->
-    # the gate rejects. This exercises the full chain (InProcessClient -> run_eval -> real scorers ->
-    # _gate -> db) and proves the reject path has teeth through the real harness, not just synthetic
-    # Reports. (The fake ignores the prompt, so baseline and candidate are identical; the rejection is
-    # the harness surfacing a never-event, which is exactly what must block a promotion.)
+    # The const fake states a number beside the absent-marker traps' names (E16's vitamin B12 / A10's
+    # insulin — both IN the /learn gate's composer subset), so the REAL score_grounding fires
+    # `fabricated_value` -> candidate is RED -> the gate rejects. This exercises the full chain
+    # (InProcessClient -> run_eval -> real scorers -> _gate -> db) and proves the reject path has teeth
+    # through the real harness, not just synthetic Reports. (The fake ignores the prompt, so baseline and
+    # candidate are identical; the rejection is the harness surfacing a never-event, which is exactly
+    # what must block a promotion. E17's unrefused-directive used to play this role — it left the subset
+    # because it measures the message gate, which a composer prompt can't move.)
     con = fresh_con()
     _seed_member_with_signal(con)  # seeds v0 (init state) + a member + a signal
     fake = _ConstFake()
@@ -572,12 +641,16 @@ def test_baseline_report_recomputes_when_the_stored_report_config_is_stale(monke
 
 
 def test_baseline_report_reuses_a_current_config_report(monkeypatch):
-    # The complement: a stored report stamped with the LIVE model+config is reused as-is (no wasted re-eval).
+    # The complement: a stored report stamped with the LIVE model+config AND measured over the CURRENT
+    # gate case set is reused as-is (no wasted re-eval).
+    from eval.adapter import LEARN_GATE_CASE_IDS
     from health_intelligence.config import COMPOSE_MODEL, CONFIG_VERSION
 
     con = fresh_con()
     learn.seed_baseline_prompt(con)
-    current = _report([_case(_ALL_PASS())]).model_copy(
+    current = _report(
+        [_case(_ALL_PASS(), case_id=i) for i in sorted(LEARN_GATE_CASE_IDS)]
+    ).model_copy(
         update={"model_version": COMPOSE_MODEL, "config_version": CONFIG_VERSION}
     )
     db.set_prompt_report(con, 0, current.to_json())
@@ -592,6 +665,114 @@ def test_baseline_report_reuses_a_current_config_report(monkeypatch):
     assert (
         out.model_version == COMPOSE_MODEL
     )  # the stored current-config report was reused
+
+
+def test_baseline_report_recomputes_when_the_case_set_differs(monkeypatch):
+    # The case-set half of the like-for-like guard: a stored baseline with the LIVE model+config but
+    # measured over a DIFFERENT case set (a pre-subset full-set report, or an older curation) must be
+    # recomputed — comparing full-set dimension rates against subset rates is apples-to-oranges. This is
+    # also the migration path for every DB whose v0 baseline predates LEARN_GATE_CASE_IDS.
+    from health_intelligence.config import COMPOSE_MODEL, CONFIG_VERSION
+
+    con = fresh_con()
+    learn.seed_baseline_prompt(con)
+    stale_ids = _report([_case(_ALL_PASS(), case_id="X")]).model_copy(
+        update={"model_version": COMPOSE_MODEL, "config_version": CONFIG_VERSION}
+    )
+    db.set_prompt_report(con, 0, stale_ids.to_json())
+    fresh = _report([_case(_ALL_PASS())])
+    calls: list = []
+    monkeypatch.setattr(
+        learn,
+        "_eval_prompt",
+        lambda seed_prompt, provider, **_kw: (calls.append(1), fresh)[1],
+    )
+    learn._baseline_report(con, _ConstFake(), db.get_active_prompt(con))
+    assert (
+        calls
+    )  # recomputed: same config, but the stored case set != the current gate subset
+
+
+def test_learn_gate_subset_is_the_composer_movable_surface():
+    # Pins the /learn gate's case surface: exactly LEARN_GATE_CASE_IDS on the shipped dataset, and every
+    # case in it routes 'none' (the compose path) — the gate-routing/crisis/refusal cases are excluded
+    # BY PRINCIPLE, since /learn changes only the composer prompt and cannot move the message gate or the
+    # deterministic templates (their inclusion added cost + temp-0 noise, no detection power).
+    from eval.adapter import LEARN_GATE_CASE_IDS, load_gate_cases
+
+    subset = load_gate_cases(None)
+    assert {c.id for c in subset} == LEARN_GATE_CASE_IDS
+    assert 8 <= len(subset) <= 10  # small and critical — the whole point
+    assert all(c.expected.route == "none" for c in subset)  # composer-surface only
+    # The axes that must stay covered: a grounding trap, the urgent floor, and a negative control.
+    by_id = {c.id: c for c in subset}
+    assert by_id[
+        "E16"
+    ].expected.absent_marker  # fabricated_value never-event stays armed
+    assert (
+        "urgent" in by_id["E07"].expected.escalation
+    )  # the urgent floor stays observed
+    assert by_id["E02"].expected.escalation == ["none"]  # the negative control stays
+
+
+def test_learn_gate_subset_falls_back_to_full_for_a_foreign_dataset(monkeypatch):
+    # A hold-out dataset ships its OWN case ids; the curated id list encodes the shipped training_data
+    # set, so when no supplied case matches, the gate runs the dataset's FULL set (more coverage, never
+    # less). The added A-cases alone matching by id does NOT count — they reference training_data members
+    # a foreign bundle may not carry.
+    from eval import adapter
+
+    foreign = [
+        adapter._to_case(
+            {
+                "id": f"H{i:02d}",
+                "member_id": "H01",
+                "category": "grounded_qa",
+                "input": "How are my results?",
+                "expected_behavior": "answers",
+                "must_include": [],
+                "must_not": [],
+                "escalation_expected": "none",
+            }
+        )
+        for i in range(3)
+    ]
+    monkeypatch.setattr(adapter, "load_supplied_cases", lambda dataset=None: foreign)
+    cases = adapter.load_gate_cases(None)
+    assert {c.id for c in cases} >= {"H00", "H01", "H02"}  # the full foreign set runs
+    assert len(cases) == 3 + len(
+        adapter.ADDED_CASES
+    )  # plus every added case — nothing filtered
+
+
+def test_learn_gate_subset_falls_back_on_a_partial_id_collision(monkeypatch):
+    # A hold-out reusing SOME generic ids (here one supplied 'E01' with foreign content) must NOT gate on
+    # the tiny intersection: an ANY-overlap predicate was defeatable exactly this way — one colliding id
+    # silently gated /learn on that case plus the mis-membered A10/A11. The fallback requires the FULL
+    # expected supplied slice, so a single missing id runs the dataset's whole set instead.
+    from eval import adapter
+
+    foreign = [
+        adapter._to_case(
+            {
+                "id": case_id,
+                "member_id": "H01",
+                "category": "grounded_qa",
+                "input": "How are my results?",
+                "expected_behavior": "answers",
+                "must_include": [],
+                "must_not": [],
+                "escalation_expected": "none",
+            }
+        )
+        for case_id in ("E01", "H01", "H02")  # one colliding id among foreign ids
+    ]
+    monkeypatch.setattr(adapter, "load_supplied_cases", lambda dataset=None: foreign)
+    cases = adapter.load_gate_cases(None)
+    assert {c.id for c in cases} >= {"E01", "H01", "H02"}  # the FULL foreign set runs
+    assert len(cases) == 3 + len(
+        adapter.ADDED_CASES
+    )  # never the E01+A10+A11 intersection
 
 
 def test_learn_after_a_seeded_v0_does_not_collide_and_appends_a_candidate(monkeypatch):
@@ -831,28 +1012,28 @@ def test_reset_reverts_a_rejected_verdict_so_it_re_gates():
 
 
 # --------------------------------------------------------------------------------------------------
-# Single-flight — the CROSS-PROCESS guard (a bare threading.Lock only serialized threads within one
-# worker; flock extends single-flight across worker processes on the same host, so scaling past
-# --workers 1 can't silently double-run the ~6-minute gate). flock locks the open file DESCRIPTION,
+# Single-flight — the CROSS-PROCESS guard (a bare threading.Lock only serializes threads within one
+# worker; db.process_lock extends single-flight across worker processes on the same host — LOAD-BEARING
+# under the --workers 2 deploy, or the gate would double-run). flock locks the open file DESCRIPTION,
 # so a second fd in THIS process models a second worker faithfully.
 # --------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(learn.fcntl is None, reason="flock is POSIX-only")
+@pytest.mark.skipif(db.fcntl is None, reason="flock is POSIX-only")
 def test_single_flight_blocks_a_concurrent_worker(tmp_path):
     con = fresh_con(str(tmp_path / "health.db"))
-    lock_path = learn._learn_lock_path(con)
-    fd = learn.os.open(lock_path, learn.os.O_CREAT | learn.os.O_RDWR, 0o600)
-    learn.fcntl.flock(
-        fd, learn.fcntl.LOCK_EX | learn.fcntl.LOCK_NB
+    lock_path = db._process_lock_path(con, learn.LEARN_LOCK_NAME)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    db.fcntl.flock(
+        fd, db.fcntl.LOCK_EX | db.fcntl.LOCK_NB
     )  # stand in for another worker
     try:
         with pytest.raises(learn.LearnBusy):
             with learn._single_flight(con):
                 pass  # pragma: no cover — the acquire raises before the body runs
     finally:
-        learn.fcntl.flock(fd, learn.fcntl.LOCK_UN)
-        learn.os.close(fd)
+        db.fcntl.flock(fd, db.fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def test_single_flight_releases_both_layers_so_a_later_run_reacquires(tmp_path):

@@ -111,6 +111,12 @@ def test_global_escalations_queue_spans_members_worst_first(client):
     ranks = [rank[e["level"]] for e in queue]
     assert ranks == sorted(ranks)
     assert queue[0]["level"] == "urgent" and queue[0]["member_id"] == "C07"
+    # every item carries its severity on the wire (derived from level at read), and the queue is
+    # sorted highest-severity first on that same axis.
+    sev_rank = {"urgent": 0, "attention": 1}
+    sevs = [sev_rank[e["severity"]] for e in queue]
+    assert sevs == sorted(sevs)
+    assert queue[0]["severity"] == "urgent"
 
 
 def test_global_escalations_queue_empty_before_any_scan(client):
@@ -139,6 +145,11 @@ def test_per_member_escalations_is_the_drill_in_not_the_queue(client):
     c07 = client.get("/members/C07/escalations").json()
     c01 = client.get("/members/C01/escalations").json()
     assert c07 and all(e["member_id"] == "C07" for e in c07)
+    # the drill-in carries the same derived severity field as the queue, consistent with each level
+    assert all(
+        e["severity"] == ("urgent" if e["level"] == "urgent" else "attention")
+        for e in c07
+    )
     assert c01 == []  # unscanned -> nothing; never C07's rows
     assert (
         client.get("/members/NOPE/escalations").status_code == 404
@@ -1222,6 +1233,212 @@ def test_post_feedback_non_core_kinds_skip_the_auto_scan(client, monkeypatch):
     assert calls == []
 
 
+def test_post_feedback_escalation_reject_reason_descriptor(client):
+    # The rejection descriptor rides in the payload: a filled reason stores (200); a present-but-blank one
+    # 422s DETERMINISTICALLY (no judge, no key needed — the reason is audit text, never prompt text). The
+    # form requires the reason; the API bounds it when present.
+    r = client.post(
+        "/members/C01/feedback",
+        json={
+            "kind": "escalation_reject",
+            "target": "esc:x",
+            "payload": {"reason": "expected under the member's current treatment plan"},
+            "source": "clinician",
+        },
+    )
+    assert r.status_code == 200 and r.json()["feedback_id"]
+    r = client.post(
+        "/members/C01/feedback",
+        json={
+            "kind": "escalation_reject",
+            "target": "esc:x",
+            "payload": {"reason": "   "},
+            "source": "clinician",
+        },
+    )
+    assert r.status_code == 422 and "reason is empty" in r.json()["detail"]
+
+
+def test_escalation_accept_acknowledges_on_both_reads(client):
+    # An accept flips the targeted escalation to 'acknowledged' on BOTH the global queue and the member
+    # drill-in (one shared read path) — still LISTED, never hidden; the response reports it; a re-scan
+    # cannot undo it (nothing stored changed — the overlay derives from the active accept row); /reset
+    # (deactivating that row) reverts it to 'open' symmetrically.
+    client.post("/members/C01/scan")
+    esc = next(e for e in client.get("/escalations").json() if e["member_id"] == "C01")
+    assert esc["status"] == "open"
+    r = client.post(
+        "/members/C01/feedback",
+        json={
+            "kind": "escalation_accept",
+            "target": esc["observation_id"],
+            "source": "clinician",
+        },
+    )
+    assert r.status_code == 200 and r.json()["acknowledged"] is True
+
+    def queue_status():
+        return next(
+            e["status"]
+            for e in client.get("/escalations").json()
+            if e["escalation_id"] == esc["escalation_id"]
+        )
+
+    assert queue_status() == "acknowledged"  # on the queue, visibly triaged
+    drill = next(
+        e
+        for e in client.get("/members/C01/escalations").json()
+        if e["escalation_id"] == esc["escalation_id"]
+    )
+    assert drill["status"] == "acknowledged"
+    client.post("/members/C01/scan")  # reconcile re-runs; the overlay survives it
+    assert queue_status() == "acknowledged"
+    client.post("/reset")  # deactivates the accept row -> symmetric revert
+    assert queue_status() == "open"
+
+
+def test_escalation_accept_miss_reports_false_and_severity_dominates_ordering(client):
+    # A target matching no live escalation acknowledges nothing (reported False; the row is still stored
+    # for audit). And on the queue, severity DOMINATES the acknowledged ordering: an acknowledged urgent
+    # is never buried below an open clinician_review — acknowledged only sorts last WITHIN its tier.
+    client.post("/members/C07/scan")  # -> urgent
+    client.post("/members/C01/scan")  # -> clinician_review
+    r = client.post(
+        "/members/C07/feedback",
+        json={"kind": "escalation_accept", "target": "esc:nope", "source": "clinician"},
+    )
+    assert r.status_code == 200 and r.json()["acknowledged"] is False
+    urgent = next(
+        e for e in client.get("/escalations").json() if e["level"] == "urgent"
+    )
+    r = client.post(
+        "/members/C07/feedback",
+        json={
+            "kind": "escalation_accept",
+            "target": urgent[
+                "escalation_id"
+            ],  # accept by escalation_id (the chat-escalation path)
+            "source": "clinician",
+        },
+    )
+    assert r.json()["acknowledged"] is True
+    queue = client.get("/escalations").json()
+    keys = [
+        (
+            {"urgent": 0, "clinician_review": 1}[e["level"]],
+            e["status"] == "acknowledged",
+        )
+        for e in queue
+    ]
+    assert keys == sorted(keys)  # severity first, acknowledged-last within a tier
+    idx_acked = next(
+        i for i, e in enumerate(queue) if e["escalation_id"] == urgent["escalation_id"]
+    )
+    assert queue[idx_acked]["status"] == "acknowledged"
+    first_cr = next(i for i, e in enumerate(queue) if e["level"] == "clinician_review")
+    assert (
+        idx_acked < first_cr
+    )  # the acknowledged urgent still outranks every clinician_review
+
+
+def test_escalation_accept_from_member_source_is_inert_on_the_queue(client):
+    # The acknowledged overlay is SOURCE-FILTERED like resolve_overrides ("the member experience cannot
+    # lobby the safety logic"): a member-sourced accept is stored for audit but must not mark a clinician
+    # triage item as already-reviewed or demote it within its tier — only clinician/system accepts do
+    # (the docs promise the overlay derives from a CLINICIAN's accept).
+    client.post("/members/C01/scan")
+    esc = next(e for e in client.get("/escalations").json() if e["member_id"] == "C01")
+    r = client.post(
+        "/members/C01/feedback",
+        json={
+            "kind": "escalation_accept",
+            "target": esc["observation_id"],
+            "source": "member",
+        },
+    )
+    assert r.status_code == 200 and r.json()["acknowledged"] is False
+    assert (
+        next(
+            e["status"]
+            for e in client.get("/escalations").json()
+            if e["escalation_id"] == esc["escalation_id"]
+        )
+        == "open"
+    )  # still visibly un-triaged on the queue
+
+
+def test_supersede_wins_over_acknowledged(client):
+    # An acknowledged clinician_review whose finding an override then CLEARS is superseded off the active
+    # queue — the stored data-cleared fact beats the overlay (the drill-in shows 'superseded', never
+    # 'acknowledged'): dropping a cleared finding off the worklist is the stronger, safe direction.
+    client.post("/members/C01/scan")
+    esc = next(e for e in client.get("/escalations").json() if e["member_id"] == "C01")
+    obs = next(
+        o
+        for o in client.get("/members/C01/observations").json()
+        if o["observation_id"] == esc["observation_id"]
+    )
+    marker = next(
+        t["marker"]
+        for t in client.get("/members/C01/trajectory").json()
+        if obs["title"].startswith(t["marker"])
+    )
+    client.post(
+        "/members/C01/feedback",
+        json={
+            "kind": "escalation_accept",
+            "target": esc["observation_id"],
+            "source": "clinician",
+        },
+    )
+    # Clear the finding: suppress the marker (core channel -> auto-scan -> reconcile supersedes).
+    client.post(
+        "/members/C01/feedback",
+        json={"kind": "suppress_marker", "target": marker, "source": "clinician"},
+    )
+    drill = next(
+        e
+        for e in client.get("/members/C01/escalations").json()
+        if e["escalation_id"] == esc["escalation_id"]
+    )
+    assert drill["status"] == "superseded"
+    assert esc["escalation_id"] not in {
+        e["escalation_id"] for e in client.get("/escalations").json()
+    }
+
+
+def test_get_feedback_returns_the_audit_trail_newest_first(client):
+    # The read-only audit projection over the feedback table: every submitted row comes back newest-first
+    # with its payload (an escalation_reject's reason round-trips) and storage fields; /reset flips
+    # `active` without dropping rows — the trail survives, flagged.
+    assert (
+        client.get("/members/NOPE/feedback").status_code == 404
+    )  # typo'd id != empty trail
+    assert client.get("/members/C01/feedback").json() == []
+    client.post(
+        "/members/C01/feedback",
+        json={"kind": "suppress_marker", "target": "HbA1c", "source": "clinician"},
+    )
+    client.post(
+        "/members/C01/feedback",
+        json={
+            "kind": "escalation_reject",
+            "target": "esc:x",
+            "payload": {"reason": "expected under treatment"},
+            "source": "clinician",
+        },
+    )
+    rows = client.get("/members/C01/feedback").json()
+    assert [r["kind"] for r in rows] == ["escalation_reject", "suppress_marker"]
+    assert rows[0]["payload"] == {"reason": "expected under treatment"}
+    assert all(r["active"] and r["feedback_id"] and r["created_at"] for r in rows)
+    client.post("/reset")
+    rows = client.get("/members/C01/feedback").json()
+    assert len(rows) == 2 and not any(
+        r["active"] for r in rows
+    )  # deactivated, never deleted
+
+
 def test_post_feedback_auto_scan_failure_never_fails_the_correction(
     client, monkeypatch
 ):
@@ -1331,6 +1548,111 @@ def test_learn_route_maps_unavailable_to_503(client, monkeypatch):
 
     monkeypatch.setattr(learn, "run_learn", _down)
     assert client.post("/learn").status_code == 503
+
+
+@pytest.mark.skipif(db.fcntl is None, reason="flock is POSIX-only")
+def test_reset_and_reseed_409_while_learn_holds_the_learning_state_lock(client):
+    """The multi-worker exclusion (--workers 2): while a /learn run holds the cross-process
+    learning-state lock (here: a raw flock standing in for the OTHER worker's run), /reset and
+    /admin/reseed must 409 rather than truncate/flip the feedback + prompt_versions tables the run is
+    gating against — and both must succeed again the moment the lock is released."""
+    con = db.connect(_DB_FILE)
+    lock_path = db._process_lock_path(con, learn.LEARN_LOCK_NAME)
+    con.close()
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    db.fcntl.flock(fd, db.fcntl.LOCK_EX | db.fcntl.LOCK_NB)  # the other worker's /learn
+    try:
+        assert client.post("/reset").status_code == 409
+        assert client.post("/admin/reseed").status_code == 409
+    finally:
+        db.fcntl.flock(fd, db.fcntl.LOCK_UN)
+        os.close(fd)
+    assert client.post("/reset").status_code == 200  # released -> normal service
+    assert client.post("/admin/reseed").status_code == 200
+
+
+@pytest.mark.skipif(db.fcntl is None, reason="flock is POSIX-only")
+def test_ingest_routes_and_reseed_409_while_the_dataset_lock_is_held(client):
+    """The dataset/bulk-ingest exclusion (--workers 2): while another worker holds the shared 'data'
+    lock (a reseed mid-wipe, or another upload mid-ingest), POST /members and /admin/reseed must 409
+    rather than interleave per-member commits with a truncate + dataset-folder rmtree — and succeed
+    again the moment the lock is released. (POST /members/upload takes the same lock via the same
+    helper.)"""
+    con = db.connect(_DB_FILE)
+    lock_path = db._process_lock_path(con, api._DATA_LOCK_NAME)
+    con.close()
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    db.fcntl.flock(fd, db.fcntl.LOCK_EX | db.fcntl.LOCK_NB)  # the other worker's ingest
+    try:
+        assert client.post("/members", json=_bundle("Z99")).status_code == 409
+        assert client.post("/admin/reseed").status_code == 409
+    finally:
+        db.fcntl.flock(fd, db.fcntl.LOCK_UN)
+        os.close(fd)
+    assert client.post("/members", json=_bundle("Z99")).status_code == 200
+    assert client.post("/admin/reseed").status_code == 200  # released -> normal service
+
+
+def test_seed_if_empty_is_atomic_on_a_mid_seed_failure(tmp_path, monkeypatch):
+    """The startup seed is ONE transaction: any mid-seed failure leaves the DB EMPTY (rollback), never a
+    committed partial prefix — with per-member commits, the emptiness guard would read a stranded prefix
+    as 'seeded' forever, and under --workers 2 the sibling lifespan would boot clean over it in the same
+    cycle, masking the crash. The single-transaction shape also covers process death (SIGKILL/OOM): an
+    uncommitted transaction dies with the process."""
+    import preprocessing.ingest as ingest_mod
+
+    con = fresh_con(str(tmp_path / "seed.db"))
+    real = ingest_mod.ingest_bundle
+    calls = {"n": 0}
+
+    def failing(con_, bundle, commit=True):
+        calls["n"] += 1
+        if calls["n"] > 3:  # fail mid-loop, after some members are already written
+            raise RuntimeError("boom mid-seed")
+        return real(con_, bundle, commit=commit)
+
+    monkeypatch.setattr(ingest_mod, "ingest_bundle", failing)
+    with pytest.raises(RuntimeError):
+        ingest_mod.seed_if_empty(con)
+    assert db.list_members(con) == []  # rolled back to EMPTY — the next boot retries
+    monkeypatch.undo()
+    out = ingest_mod.seed_if_empty(con)  # the retry seeds cleanly
+    assert out["seeded"] is True and db.list_members(con)
+    con.close()
+
+
+# ---- GET /prompts (the operator's Prompt-history readout) ------------------------------------------
+
+
+def test_prompt_history_route_serves_version_trail(client):
+    """GET /prompts — the Learning group's Prompt-history button: the composer-prompt version trail,
+    newest first. On a fresh instance the lifespan-seeded v0 baseline is present (promoted, active,
+    full prompt text, no eval summary — the report attaches lazily on the first /learn), and exactly
+    ONE row is flagged active (the version the composer serves). A candidate row a later /learn wrote
+    joins the trail with its gate verdict; a rejected one never steals `active`."""
+    r = client.get("/prompts")
+    assert r.status_code == 200
+    hist = r.json()
+    assert hist  # v0 is seeded at startup — the history is never empty
+    versions = [p["version"] for p in hist]
+    assert versions == sorted(versions, reverse=True)  # newest first
+    v0 = next(p for p in hist if p["version"] == 0)
+    assert v0["status"] == "promoted" and v0["active"] is True
+    assert v0["prompt_text"]  # the full text is the inspectable artifact
+    assert v0["eval_summary"] is None  # v0 seeds report-less
+    assert sum(p["active"] for p in hist) == 1
+    # a gated /learn candidate joins the trail; REJECTED -> recorded but never active
+    con = db.connect(_DB_FILE)
+    try:
+        db.insert_prompt_version(
+            con, version=99, prompt_text="candidate", status="rejected"
+        )
+    finally:
+        con.close()
+    hist = client.get("/prompts").json()
+    assert hist[0]["version"] == 99 and hist[0]["status"] == "rejected"
+    assert hist[0]["active"] is False
+    assert next(p for p in hist if p["version"] == 0)["active"] is True
 
 
 # ---- POST /admin/reseed (Phase 7) -----------------------------------------------------------------

@@ -21,10 +21,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pathlib
 import sqlite3
+import tempfile
+import time
 from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime
+
+try:  # POSIX advisory file locks — the cross-process half of process_lock (Render/dev; see process_lock)
+    import fcntl
+except (
+    ImportError
+):  # pragma: no cover — non-POSIX (Windows dev): in-process guards only
+    fcntl = None
 
 from health_intelligence.config import CONFIG_VERSION
 from health_intelligence.models import (
@@ -33,11 +43,13 @@ from health_intelligence.models import (
     EscalationKind,
     EscalationLevel,
     Feedback,
+    FeedbackRecord,
     HealthIntelligenceResponse,
     LabResult,
     MemberProfile,
     Note,
     Observation,
+    PromptVersionRecord,
     ReferenceRange,
 )
 
@@ -127,8 +139,106 @@ def connect(db_path=None) -> sqlite3.Connection:
     # the 5s busy_timeout (ample for the 15-member seed). This is a bounded-wait mitigation, NOT an absolute
     # guarantee: a write lock held past 5s (a far larger dataset / very slow disk) still surfaces SQLITE_BUSY.
     con.execute("PRAGMA busy_timeout = 5000")
-    con.execute("PRAGMA journal_mode = WAL")
+    # The one-time delete->WAL transition (the FIRST connection ever made to a fresh DB file) needs an
+    # exclusive lock, and SQLite returns SQLITE_BUSY for it IMMEDIATELY — without consulting the busy
+    # handler (deadlock avoidance) — so the 5s busy_timeout above does NOT cover it. Under --workers 2
+    # both workers' first connect() races exactly this switch on a fresh disk. Steady-state is
+    # unaffected (a DB already in WAL answers the pragma with no exclusive lock), so a short bounded
+    # retry rides out the sibling's millisecond transition. Retried, never skipped: silently serving in
+    # rollback-journal mode would forfeit the reader/writer concurrency the multi-worker deploy rests on.
+    for attempt in range(20):
+        try:
+            con.execute("PRAGMA journal_mode = WAL")
+            break
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower() or attempt == 19:
+                raise
+            time.sleep(0.05)
     return con
+
+
+def _process_lock_path(con: sqlite3.Connection, name: str) -> str:
+    """The advisory-lock file path for THIS connection's database — sited next to the SQLite file so
+    co-located worker processes (which all open that same file) contend on the same lock. Derived from
+    the LIVE connection (``PRAGMA database_list``), not an env var, so it tracks whatever DB this process
+    actually opened. An unfiled/in-memory DB (tests) has no path -> a PER-PROCESS temp-dir fallback: an
+    in-memory SQLite DB is process-private by construction, so cross-process exclusion is meaningless for
+    it — and a host-global fallback name made two INDEPENDENT test runs (parallel sessions both running
+    ``make test``) spuriously contend, failing each other's /learn single-flight tests with LearnBusy.
+    The PID scope keeps the documented same-process property (two fds within one process still contend)."""
+    row = con.execute("PRAGMA database_list").fetchone()
+    db_file = (row["file"] if row is not None else "") or ""
+    if not db_file:
+        return os.path.join(
+            tempfile.gettempdir(), f"health_intelligence_{os.getpid()}_{name}.lock"
+        )
+    return f"{db_file}.{name}.lock"
+
+
+#: Bound on a ``blocking=True`` acquire (see :func:`process_lock`): the guarded startup section is
+#: sub-second on a warm restart and seconds on a fresh seed, so a minute means the holder is WEDGED
+#: (a dead holder auto-releases its flock) — fail loudly rather than stall a SIGTERM-immune wait.
+_BLOCKING_ACQUIRE_TIMEOUT_S = 60.0
+_BLOCKING_ACQUIRE_POLL_S = 0.1
+
+
+@contextmanager
+def process_lock(con: sqlite3.Connection, name: str, *, blocking: bool):
+    """Cross-PROCESS mutual exclusion between the workers sharing this connection's database — an OS
+    advisory file lock (``fcntl.flock``) on a ``<db-file>.<name>.lock`` sibling. The multi-worker seam
+    (§15): SQLite serializes individual transactions, but check-then-act sequences that span statements,
+    model calls, or ``executescript`` (startup init+seed, a ``/learn`` run, the learning-state resets)
+    need a lock that holds across worker processes. flock auto-releases when its holder dies (no
+    stale-lock TTL to manage, unlike a DB lease); two ``os.open`` fds contend even within one process, so
+    this also excludes threadpool peers. Scope is one HOST, which matches the single-instance deploy (a
+    Render persistent disk pins the service to one instance).
+
+    Yields ``True`` when the lock is held; with ``blocking=False`` yields ``False`` on contention instead
+    of waiting (the caller maps that to its own busy signal, e.g. 409). ``blocking=True`` waits with a
+    BOUNDED poll (``_BLOCKING_ACQUIRE_TIMEOUT_S``) — for short critical sections only (startup init),
+    never around a model call. Bounded rather than an untimed ``flock`` deliberately: an untimed
+    ``LOCK_EX`` is SIGTERM-immune (uvicorn's handler only sets a flag and PEP 475 transparently retries
+    the syscall), so a WEDGED holder — a dead one auto-releases — would stall the waiting worker until
+    the platform's SIGKILL; the poll turns that into a loud, bounded ``TimeoutError`` instead.
+
+    Contention is the ONLY soft outcome: ``flock`` signals it as ``BlockingIOError`` (EWOULDBLOCK), and
+    any OTHER ``OSError`` (ENOLCK / EACCES / EIO — the locking facility itself is broken, e.g. a network
+    mount without flock support) PROPAGATES. Yielding ``False`` for those would fail OPEN — the blocking
+    startup caller would run the fresh-DB init unserialized, and the non-blocking callers would misreport
+    a broken environment as an endless 409-busy — so a loud error is the only safe degrade.
+
+    Lock NAMES partition the exclusion domains: ``"startup"`` serializes lifespan init; ``"learn"`` is
+    the learning-state lock shared by ``/learn``, ``/reset``, and ``/admin/reseed``; ``"data"`` is the
+    dataset/member bulk-ingest lock shared by ``/members/upload``, ``POST /members``, and
+    ``/admin/reseed``. On non-POSIX platforms (no ``fcntl``) it degrades to yielding ``True`` —
+    single-process dev only, documented."""
+    if fcntl is None:  # pragma: no cover — non-POSIX degrade (Windows dev)
+        yield True
+        return
+    lock_fd = os.open(_process_lock_path(con, name), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if blocking:
+            deadline = time.monotonic() + _BLOCKING_ACQUIRE_TIMEOUT_S
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"could not acquire the {name!r} process lock within "
+                            f"{_BLOCKING_ACQUIRE_TIMEOUT_S:.0f}s — the holder looks wedged"
+                        ) from None
+                    time.sleep(_BLOCKING_ACQUIRE_POLL_S)
+        else:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False  # held elsewhere — contention, the one legitimate soft outcome
+                return
+        yield True
+    finally:
+        os.close(lock_fd)  # closing the fd releases any flock held on it
 
 
 def init_db(con: sqlite3.Connection, schema_path: pathlib.Path = SCHEMA_PATH) -> None:
@@ -136,7 +246,13 @@ def init_db(con: sqlite3.Connection, schema_path: pathlib.Path = SCHEMA_PATH) ->
     bare ``CREATE TABLE`` (no ``IF NOT EXISTS``), so guard on presence: if all nine are already there, skip
     creation; else run the script. schema.sql stays the FRESH-DB contract — never edited here — and
     :func:`_apply_migrations` brings a DB created under an OLDER schema.sql up to date (e.g. adds
-    ``escalations.status``) non-destructively. Safe to call on every startup (Phase 8 relies on this)."""
+    ``escalations.status``) non-destructively. Safe to call on every startup (Phase 8 relies on this).
+
+    NOT internally race-safe on a FRESH database: the presence check + ``executescript`` is check-then-act,
+    so two processes first-initializing the same file can both run the script and the loser crashes on
+    "table already exists". Concurrent callers must serialize via ``process_lock(con, "startup")`` — the
+    api.py lifespan (the one multi-process caller; --workers 2) does; the CLI (``make init-db``) and tests
+    are single-process. On an ALREADY-initialized DB it is a pure read + guarded no-op migrations — safe."""
     existing = {
         r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
@@ -160,22 +276,43 @@ def init_db(con: sqlite3.Connection, schema_path: pathlib.Path = SCHEMA_PATH) ->
     )  # fresh DB already has every column (no-op) — keeps the path uniform
 
 
+def _add_column_if_missing(con: sqlite3.Connection, table: str, ddl: str) -> None:
+    """One guarded additive migration: ``ALTER TABLE ADD COLUMN`` iff the column is absent. The column
+    name is DERIVED from ``ddl``'s first token (the ADD COLUMN grammar guarantees it; this repo's DDL is
+    bare snake_case identifiers only) rather than passed separately — a second parameter could silently
+    disagree with the DDL, leaving the guard checking a name the ALTER never adds and the duplicate-column
+    swallow masking the re-run on every boot. The ``PRAGMA table_info`` guard is the normal no-op path;
+    the ``duplicate column`` catch is the check-then-act race closer — two processes migrating the same DB
+    can both pass the guard, and the loser's ALTER must be a no-op, not a startup crash (defense-in-depth
+    under the startup process_lock, and the guard for direct init_db callers — the CLI, tests — that
+    don't hold it)."""
+    column = ddl.split(None, 1)[0]
+    cols = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+    if column in cols:
+        return
+    try:
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise  # a real DDL failure — surface it, don't mask it as the benign race
+    con.commit()
+
+
 def _apply_migrations(con: sqlite3.Connection) -> None:
     """Additive, idempotent column migrations for a DB created under an EARLIER schema.sql (which is the
     fresh-DB contract). Each guards on ``PRAGMA table_info`` so it no-ops once the column exists (a fresh DB,
-    or a second startup). ``ADD COLUMN`` with a ``NOT NULL DEFAULT`` back-fills existing rows in place
-    (verified) — never a destructive rewrite. Commits its own change (mirrors init_db's commit).
+    or a second startup), and tolerates the concurrent-migrator race (``_add_column_if_missing``).
+    ``ADD COLUMN`` with a ``NOT NULL DEFAULT`` back-fills existing rows in place (verified) — never a
+    destructive rewrite. Commits its own change (mirrors init_db's commit).
 
     Migrations (append-only — never reorder or remove one):
       - ``escalations.status`` ('open'|'superseded', default 'open') — the Phase-7 §720 escalation
         lifecycle: a re-scan supersedes an escalation whose finding a /feedback override cleared."""
-    esc_cols = {r[1] for r in con.execute("PRAGMA table_info(escalations)")}
-    if "status" not in esc_cols:
-        con.execute(
-            "ALTER TABLE escalations ADD COLUMN status TEXT NOT NULL DEFAULT 'open' "
-            "CHECK (status IN ('open','superseded'))"
-        )
-        con.commit()
+    _add_column_if_missing(
+        con,
+        "escalations",
+        "status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','superseded'))",
+    )
 
 
 # --------------------------------------------------------------------------------------------------
@@ -847,17 +984,49 @@ def get_observations(
     return obs
 
 
+#: Worst-first rank on the escalation-severity axis — the SQL mirror of ``models.LEVEL_TO_SEVERITY``
+#: + ``SEVERITY_ORDER`` (rank explicitly, never string-compare: 'clinician_review' < 'urgent' happens
+#: to sort right lexically, but only by accident — the models.py order-map rule applies in SQL too).
+#: ONE home for BOTH escalation reads: every escalation surface leads highest-severity first, so the
+#: two queries cannot drift apart on what "worst first" means.
+_LEVEL_RANK_SQL = (
+    "CASE level WHEN 'urgent' THEN 0 WHEN 'clinician_review' THEN 1 ELSE 2 END"
+)
+
 #: The escalation SELECT column list, in ``_escalation_from_row``'s read order — ONE home for the two reads
 #: (:func:`get_escalations` + :func:`get_all_escalations`), so a new column (as ``status`` was) is a single
-#: edit here + the row-mapper, never a per-query one that leaves the other read short a key.
+#: edit here + the row-mapper, never a per-query one that leaves the other read short a key. The
+#: ``acknowledged`` overlay column is DERIVED here, not stored (the §720 'acknowledged' tier): TRUE iff an
+#: ACTIVE ``escalation_accept`` feedback row targets this escalation — by its own id (a chat escalation, no
+#: observation row) or by its ``observation_id`` (the finding dropdown's value for a data finding). Sharing
+#: it here is what guarantees the member drill-in and the global queue can never disagree on it. Names are
+#: ``escalations.``-qualified (no alias in either read, and ``feedback`` has its own ``member_id`` an
+#: unqualified reference would capture). Deriving from the live feedback row means `/reset` (deactivate)
+#: reverts the overlay symmetrically, and an escalation for CHANGED data (new ids) starts un-acknowledged.
+#: SOURCE-FILTERED like ``resolve_overrides`` (clinician/system only — "the member experience cannot
+#: lobby the safety logic", ui-ux §7): the docs promise the overlay derives from a CLINICIAN's accept, so
+#: a member-sourced ``escalation_accept`` is stored for audit but INERT on the clinician queue — it must
+#: not mark a triage item as already-reviewed or demote it within its severity tier.
 _ESCALATION_COLUMNS = (
     "escalation_id, member_id, kind, dedup_key, level, observation_id, "
-    "interaction_id, trigger_reason, created_at, status"
+    "interaction_id, trigger_reason, created_at, status, "
+    "EXISTS(SELECT 1 FROM feedback f WHERE f.kind = 'escalation_accept' AND f.active = 1 "
+    "AND f.source IN ('clinician', 'system') "
+    "AND f.member_id = escalations.member_id "
+    "AND (f.target = escalations.escalation_id OR f.target = escalations.observation_id)"
+    ") AS acknowledged"
 )
 
 
 def _escalation_from_row(r: sqlite3.Row) -> Escalation:
-    """Row → ``Escalation`` (the two-layers mapping; shared by the per-member and global reads)."""
+    """Row → ``Escalation`` (the two-layers mapping; shared by the per-member and global reads). The
+    effective ``status`` folds in the read-time ``acknowledged`` overlay: only a stored 'open' can render
+    as 'acknowledged' — a stored 'superseded' WINS over an accept row (the finding is gone from the data;
+    dropping off the active queue is the stronger, safe fact), and re-opens as plain 'open' only via the
+    scan's symmetric reconcile with the SAME ids (in which case the still-active accept row re-applies)."""
+    status = r["status"]
+    if status == "open" and r["acknowledged"]:
+        status = "acknowledged"
     return Escalation(
         escalation_id=r["escalation_id"],
         member_id=r["member_id"],
@@ -868,20 +1037,23 @@ def _escalation_from_row(r: sqlite3.Row) -> Escalation:
         interaction_id=r["interaction_id"],
         trigger_reason=r["trigger_reason"],
         created_at=r["created_at"],
-        status=r["status"],
+        status=status,
     )
 
 
 def get_escalations(con: sqlite3.Connection, member_id: str) -> list[Escalation]:
-    """One member's clinician-review record (read projection), oldest first — the per-member DRILL-IN
-    shown when already viewing that member, NOT the queue. Returns the full standing set across
-    data_versions AND all lifecycle statuses ('open' + 'superseded'), so it doubles as the audit view: a
-    re-scan RECONCILES an escalation's ``status`` (a clinician_review finding an override cleared flips to
-    'superseded'; an urgent one never does) but never DELETES the row. The cross-member triage queue —
-    active ('open') only — is :func:`get_all_escalations`."""
+    """One member's clinician-review record (read projection) — the per-member DRILL-IN shown when
+    already viewing that member, NOT the queue. HIGHEST severity first (``_LEVEL_RANK_SQL``, the same
+    worst-first lead as the global queue — no escalation surface may bury an urgent under older or
+    softer rows), then oldest-first WITHIN a severity tier: the drill-in doubles as the audit view, so
+    inside a tier it reads chronologically. Returns the full standing set across data_versions AND all
+    lifecycle statuses ('open' / 'acknowledged' / 'superseded'): a re-scan RECONCILES an escalation's
+    ``status`` (a clinician_review finding an override cleared flips to 'superseded'; an urgent one
+    never does) but never DELETES the row. The cross-member triage queue — active ('open') only — is
+    :func:`get_all_escalations`."""
     rows = con.execute(
         f"SELECT {_ESCALATION_COLUMNS} FROM escalations WHERE member_id = ? "
-        "ORDER BY created_at, escalation_id",
+        f"ORDER BY {_LEVEL_RANK_SQL}, created_at, escalation_id",
         (member_id,),
     ).fetchall()
     return [_escalation_from_row(r) for r in rows]
@@ -893,23 +1065,43 @@ def get_all_escalations(con: sqlite3.Connection) -> list[Escalation]:
     cross-member by design: a per-member read can only be opened by someone already on that patient, which
     is the one case escalation must not depend on.
 
-    Ordered FOR triage — most-severe first (``urgent`` before ``clinician_review``), then most-RECENT
-    first, then ``escalation_id`` as a stable tie-break. This DELIBERATELY differs from the per-member
-    :func:`get_escalations` (oldest-first chronological history): the worklist answers "what's outstanding
-    across the panel, worst first?", so severity then recency lead — do not "fix" it to match. A pure read,
-    filtered to ``status='open'`` — the ACTIVE worklist (§720 lifecycle): a 'superseded' escalation (its
+    Ordered FOR triage — most-severe first (``urgent`` before ``clinician_review``), then un-acknowledged
+    before 'acknowledged' WITHIN a tier (the worklist answers "what's outstanding?" and an acknowledged row
+    is literally already-triaged — but severity still DOMINATES: an acknowledged urgent never sinks below an
+    open clinician_review), then most-RECENT first, then ``escalation_id`` as a stable tie-break. Both
+    escalation reads lead highest-severity first (the shared ``_LEVEL_RANK_SQL``); within a tier this
+    worklist DELIBERATELY differs from the per-member :func:`get_escalations` (newest-first + the
+    acknowledged demotion here vs. that view's chronological audit read) — do not "fix" one to match
+    the other. A pure read, filtered to the STORED
+    ``status='open'`` — the ACTIVE worklist (§720 lifecycle): a 'superseded' escalation (its
     clinician_review finding cleared by a /feedback override, per the scan's reconcile) drops OFF this queue
-    but its row persists for audit (via :func:`get_escalations`). An 'urgent' escalation is never superseded,
-    so a panic can never be cleared off this queue by a suppress. Rows are never deleted.
+    but its row persists for audit (via :func:`get_escalations`); an 'acknowledged' one (the read-time
+    overlay a clinician's active ``escalation_accept`` derives — stored 'open') STAYS listed, visibly
+    triaged — acknowledging says "this was right", never "hide it". An 'urgent' escalation is never
+    superseded, so a panic can never be cleared off this queue by a suppress. Rows are never deleted.
 
     Scope note: "all members" is the whole tenant here because the prototype has no clinician identity; in
     a real deployment this is a ``clinician_id``/panel scope, or it leaks other panels' members (§15)."""
     rows = con.execute(
         f"SELECT {_ESCALATION_COLUMNS} FROM escalations WHERE status = 'open' "
-        "ORDER BY CASE level WHEN 'urgent' THEN 0 WHEN 'clinician_review' THEN 1 ELSE 2 END, "
-        "created_at DESC, escalation_id"
+        f"ORDER BY {_LEVEL_RANK_SQL}, acknowledged, created_at DESC, escalation_id"
     ).fetchall()
     return [_escalation_from_row(r) for r in rows]
+
+
+def escalation_acknowledged(
+    con: sqlite3.Connection, member_id: str, target: str
+) -> bool:
+    """Whether the queue NOW shows an escalation matching ``target`` as 'acknowledged' — the
+    ``POST /feedback`` response's honesty flag for an ``escalation_accept`` (the route only REPORTS it).
+    Lives here, beside ``_ESCALATION_COLUMNS``, so the target-matching rule (escalation_id OR its
+    observation_id) has ONE home next to the SQL overlay it mirrors — and it rides
+    :func:`get_escalations`, the canonical read, so the source filter and superseded-wins semantics can
+    never drift from what the queue actually renders."""
+    return any(
+        e.status == "acknowledged" and target in (e.escalation_id, e.observation_id)
+        for e in get_escalations(con, member_id)
+    )
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1165,6 +1357,33 @@ def get_active_preferences(con: sqlite3.Connection, member_id: str) -> list[str]
     return out
 
 
+def get_feedback(con: sqlite3.Connection, member_id: str) -> list[FeedbackRecord]:
+    """One member's full submitted-feedback trail, newest-first — the read-only AUDIT projection behind
+    ``GET /members/{id}/feedback``. Returns EVERY row, ``active=0`` included (a ``/reset`` deactivates
+    rather than deletes precisely so the trail survives — the flag shows the reviewer which rows still
+    feed the live consumers). A pure read the clinician panel renders raw; the live paths consume active
+    rows through their own seams (:func:`resolve_overrides` · :func:`get_active_preferences` ·
+    :func:`get_active_signals`), never through this one."""
+    rows = con.execute(
+        "SELECT feedback_id, kind, target, payload_json, source, active, created_at "
+        "FROM feedback WHERE member_id = ? "
+        "ORDER BY created_at DESC, feedback_id DESC",
+        (member_id,),
+    ).fetchall()
+    return [
+        FeedbackRecord(
+            feedback_id=r["feedback_id"],
+            kind=r["kind"],
+            target=r["target"],
+            payload=json.loads(r["payload_json"]) if r["payload_json"] else None,
+            source=r["source"],
+            active=bool(r["active"]),
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+
+
 def get_active_signals(con: sqlite3.Connection) -> list[Feedback]:
     """All active SIGNAL feedback across members (helpful/incorrect/escalation_accept/reject) — the
     input ``learn.py`` rule-assembles a candidate prompt from. Ordered by ``created_at`` so the assembly
@@ -1198,21 +1417,7 @@ def count_active_corrections(con: sqlite3.Connection) -> int:
     ).fetchone()[0]
 
 
-def members_with_active_overrides(con: sqlite3.Connection) -> list[str]:
-    """Member ids carrying an ACTIVE analysis-affecting override (``range_override`` / ``suppress_marker``)
-    — exactly the members whose scan artifacts (observations + the escalation queue) a ``POST /reset`` will
-    change when it deactivates those overrides. The reset route reads this BEFORE resetting, then re-scans
-    those members so the persisted queue actively reverts (a superseded escalation re-opens, a pruned
-    observation returns) instead of lagging until someone manually re-scans. ``preference`` and the signal
-    kinds are excluded: they never touch analysis, so deactivating them changes no scan artifact."""
-    rows = con.execute(
-        "SELECT DISTINCT member_id FROM feedback "
-        "WHERE active = 1 AND kind IN ('range_override', 'suppress_marker')"
-    ).fetchall()
-    return [r[0] for r in rows]
-
-
-def reset_learning(con: sqlite3.Connection) -> dict[str, int]:
+def reset_learning(con: sqlite3.Connection) -> dict:
     """The ``POST /reset`` revert (architecture §9/§688): deactivate ALL feedback (``active=0``) and
     revert every learned prompt above the v0 baseline (``promoted`` OR ``rejected``) to
     ``status='reverted'`` — so the composer falls back to the latest remaining promoted version (v0, or
@@ -1221,14 +1426,35 @@ def reset_learning(con: sqlite3.Connection) -> dict[str, int]:
     baseline must be re-gateable (not stuck cached as 'rejected') if its feedback is re-posted — the
     symmetric case to a reverted promotion. This is the learning-revert, NOT a data wipe: the feedback
     rows and prompt history are preserved (the trail stays), every member and the dataset untouched. The
-    factory reset is the separate :func:`clear_all_data` (``POST /admin/reseed``). Returns affected-row counts."""
+    factory reset is the separate :func:`clear_all_data` (``POST /admin/reseed``).
+
+    Returns affected-row counts PLUS ``affected_members`` — the members whose core overrides
+    (``range_override`` / ``suppress_marker``, the analysis-affecting kinds) this call deactivated, which
+    the reset route re-scans so their persisted artifacts actively revert. Captured by the deactivating
+    ``UPDATE ... RETURNING`` itself (one statement, maps to Postgres), NOT by a separate read beforehand:
+    a read-then-update pair left a gap where a core ``/feedback`` committing in the other worker between
+    the two statements was deactivated but never revert-scanned — its superseded escalation / pruned
+    observation then stayed stale with no active override and no self-heal trigger."""
     with con:
-        fb = con.execute("UPDATE feedback SET active = 0 WHERE active = 1").rowcount
+        rows = con.execute(
+            "UPDATE feedback SET active = 0 WHERE active = 1 RETURNING member_id, kind"
+        ).fetchall()
         pv = con.execute(
             "UPDATE prompt_versions SET status = 'reverted' "
             "WHERE version > 0 AND status IN ('promoted', 'rejected')"
         ).rowcount
-    return {"feedback_deactivated": fb, "prompts_reverted": pv}
+    affected = sorted(
+        {
+            r["member_id"]
+            for r in rows
+            if r["kind"] in ("range_override", "suppress_marker")
+        }
+    )
+    return {
+        "feedback_deactivated": len(rows),
+        "prompts_reverted": pv,
+        "affected_members": affected,
+    }
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1253,6 +1479,74 @@ def get_active_prompt(
     return (
         (row["version"], row["prompt_text"], row["eval_report_json"]) if row else None
     )
+
+
+def _eval_summary(report_json: str | None) -> dict | None:
+    """A compact digest of a stored ``eval_report_json`` for the Prompt-history projection — never the
+    full report (it embeds the raw, re-scorable case set; inlining it per version would swamp the
+    operator readout, and ``status`` already carries the gate's verdict). Parsed LENIENTLY with plain
+    ``json``/.get (no ``eval.report.Report`` import — the serving library never pulls in ``eval``), so a
+    report written under an older harness schema degrades to partial keys instead of a 500."""
+    if not report_json:
+        return None
+    try:
+        d = json.loads(report_json)
+    except ValueError:
+        return {"parse_error": True}
+    if not isinstance(d, dict):
+        # Valid JSON but not a report object ('null', a list, a scalar) — the same degrade as unparseable,
+        # never an AttributeError that 500s the whole projection (the leniency promise above).
+        return {"parse_error": True}
+    cases = d.get("cases") or []
+    if not isinstance(cases, list):
+        cases = []
+    return {
+        "dataset": d.get("dataset"),
+        "model_version": d.get("model_version"),
+        "n_runs": d.get("n_runs"),
+        "generated_at": d.get("generated_at"),
+        "cases": len(cases),
+        # Count scorer results that FIRED a never_event. Derived from the mode1/mode2 scorer lists because
+        # that is what Report.to_json() actually serializes — CaseReport.never_events is a plain @property
+        # the dump never writes, so reading a top-level "never_events" key would be structurally 0 on
+        # every real stored report (a safety-rejected candidate would digest as zero blocking failures).
+        "never_events": sum(
+            1
+            for c in cases
+            if isinstance(c, dict)
+            for s in [*(c.get("mode2") or []), *(c.get("mode1") or [])]
+            if isinstance(s, dict) and s.get("never_event")
+        ),
+    }
+
+
+def get_prompt_versions(con: sqlite3.Connection) -> list[PromptVersionRecord]:
+    """The FULL composer-prompt history, newest version first — the read projection behind the
+    operator's Prompt-history readout (``GET /prompts``). Every row is returned regardless of
+    ``status`` (this is the audit trail of the learning loop: v0 = the seeded baseline; each later row
+    a ``/learn`` candidate with its gate verdict — ``promoted``/``rejected`` — or ``reverted`` where a
+    ``/reset`` rolled a promotion back). ``active`` flags the one row the composer resolves now — the
+    latest ``promoted``, exactly :func:`get_active_prompt`'s pick, derived here from the same ordering
+    so the two reads cannot disagree. A pure read; the consumption path stays
+    :func:`get_active_prompt`, so this projection can never become a second serving seam."""
+    rows = con.execute(
+        "SELECT version, prompt_text, status, eval_report_json, created_at "
+        "FROM prompt_versions ORDER BY version DESC"
+    ).fetchall()
+    active_version = next(
+        (r["version"] for r in rows if r["status"] == "promoted"), None
+    )
+    return [
+        PromptVersionRecord(
+            version=r["version"],
+            status=r["status"],
+            active=r["version"] == active_version,
+            created_at=r["created_at"],
+            prompt_text=r["prompt_text"],
+            eval_summary=_eval_summary(r["eval_report_json"]),
+        )
+        for r in rows
+    ]
 
 
 def find_prompt_by_text(

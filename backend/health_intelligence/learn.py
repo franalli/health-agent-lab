@@ -36,16 +36,8 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-import tempfile
 import threading
 from datetime import UTC, datetime
-
-try:
-    import fcntl  # POSIX advisory file locks — the cross-process half of single-flight (see _LOCK)
-except (
-    ImportError
-):  # non-POSIX (e.g. Windows): the cross-process guard degrades to in-process only
-    fcntl = None
 
 from pydantic import BaseModel
 
@@ -111,50 +103,40 @@ _REQUIRED_CLAUSES: tuple[str, ...] = (
 # gate, so neither can go stale.
 
 #: Single-flight: one /learn run at a time, in TWO layers. A bare threading.Lock serializes THREADS
-#: within one worker but silently depends on the single-worker deploy (§15) — with --workers >1 two
-#: processes would each hold their own lock and both run the ~6-minute, credit-burning gate (and race
-#: ``next_prompt_version``). The OS advisory file lock (``fcntl.flock``, added below) closes that gap:
-#: single-flight holds across worker PROCESSES on the same host regardless of worker count. flock
-#: auto-releases when its holder dies (no stale-lock TTL to manage, unlike a DB lease); its scope is one
-#: host, which matches this deployment — a multi-INSTANCE deploy has a per-instance ephemeral DB, so it
-#: is not a shared-state topology to begin with. A held lock (either layer) -> 409 LearnBusy.
+#: within one worker; the cross-process file lock (``db.process_lock``, LOAD-BEARING now that the deploy
+#: runs ``--workers 2``) extends single-flight across worker PROCESSES on the same host — without it, two
+#: workers would each run the ~6-minute, credit-burning gate concurrently (and race
+#: ``next_prompt_version``). Its scope is one host, which matches the single-instance deploy (the Render
+#: persistent disk pins the service to one instance). A held lock (either layer) -> 409 LearnBusy.
+#:
+#: The same file lock (``LEARN_LOCK_NAME``) is the LEARNING-STATE lock: ``POST /reset`` and
+#: ``POST /admin/reseed`` acquire it non-blocking in api.py before mutating ``feedback`` /
+#: ``prompt_versions``, so a factory reset can't truncate the tables a mid-flight /learn is gating
+#: against (which would corrupt its version numbering and break the "reseed -> one row" invariant) —
+#: they 409 instead, and symmetrically /learn 409s while a reset/reseed briefly holds the lock.
 _LOCK = threading.Lock()
 
-
-def _learn_lock_path(con) -> str:
-    """The advisory-lock file path for THIS connection's database — sited next to the SQLite file so
-    co-located workers (which all open that same file) contend on the same lock. Derived from the LIVE
-    connection (``PRAGMA database_list``), not an env var, so it tracks whatever DB this process actually
-    opened. An unfiled/in-memory DB (tests) has no path -> a stable temp-dir fallback."""
-    row = con.execute("PRAGMA database_list").fetchone()
-    db_file = (row["file"] if row is not None else "") or ""
-    if not db_file:
-        return os.path.join(tempfile.gettempdir(), "health_intelligence_learn.lock")
-    return db_file + ".learn.lock"
+#: The shared exclusion-domain name for everything that mutates learning state (/learn, /reset,
+#: /admin/reseed). One name -> one ``<db-file>.learn.lock`` sibling file -> mutual exclusion.
+LEARN_LOCK_NAME = "learn"
 
 
 @contextlib.contextmanager
 def _single_flight(con):
-    """Hold BOTH the in-process lock and (on POSIX) the cross-process file lock for the duration of a
-    /learn run; raise ``LearnBusy`` (-> 409) if either is already held. Releasing is symmetric and
-    crash-safe: closing the fd drops the flock, and the ``finally`` frees the thread lock. See ``_LOCK``."""
+    """Hold BOTH the in-process lock and (on POSIX) the cross-process learning-state lock for the
+    duration of a /learn run; raise ``LearnBusy`` (-> 409) if either is already held. Releasing is
+    symmetric and crash-safe: ``db.process_lock`` drops the flock with its fd, and the ``finally``
+    frees the thread lock. See ``_LOCK``."""
     if not _LOCK.acquire(blocking=False):
         raise LearnBusy("a /learn run is already in progress")
     try:
-        if fcntl is None:  # non-POSIX: in-process guard only (documented degrade)
-            yield
-            return
-        lock_fd = os.open(_learn_lock_path(con), os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as e:
+        with db.process_lock(con, LEARN_LOCK_NAME, blocking=False) as acquired:
+            if not acquired:
                 raise LearnBusy(
-                    "a /learn run is already in progress (held by another worker)"
-                ) from e
+                    "a /learn run is already in progress (held by another worker), "
+                    "or a reset/reseed is mutating the learning state"
+                )
             yield
-        finally:
-            os.close(lock_fd)  # closing the fd releases any flock held on it
     finally:
         _LOCK.release()
 
@@ -212,6 +194,12 @@ _MAX_CORRECTION_CHARS = 2000
 #: concise worked example), while the question is only replayed CONTEXT (as long as an ask message).
 _MAX_QUESTION_CHARS = 8000
 
+#: Bounds an ``escalation_reject`` signal's ``reason`` — the free-text descriptor saying WHY the escalation
+#: is a false alarm. It is an AUDIT/provenance detail, never prompt text (the toggled tone clause is
+#: pre-written, so the reason can't be spliced into the composer prompt), which is why the deterministic
+#: bounds here are its WHOLE screen: no Haiku judge, unlike a corrected answer, because nothing imitates it.
+_MAX_REASON_CHARS = 2000
+
 _JUDGE_TOOL = "judge_correction"
 _JUDGE_TOOL_DESC = "Judge whether a clinician's corrected answer is a fit few-shot exemplar for the assistant to imitate."
 _JUDGE_SYSTEM = """You review a clinician's CORRECTED ANSWER for a health-information assistant's learning loop. The assistant answers a member's questions about the member's OWN lab results. You are shown the member's question and the reply the clinician thinks the assistant should have given. That corrected answer will be stored as a FEW-SHOT EXAMPLE the assistant imitates, so it must model good behavior.
@@ -253,23 +241,60 @@ def _exemplar_halves(fb: Feedback) -> tuple[str, str] | None:
     return str(q), str(a)
 
 
-def _screen_length(text: str) -> str | None:
-    """The DETERMINISTIC bounds on a corrected answer (empty / oversized) — no model, PURE, so it runs both
-    at submission (a cheap pre-filter before the judge) and at assembly (``assemble_candidate`` must stay a
-    pure function of the signal set). Returns a rejection reason or ``None``. Coherence and the safety-rule
-    checks are the judge's job, not a length heuristic's."""
-    stripped = text.strip()
-    if not stripped:
-        return "corrected answer is empty — provide the answer the assistant should have given"
-    # Oversize check on the RAW length, not the stripped one: the raw string is what reaches the judge
-    # prompt (validate_feedback) and the DB row (insert_feedback), so measuring `stripped` let leading/
-    # trailing whitespace padding smuggle a ~1MB payload past a 2000-char cap. Empty check stays on stripped.
-    if len(text) > _MAX_CORRECTION_CHARS:
+def _screen_bounds(
+    text: str, *, max_chars: int, subject: str, empty_advice: str, oversize_advice: str
+) -> str | None:
+    """The shared deterministic text bounds (empty / oversized) — ONE home for the two ``/feedback``
+    text screens (corrected answer · reject reason), so the strip-vs-raw discipline lives once. Empty is
+    checked on the STRIPPED text; oversize on the RAW length — the raw string is what reaches the judge
+    prompt and the DB row, so measuring ``stripped`` would let leading/trailing whitespace padding
+    smuggle a ~1MB payload past the cap. Returns a rejection reason or ``None``."""
+    if not text.strip():
+        return f"{subject} is empty — {empty_advice}"
+    if len(text) > max_chars:
         return (
-            f"corrected answer is too long ({len(text)} > {_MAX_CORRECTION_CHARS} characters) — "
-            "a worked example is a concise replacement answer, not a document"
+            f"{subject} is too long ({len(text)} > {max_chars} characters) — "
+            f"{oversize_advice}"
         )
     return None
+
+
+def _screen_length(text: str) -> str | None:
+    """The DETERMINISTIC bounds on a corrected answer (``_screen_bounds``) — no model, PURE, so it runs
+    both at submission (a cheap pre-filter before the judge) and at assembly (``assemble_candidate`` must
+    stay a pure function of the signal set). Returns a rejection reason or ``None``. Coherence and the
+    safety-rule checks are the judge's job, not a length heuristic's."""
+    return _screen_bounds(
+        text,
+        max_chars=_MAX_CORRECTION_CHARS,
+        subject="corrected answer",
+        empty_advice="provide the answer the assistant should have given",
+        oversize_advice="a worked example is a concise replacement answer, not a document",
+    )
+
+
+def _screen_reject_reason(fb: Feedback) -> str | None:
+    """The deterministic bounds on an ``escalation_reject`` reason descriptor (``_screen_bounds``) —
+    PURE, no model. A reason that is PRESENT must be usable: a non-string, blank ("filed a false alarm,
+    said nothing"), or oversized reason is rejected; a payload-less reject stays storable, since
+    ``/learn``'s toggle counts recurrence by KIND and the form is what requires the descriptor (the API
+    stays permissive for programmatic use). The string requirement is deliberate — the old ``str()``
+    coercion bounds-checked the REPR of any JSON type while the stored payload kept the non-string, so
+    the audit trail could hold a shape no screen ever validated. No judge: the reason never enters the
+    composer prompt (the tone clause is pre-written), so there is nothing semantic to screen — it is
+    audit text for the clinician reviewing the rejection trail."""
+    if not fb.payload or "reason" not in fb.payload:
+        return None
+    reason = fb.payload["reason"]
+    if not isinstance(reason, str):
+        return "the rejection reason must be text — say why this escalation is a false alarm"
+    return _screen_bounds(
+        reason,
+        max_chars=_MAX_REASON_CHARS,
+        subject="the rejection reason",
+        empty_advice="say why this escalation is a false alarm",
+        oversize_advice="a short note on why the escalation is a false alarm, not a document",
+    )
 
 
 def judge_corrected_answer(
@@ -313,12 +338,16 @@ def validate_feedback(
 ) -> str | None:
     """Return a rejection reason if ``fb`` is unfit to STORE, else ``None`` — the ``/feedback`` input bar.
     The route maps a returned reason to a **422**, and a :class:`LearnUnavailable` (the judge could not run)
-    to a **503** (fail-closed: retry, never store unjudged). Screens exactly the shape that becomes imitated
-    prose: an ``incorrect`` signal whose payload carries BOTH a ``question`` and a ``corrected_answer`` — the
-    same predicate ``assemble_candidate`` folds an exemplar on. Every other kind/shape — corrections,
-    advisory signals, an ``incorrect`` missing either half (the documented inert no-op) — returns ``None``
-    and is stored as before, so the bar never 422s a row that could not become an exemplar. For a real
-    exemplar: the deterministic bounds first (no model call on empty/oversized), then the Haiku judge."""
+    to a **503** (fail-closed: retry, never store unjudged). Two screens, matched to what each field
+    BECOMES: (1) the shape that becomes imitated prose — an ``incorrect`` signal whose payload carries BOTH
+    a ``question`` and a ``corrected_answer`` (the same predicate ``assemble_candidate`` folds an exemplar
+    on) — gets the deterministic bounds then the Haiku judge; (2) an ``escalation_reject``'s ``reason``
+    descriptor — audit text, never prompt text — gets deterministic bounds ONLY
+    (:func:`_screen_reject_reason`). Every other kind/shape — corrections, advisory signals, an
+    ``incorrect`` missing either half (the documented inert no-op), a payload-less reject — returns ``None``
+    and is stored as before, so the bar never 422s a row it has no screen for."""
+    if fb.kind == "escalation_reject":
+        return _screen_reject_reason(fb)
     # Match assemble_candidate's exemplar-eligibility EXACTLY via the shared predicate: a row missing EITHER
     # half can't be imitated (it folds nothing), so it is an inert no-op, not a 422. Only screen what will
     # actually become an exemplar.
@@ -396,7 +425,17 @@ def classify_feedback(fb: Feedback) -> dict[str, str]:
             "channel": "learn",
             "effect": f"Feeds /learn: once this recurs ({_RECURRING_THRESHOLD}×), Run learn toggles a softer-tone clause into the composer prompt.",
         }
-    # helpful, escalation_accept
+    if kind == "escalation_accept":
+        # Advisory for LEARNING (feeds no prompt channel), but not inert: the escalation reads derive the
+        # queue's 'acknowledged' overlay from the active accept row — a deterministic side effect the
+        # route reports separately via `acknowledged`, exactly as a core correction's auto-scan is
+        # reported via `rescanned` (channel describes the learning path, never the side effects).
+        return {
+            "channel": "advisory",
+            "effect": "Acknowledges the targeted escalation on the clinician queue — kept listed, marked "
+            "triaged; Reset learning reverts it. It changes no prompt and does not feed /learn.",
+        }
+    # helpful
     return {
         "channel": "advisory",
         "effect": "Advisory — recorded for audit; it changes no prompt and does not feed /learn.",
@@ -503,9 +542,13 @@ def _gate(candidate, baseline) -> tuple[bool, list[str]]:
 
 
 def _eval_prompt(seed_prompt: str | None, provider, *, label: str = "candidate"):
-    """Run the full labeled set through the in-process harness with ``seed_prompt`` as the active prompt
-    (``None`` -> the v0/BASE baseline). Returns the harness ``Report``. The eval runs on a throwaway
-    template seeded from the active dataset — it never touches the live DB.
+    """Run the /learn gate's CRITICAL COMPOSER SUBSET (``eval.adapter.load_gate_cases`` —
+    ``LEARN_GATE_CASE_IDS``, ~10 cases; the full set stays ``make eval``'s surface) through the in-process
+    harness with ``seed_prompt`` as the active prompt (``None`` -> the v0/BASE baseline). Returns the
+    harness ``Report``. The subset is the surface a composer prompt can actually move — gate-routing/
+    crisis/refusal-template cases can't regress from a prompt change, so running them here only added
+    cost and temp-0 noise (false-reject risk). The eval runs on a throwaway template seeded from the
+    active dataset — it never touches the live DB.
 
     The report is streamed to LangSmith via ``llm_eval.trace_report`` — the SAME sink the ``make eval`` CLI
     uses, so a ``/learn`` run is observable in the same project (this is why the earlier "live path never
@@ -514,12 +557,14 @@ def _eval_prompt(seed_prompt: str | None, provider, *, label: str = "candidate")
     from a CLI ``eval:*`` run. A no-op without ``LANGSMITH_API_KEY`` and best-effort (a trace failure is
     swallowed, never failing the gate); the traced cases are the SYNTHETIC eval set (no member PHI)."""
     from eval import llm_eval  # function-local: the eval bridge (see module docstring)
-    from eval.adapter import load_cases
+    from eval.adapter import load_gate_cases
     from eval.harness import run_eval
     from eval.inprocess import InProcessClient
     from eval.types import EvalConfig
 
-    cases = load_cases(None)  # None -> the active DATASET (training_data by default)
+    cases = load_gate_cases(
+        None
+    )  # None -> the active DATASET; falls back to the full set for a foreign dataset
     cfg = EvalConfig(n_runs=LEARN_N_RUNS, use_judge=False, dataset=None)
     with InProcessClient.build(
         None, seed_prompt=seed_prompt, provider=provider
@@ -574,25 +619,39 @@ def _baseline_report(con, provider, active):
             )
     version, text, report_json = active
     if report_json:
+        from eval.adapter import (
+            load_gate_cases,  # function-local: the eval bridge (see module docstring)
+        )
+
         stored = _report_from_json(report_json)
-        # Reuse the stored baseline ONLY if it was measured under the SAME composer config it will be
-        # compared against. write_baseline_prompt drops v0's report only when the PROMPT TEXT changes — so a
-        # durable-disk redeploy that bumps COMPOSE_MODEL or CONFIG_VERSION (thresholds) with the base text
-        # unchanged would leave a report measured under the OLD model/config, and the gate would then rank a
-        # candidate freshly eval'd under the NEW config against it — an invalid comparison that could promote
-        # a real regression or false-reject a gain. On a mismatch, fall through and recompute + re-cache.
+        # Reuse the stored baseline ONLY if it was measured under the SAME composer config AND over the
+        # SAME case set it will be compared against. write_baseline_prompt drops v0's report only when the
+        # PROMPT TEXT changes — so a durable-disk redeploy that bumps COMPOSE_MODEL or CONFIG_VERSION
+        # (thresholds) with the base text unchanged would leave a report measured under the OLD
+        # model/config, and the gate would then rank a candidate freshly eval'd under the NEW config
+        # against it — an invalid comparison that could promote a real regression or false-reject a gain.
+        # The CASE-SET check is the same discipline on the other axis: a baseline measured over the full
+        # set (pre-subset reports) — or over an older LEARN_GATE_CASE_IDS curation — would compare
+        # 30-case dimension rates against ~10-case ones. On any mismatch, fall through and recompute +
+        # re-cache over the current subset.
+        gate_ids = {c.id for c in load_gate_cases(None)}
+        stored_ids = {c.case_id for c in stored.cases}
         if (
             stored.model_version == COMPOSE_MODEL
             and stored.config_version == CONFIG_VERSION
+            and stored_ids == gate_ids
         ):
             return stored
         logger.warning(
-            "/learn: stored baseline report was measured under model=%r config=%r but the active composer "
-            "config is model=%r config=%r — recomputing the baseline so the gate compares like-for-like",
+            "/learn: stored baseline report was measured under model=%r config=%r over %d case(s), but "
+            "the active composer config is model=%r config=%r over %d gate case(s) — recomputing the "
+            "baseline so the gate compares like-for-like",
             stored.model_version,
             stored.config_version,
+            len(stored_ids),
             COMPOSE_MODEL,
             CONFIG_VERSION,
+            len(gate_ids),
         )
     # No usable report (v0 seeded report-less, a report-less promoted vN, or a stale-config report above) —
     # eval the prompt ACTUALLY IN FORCE (v0 == BASE via seed_prompt=None, or a learned vN's own text) and

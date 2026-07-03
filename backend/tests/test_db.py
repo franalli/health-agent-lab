@@ -79,8 +79,9 @@ def test_emit_escalation_is_idempotent():
 def test_get_all_escalations_ranks_severity_then_recency_across_members():
     """The global triage worklist: most-severe first (urgent before clinician_review), then
     most-recent first, spanning members. created_at is passed explicitly so the ordering is asserted
-    deterministically (not at the mercy of a wall clock). Contrast the per-member get_escalations,
-    which is oldest-first — this difference is intentional (a worklist, not a history)."""
+    deterministically (not at the mercy of a wall clock). The per-member get_escalations leads
+    worst-first too but is oldest-first WITHIN a tier — that difference is intentional (a worklist
+    vs. a history)."""
     con = _con()
     for m in ("A", "B", "C"):
         con.execute("INSERT INTO members (member_id, sex) VALUES (?, 'male')", (m,))
@@ -129,6 +130,49 @@ def test_get_all_escalations_ranks_severity_then_recency_across_members():
     assert [e.created_at for e in cr] == sorted(
         (e.created_at for e in cr), reverse=True
     )
+    # each item carries its severity on the shared observation axis (derived from level at read)
+    assert [e.severity for e in queue] == [
+        "urgent",
+        "attention",
+        "attention",
+        "attention",
+    ]
+
+
+def test_get_escalations_drill_in_leads_worst_first_with_derived_severity():
+    """The per-member drill-in ranks highest-severity first like the queue (no escalation surface may
+    bury an urgent under older/softer rows), oldest-first WITHIN a tier (it doubles as the audit
+    history). Each item carries the derived ``severity`` (models.LEVEL_TO_SEVERITY — computed from
+    ``level`` at read, never stored): urgent → 'urgent', clinician_review → 'attention'."""
+    con = _con()
+    con.execute("INSERT INTO members (member_id, sex) VALUES ('A', 'male')")
+    con.commit()
+    # (level, created_at, dedup_key) — interleaved so insert order matches neither tier nor time.
+    rows = [
+        ("clinician_review", "2024-01-01T00:00:00+00:00", "data:A:m1:v1"),
+        ("urgent", "2024-02-01T00:00:00+00:00", "data:A:m2:v1"),
+        ("clinician_review", "2024-03-01T00:00:00+00:00", "data:A:m3:v1"),
+        ("urgent", "2024-04-01T00:00:00+00:00", "data:A:m4:v1"),
+    ]
+    for level, created_at, key in rows:
+        db.emit_escalation(
+            con,
+            member_id="A",
+            kind="data_finding",
+            dedup_key=key,
+            level=level,
+            trigger_reason="t",
+            created_at=created_at,
+        )
+    drill = db.get_escalations(con, "A")
+    # urgent tier first (oldest→newest inside it), then clinician_review (oldest→newest).
+    assert [e.dedup_key for e in drill] == [
+        "data:A:m2:v1",
+        "data:A:m4:v1",
+        "data:A:m1:v1",
+        "data:A:m3:v1",
+    ]
+    assert [e.severity for e in drill] == ["urgent", "urgent", "attention", "attention"]
 
 
 # ---- row <-> model round-trip --------------------------------------------------------------------
@@ -574,3 +618,248 @@ def test_load_for_analysis_matches_in_memory_fixture():
     assert (
         db_analysis.overall_floor == "none"
     )  # eGFR + default vitals all in-range/stable
+
+
+# --------------------------------------------------------------------------------------------------
+# process_lock — the cross-process mutual-exclusion seam the --workers 2 deploy rests on (startup init
+# + the learning-state lock). flock locks the open file DESCRIPTION, so a second fd in THIS process
+# models a second worker faithfully; the subprocess test exercises two genuinely separate processes.
+# --------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(db.fcntl is None, reason="flock is POSIX-only")
+def test_process_lock_contends_and_releases(tmp_path):
+    """Non-blocking contention yields False (never blocks, never raises); exit releases the lock."""
+    con = db.connect(str(tmp_path / "health.db"))
+    with db.process_lock(con, "startup", blocking=False) as first:
+        assert first is True
+        with db.process_lock(con, "startup", blocking=False) as second:
+            assert second is False  # a second holder (fd == another worker) is refused
+        # names partition the exclusion domains: a different name is a different lock file
+        with db.process_lock(con, "learn", blocking=False) as other_domain:
+            assert other_domain is True
+    with db.process_lock(con, "startup", blocking=False) as reacquired:
+        assert reacquired is True  # released with the fd — no leak, no stale lock
+    con.close()
+
+
+@pytest.mark.skipif(db.fcntl is None, reason="flock is POSIX-only")
+def test_process_lock_raises_on_a_real_flock_failure(tmp_path, monkeypatch):
+    """A non-contention OSError from flock (ENOLCK/EIO — the locking FACILITY is broken, not busy) must
+    PROPAGATE, never yield False: a soft False fails OPEN for the blocking startup caller (init would run
+    unserialized — the exact race the lock closes) and misreports an infra fault as an endless 409 for
+    the non-blocking callers. Contention (BlockingIOError) stays the one soft outcome."""
+    import errno
+
+    con = db.connect(str(tmp_path / "health.db"))
+
+    def broken_flock(fd, op):
+        raise OSError(errno.ENOLCK, "no locks available")
+
+    monkeypatch.setattr(db.fcntl, "flock", broken_flock)
+    with pytest.raises(OSError):
+        with db.process_lock(con, "startup", blocking=True):
+            pass  # pragma: no cover — the acquire raises before the body runs
+    with pytest.raises(OSError):
+        with db.process_lock(con, "learn", blocking=False):
+            pass  # pragma: no cover — the acquire raises before the body runs
+    con.close()
+
+
+@pytest.mark.skipif(db.fcntl is None, reason="flock is POSIX-only")
+def test_process_lock_blocking_acquire_is_bounded(tmp_path, monkeypatch):
+    """blocking=True polls with a deadline: a WEDGED holder (a dead one auto-releases its flock) turns
+    into a loud TimeoutError, instead of an untimed flock wait that is SIGTERM-immune (the handler runs
+    but PEP 475 retries the syscall) and would stall the losing worker until the platform's SIGKILL."""
+    import os as _os
+
+    monkeypatch.setattr(db, "_BLOCKING_ACQUIRE_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(db, "_BLOCKING_ACQUIRE_POLL_S", 0.02)
+    con = db.connect(str(tmp_path / "health.db"))
+    lock_path = db._process_lock_path(con, "startup")
+    fd = _os.open(lock_path, _os.O_CREAT | _os.O_RDWR, 0o600)
+    db.fcntl.flock(fd, db.fcntl.LOCK_EX | db.fcntl.LOCK_NB)  # the wedged holder
+    try:
+        with pytest.raises(TimeoutError):
+            with db.process_lock(con, "startup", blocking=True):
+                pass  # pragma: no cover — the acquire times out before the body runs
+    finally:
+        db.fcntl.flock(fd, db.fcntl.LOCK_UN)
+        _os.close(fd)
+    con.close()
+
+
+@pytest.mark.skipif(db.fcntl is None, reason="flock is POSIX-only")
+def test_concurrent_first_init_serializes_under_the_startup_lock(tmp_path):
+    """The --workers 2 boot race, for real: two PROCESSES first-initialize the same fresh DB file at
+    once. init_db's presence-check + executescript is check-then-act (bare CREATE TABLE), so without
+    the startup lock the loser crashes on "table already exists"; under the lock both must exit 0 and
+    leave one intact schema."""
+    import subprocess
+    import sys
+
+    db_path = str(tmp_path / "health.db")
+    code = (
+        "import sys\n"
+        "from health_intelligence import db\n"
+        "con = db.connect(sys.argv[1])\n"
+        "with db.process_lock(con, 'startup', blocking=True):\n"
+        "    db.init_db(con)\n"
+        "con.close()\n"
+    )
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", code, db_path],
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    for p in procs:
+        _, err = p.communicate(timeout=60)
+        assert p.returncode == 0, f"concurrent first-init crashed: {err}"
+    con = db.connect(db_path)
+    tables = {
+        r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert db._EXPECTED_TABLES <= tables  # one intact schema, no partial wreckage
+    con.close()
+
+
+def test_add_column_if_missing_tolerates_the_check_then_act_race(tmp_path):
+    """The migration race closer: a racer whose PRAGMA guard read STALE state (column looks absent,
+    then the ALTER finds it already added by the winner) must no-op, not crash the losing worker's
+    startup. A non-duplicate DDL failure must still surface."""
+    con = db.connect(str(tmp_path / "health.db"))
+    con.execute("CREATE TABLE t (a TEXT)")
+    db._add_column_if_missing(con, "t", "b TEXT NOT NULL DEFAULT ''")
+    assert {r[1] for r in con.execute("PRAGMA table_info(t)")} == {"a", "b"}
+
+    class StaleGuardCon:
+        """Delegates to the real connection but reports the column ABSENT — the loser's stale read."""
+
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *args):
+            if sql.startswith("PRAGMA table_info"):
+                return iter(
+                    []
+                )  # stale: no columns visible -> guard passes -> ALTER runs
+            return self._real.execute(sql, *args)
+
+        def commit(self):
+            self._real.commit()
+
+    db._add_column_if_missing(
+        StaleGuardCon(con), "t", "b TEXT NOT NULL DEFAULT ''"
+    )  # no crash
+    with pytest.raises(
+        db.sqlite3.OperationalError
+    ):  # a REAL DDL failure is never masked
+        db._add_column_if_missing(
+            StaleGuardCon(con), "t", "c BOGUSTYPE NOT NULL DEFAULT"
+        )
+    con.close()
+
+
+# ---- prompt-history projection (GET /prompts) -----------------------------------------------------
+
+
+def test_get_prompt_versions_history_newest_first_with_active_flag():
+    """The Prompt-history read projection (db.get_prompt_versions): every prompt_versions row,
+    newest version first, regardless of status — the audit trail of the learn loop (prompts are
+    LEARNT from feedback and VALIDATED by /learn's eval gate; `status` records each verdict).
+    `active` marks exactly get_active_prompt's pick — the LATEST 'promoted' row — so a later
+    rejected candidate never steals it. `eval_summary` is the compact digest, never the stored
+    report: None for the report-less seeded v0; counts (cases, never_events) for a gated row."""
+    con = _con()
+    db.write_baseline_prompt(con, prompt_text="BASE")  # v0: promoted, report-less
+    # The stored report is a REAL harness serialization (Report.to_json), not hand-crafted JSON: the
+    # digest's never_events count must read what the serializer actually writes (the mode1/mode2 scorer
+    # results — CaseReport.never_events is a plain @property the dump never emits), and a hand-written
+    # fixture once masked exactly that mismatch (the digest read a key no real report carries -> always 0).
+    from eval.report import CaseReport, Report
+    from eval.types import ScorerResult
+
+    report = Report(
+        dataset="training_data",
+        model_version="m",
+        config_version="c",
+        n_runs=1,
+        generated_at="2026-01-01T00:00:00+00:00",
+        cases=[
+            CaseReport(
+                case_id="E07",
+                category="c",
+                tags=[],
+                mode1_covered=False,
+                mode2=[ScorerResult(dimension="grounding", passed=True)],
+            ),
+            CaseReport(
+                case_id="A10",
+                category="c",
+                tags=[],
+                mode1_covered=False,
+                mode2=[
+                    ScorerResult(
+                        dimension="grounding",
+                        passed=False,
+                        never_event="fabricated_value",
+                    )
+                ],
+            ),
+        ],
+    ).to_json()
+    db.insert_prompt_version(
+        con,
+        version=1,
+        prompt_text="BASE + exemplar",
+        status="promoted",
+        eval_report_json=report,
+        created_at="2026-01-02T00:00:00+00:00",
+    )
+    db.insert_prompt_version(
+        con,
+        version=2,
+        prompt_text="BASE + exemplar 2",
+        status="rejected",
+        eval_report_json=report,
+        created_at="2026-01-03T00:00:00+00:00",
+    )
+
+    hist = db.get_prompt_versions(con)
+    assert [h.version for h in hist] == [2, 1, 0]  # newest first
+    assert [h.status for h in hist] == ["rejected", "promoted", "promoted"]
+    # active == the latest PROMOTED (v1): the rejected v2 never steals it, and the flag agrees with
+    # the composer's own resolution seam by construction.
+    assert [h.active for h in hist] == [False, True, False]
+    assert db.get_active_prompt(con)[0] == 1
+    # full prompt_text IS returned (the inspectable artifact) ...
+    assert hist[1].prompt_text == "BASE + exemplar"
+    # ... but the report is digested, never inlined raw
+    assert (
+        hist[2].eval_summary is None
+    )  # v0 seeds report-less (/learn attaches it lazily)
+    assert (
+        hist[0].eval_summary
+        == {
+            "dataset": "training_data",
+            "model_version": "m",
+            "n_runs": 1,
+            "generated_at": "2026-01-01T00:00:00+00:00",
+            "cases": 2,
+            "never_events": 1,  # counted from the serialized scorer results a REAL report carries
+        }
+    )
+
+
+def test_eval_summary_degrades_on_non_object_json():
+    """LENIENT means lenient on every shape: valid JSON that is not a report OBJECT ('null', a list, a
+    scalar) must degrade to the parse_error sentinel exactly like unparseable text — an AttributeError
+    here would 500 the whole GET /prompts projection over one bad row (a hand-edited durable-disk DB or
+    a foreign writer; every in-app writer stores Report.to_json())."""
+    for bad in ("null", "[]", '"x"', "3", "not json {"):
+        assert db._eval_summary(bad) == {"parse_error": True}
+    assert db._eval_summary(None) is None
+    assert db._eval_summary("") is None

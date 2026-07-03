@@ -19,8 +19,8 @@ seed:  ## ingest the active dataset (DATASET env; default training_data) — ini
 run: seed  ## init + seed + serve the API + UI on :8000 (--reload: backend edits restart automatically)
 	$(UVICORN) --port 8000 --reload
 
-serve:  ## production-mode serve (no reload; --workers 1; binds $PORT or 8000) — mirrors the Render start command
-	$(UVICORN) --port $${PORT:-8000} --workers 1
+serve:  ## production-mode serve (no reload; --workers 2; binds $PORT or 8000) — mirrors the Render start command
+	$(UVICORN) --port $${PORT:-8000} --workers 2
 
 test:  ## unit tests
 	uv run pytest

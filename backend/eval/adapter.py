@@ -21,11 +21,15 @@ The few tagged additions (gate crisis/acute cases) are appended from ``added_cas
 
 from __future__ import annotations
 
+import logging
+
 from eval.added_cases import ADDED_CASES
 from eval.types import Case, CaseExpectation, Mode1Coverage, Route
 from health_intelligence.models import AnswerDisposition, FloorLevel
 from preprocessing.datasets import dataset_dir
 from preprocessing.ingest import read_records
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------------------------------
 # Escalation-label normalization — free text → enum / acceptable-set (architecture §8). Order matters:
@@ -144,3 +148,58 @@ def load_cases(dataset: str | None = None) -> list[Case]:
     """The full case list the harness runs: the supplied set (from the dataset bundle) + the tagged
     additions (gate crisis/acute cases, architecture §8 "a few tagged additions — noted, with why")."""
     return load_supplied_cases(dataset) + list(ADDED_CASES)
+
+
+#: The ``/learn`` gate's CRITICAL COMPOSER SUBSET — a curated slice of the surface a candidate composer
+#: prompt can move. Two DISTINCT exclusions, with different rationales — name both honestly:
+#: (1) the cases kept for gate-routing/crisis/refusal-template coverage (A01–A09, A12, A13, E17), whose
+#: DEFINING checks measure the message gate, the deterministic floor, and the templates — none of which
+#: ``/learn`` can change — so running them added per-run API cost and temp-0 sampling noise (the
+#: documented n_runs=1 false-reject) with near-zero added regression-detection power; and (2) EIGHT
+#: further supplied composer-answered cases (E03–E06, E08–E10, E13 — all route 'none') that ARE
+#: prompt-movable but per-axis REDUNDANT with the kept ten — dropped for the same cost/noise reason.
+#: (2) is a deliberate coverage TRADE, not a zero-loss cut: a grounding/tone regression confined to
+#: those shapes is caught by the full ``make eval``, not by this gate. What remains is one case per
+#: composer axis:
+#:   E01 change-summary synthesis under a clinician_review floor (the exemplar-shaped case family) ·
+#:   E02 negative control (a learned tone clause must not invent worry on a healthy member) ·
+#:   E07 urgent panic narration (prose must state the flag; the tone clause's "never soften urgent"
+#:   boundary) · E11 multi-marker synthesis · E12 sparse-data honesty ("too short to call") ·
+#:   E14 managed-condition tone (no false alarm, no escalation of the expected-high marker) ·
+#:   E15 benign out-of-range (flag stated without over-referral) · E16 grounding trap (absent B12 →
+#:   fabricated_value) · A10 absent-marker confabulation · A11 present-marker lay-alias over-refusal
+#:   (must_cite — authored to close this gate's blind spot).
+#: Every member id these cases reference ships in the training_data bundle. ``make eval`` still runs the
+#: FULL set (this subset is /learn-gate policy, not the harness's coverage); never-events stay absolute
+#: over the subset, and safety recall degrades to the empty-dimension 1.0 the gate already handles
+#: (correct: the composer cannot move gate recall).
+LEARN_GATE_CASE_IDS: frozenset[str] = frozenset(
+    {"E01", "E02", "E07", "E11", "E12", "E14", "E15", "E16", "A10", "A11"}
+)
+
+
+def load_gate_cases(dataset: str | None = None) -> list[Case]:
+    """The ``/learn`` gate's case list: :data:`LEARN_GATE_CASE_IDS` filtered out of :func:`load_cases`.
+    The id list encodes knowledge of the SHIPPED training_data set, so a foreign dataset (a hold-out
+    upload with its own ids) falls back to gating on its FULL set — judged by whether EVERY supplied id
+    the subset expects is matched (the added A-cases always match by id but reference training_data
+    members a foreign bundle may not carry). An earlier ANY-overlap predicate was defeatable by partial
+    id collision: a hold-out reusing generic ids like ``E01`` silently gated on the tiny intersection
+    (plus the mis-membered A10/A11) instead of falling back — so a single missing expected supplied id
+    now triggers the full-set fallback. The fallback errs toward MORE coverage, never less. (A foreign
+    dataset that reuses EVERY expected id is indistinguishable by id alone — the residual, documented
+    limit of id-keyed curation.)"""
+    cases = load_cases(dataset)
+    subset = [c for c in cases if c.id in LEARN_GATE_CASE_IDS]
+    expected_supplied = LEARN_GATE_CASE_IDS - {c.id for c in ADDED_CASES}
+    matched_supplied = {c.id for c in subset if "supplied" in c.tags}
+    if matched_supplied != expected_supplied:
+        logger.warning(
+            "dataset %r supplies %d of the %d expected LEARN_GATE_CASE_IDS cases — the /learn gate "
+            "runs its FULL eval set instead of the critical composer subset",
+            dataset,
+            len(matched_supplied),
+            len(expected_supplied),
+        )
+        return cases
+    return subset

@@ -119,16 +119,36 @@ def scan(con: sqlite3.Connection, member_id: str) -> ScanResult:
     genuine data change retains the prior audit row. The data_finding escalation dedup keys on the
     PER-MARKER ``compute_marker_version`` (the §48 finding-stable resolution): a notes-/profile-only edit,
     or an override to a DIFFERENT marker, leaves this marker's version unmoved, so it writes fresh audit
-    rows without re-queuing a clinician task. All writes for the scan run in ONE transaction (atomic — no
-    partial interaction/observation/escalation set on a crash)."""
-    member, results, ranges, age, data_version = db.load_for_analysis(con, member_id)
-    analysis = analyze(
-        member, results, ranges, age, ANALYSIS_CONFIG, data_version=data_version
-    )
-    floor = safety.data_floor(analysis)
-
-    # Which markers to surface, ranked highest-severity first then by marker name (shared with suggestions).
-    raised = _raised_ranked(analysis)
+    rows without re-queuing a clinician task. The WHOLE scan — load, analyze, write, prune, reconcile —
+    rides ONE IMMEDIATE transaction (atomic — no partial interaction/observation/escalation set on a
+    crash, and no cross-worker clobber; see the BEGIN IMMEDIATE comment below)."""
+    # BEGIN IMMEDIATE takes the write lock BEFORE the load/analyze read, making the whole
+    # read-compute-write one transaction (CLAUDE.md's multi-worker rule: a multi-statement
+    # read-modify-write on shared state rides one SQLite transaction or takes a process_lock — never
+    # bare). A bare `with con:` BEGINs only at the first DML, which left this read OUTSIDE the
+    # transaction: under --workers 2, a scan whose read predated a sibling's feedback+auto-scan commit
+    # could serialize its WRITES after it, and its stale reconcile/prune would then supersede a LIVE
+    # clinician_review escalation (or delete a fresh observation) the sibling had just emitted.
+    # IMMEDIATE serializes concurrent scans whole-scan-at-a-time (bounded by the 5s busy_timeout; a
+    # scan is sub-second), so every reconcile acts on a view that includes every prior scan's writes.
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        member, results, ranges, age, data_version = db.load_for_analysis(
+            con, member_id
+        )
+        analysis = analyze(
+            member, results, ranges, age, ANALYSIS_CONFIG, data_version=data_version
+        )
+        floor = safety.data_floor(analysis)
+        # Which markers to surface, ranked highest-severity first then by marker name (shared with
+        # suggestions).
+        raised = _raised_ranked(analysis)
+    except BaseException:
+        # Roll back the explicit BEGIN on ANY load/analyze failure (incl. the missing-member KeyError):
+        # scan_members loops members over ONE connection, and a leaked open transaction would make the
+        # next member's BEGIN IMMEDIATE fail "within a transaction".
+        con.rollback()
+        raise
 
     kept_ids: set[str] = (
         set()
@@ -137,7 +157,7 @@ def scan(con: sqlite3.Connection, member_id: str) -> ScanResult:
         set()
     )  # the escalation rows this scan (re-)emitted — the live findings the reconcile keeps 'open'
     new_count = 0  # rows write_observation newly created (vs refreshed in place) — the ScanResult count
-    with con:  # atomic: interaction + observation + escalation per finding commit (or roll back) together
+    with con:  # commits (or rolls back) the IMMEDIATE transaction opened above — one atomic scan
         for traj in raised:
             response_id = db._det_id("scan:", member_id, traj.marker, data_version)
             obs_id = db._det_id(

@@ -1,20 +1,22 @@
 # Render Blueprint — one web service: FastAPI serves the API and the static UI same-origin.
-# Deploy: Render → New → Blueprint → connect this repo (it reads this file). See README "Deployment".
+# Deploy: Render → New → Blueprint → connect this repo (it reads this file). See README "Deploy your own copy".
 #
-# Shipped on the FREE / EPHEMERAL tier: no persistent disk, and the instance spins down when idle, so
-# the SQLite file is wiped on a cold start. That is fine by construction — the app's lifespan runs
-# init_db + seed-if-empty + auto-scan on startup (the build can't see the runtime filesystem), so a fresh
-# instance self-heals its schema, the 15 training members, AND their observations (proactive-by-default:
-# findings are visible on the first page load). The trade-off: POST /members uploads and feedback do NOT
-# survive a spin-down. The paid-disk upgrade for durable storage is the commented block below.
+# Runs on the paid STARTER plan with a 1 GB persistent disk mounted at /data (~$8/mo): HEALTH_DB_PATH
+# points SQLite at the disk, so uploaded members, feedback, and promoted prompt_versions survive
+# deploys and restarts, and the instance no longer spins down when idle. The lifespan still runs
+# init_db + seed-if-empty + auto-scan on startup (the build can't see the runtime filesystem), so a
+# FRESH disk self-heals its schema, the 15 training members, AND their observations — while a
+# non-empty durable DB is left alone (the seed is if-empty; ingest is additive). One durable-DB
+# consequence: an analysis.py/config.py change deployed over a durable DB needs a manual Scan (or
+# /admin/reseed) to refresh persisted observations — nothing re-derives them on deploy, by design.
 services:
   - type: web
     name: health-intelligence
     runtime: python
-    plan: free
+    plan: starter  # paid + durable; the disk block below requires a paid plan (free has no disks and spins down)
     rootDir: backend                                    # pyproject.toml + uv.lock live here; build/start run here
     buildCommand: "pip install uv==0.11.14 && uv sync --frozen"  # uv pinned so the build stays reproducible
-    startCommand: "uv run uvicorn api:app --host 0.0.0.0 --port $PORT --workers 1"  # $PORT injected; --workers 1 enforces the §15 single-worker invariant
+    startCommand: "uv run uvicorn api:app --host 0.0.0.0 --port $PORT --workers 2"  # $PORT injected; 2 workers share the one SQLite DB — safe via WAL + per-request connections + idempotent writes + the cross-process flocks (startup init, /learn·/reset·/reseed) — §15
     healthCheckPath: /health  # served once the lifespan completes; the startup seed + auto-scan is sub-second (~0.3s for 15 members), so no cold-start health-check timeout
     # Python is pinned to 3.12 by the repo-root .python-version file: Render reads it from the repository
     # root and auto-selects the latest 3.12 patch. (The env-var PYTHON_VERSION method is NOT used — it
@@ -25,20 +27,24 @@ services:
         sync: false                                     # Mode 1 runs without it; Mode 2 + the gate need it.
       - key: DATASET
         value: training_data
-      # HEALTH_DB_PATH is left unset -> the app uses backend/data/health.db on the ephemeral container FS.
+      # LANGSMITH_API_KEY is deliberately NOT declared: the /learn + eval trace sink is opt-in and a
+      # no-op without the key (eval/llm_eval.is_enabled). To trace prod /learn runs, add it manually
+      # as a dashboard secret — nothing else to change; the SDK ships but is never imported keyless.
+      - key: HEALTH_DB_PATH                             # SQLite on the persistent disk below — the durability switch.
+        value: /data/health.db
+    disk:                                               # the durable volume HEALTH_DB_PATH points into
+      name: health-data
+      mountPath: /data
+      sizeGB: 1
 
-# ---- Paid-disk upgrade (durable across deploys, ~$8/mo) ----------------------------------------------
-# 1. change `plan: free` above to `plan: starter`
-# 2. add this env var under envVars — makes the DB durable, so uploaded MEMBERS + feedback survive:
-#      - key: HEALTH_DB_PATH
-#        value: /data/health.db
-# 3. add this disk block under the service (a sibling of envVars):
-#    disk:
-#      name: health-data
-#      mountPath: /data
-#      sizeGB: 1
-# That alone persists everything in the DB. The dataset *folders* POST /members/upload writes (the kept
-# eval_set.jsonl / lab_panels.csv, for later `DATASET=<name> make eval`) still live under the ephemeral
-# app dir. To persist those too, also set HEALTH_DATA_ROOT to a disk path (e.g. /data/datasets) AND copy
-# the shipped backend/data/training_data into it once — an empty relocated root has no training_data for
-# the startup seed to read, so the 15 members won't appear until it's present.
+# ---- What the disk does and doesn't cover -------------------------------------------------------------
+# The disk persists everything in the DB (uploaded members, feedback, promoted prompts). The dataset
+# *folders* POST /members/upload writes (the kept eval_set.jsonl / lab_panels.csv, for later
+# `DATASET=<name> make eval`) still live under the ephemeral app dir. To persist those too, also set
+# HEALTH_DATA_ROOT to a disk path (e.g. /data/datasets) AND copy the shipped backend/data/training_data
+# into it once — an empty relocated root has no training_data for the startup seed to read, so the 15
+# members won't appear until it's present.
+#
+# Downgrade to free/ephemeral: `plan: free`, delete the HEALTH_DB_PATH env var and the disk block.
+# The DB then lives on the container FS and is wiped + re-seeded on every cold start (uploads and
+# feedback don't survive a spin-down) — safe by construction, thanks to the same startup self-heal.

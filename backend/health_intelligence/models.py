@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 # --------------------------------------------------------------------------------------------------
 # Enumerations — each mirrors a schema.sql CHECK constraint VERBATIM. Change one, change both.
@@ -89,6 +89,18 @@ SEVERITY_TO_FLOOR: dict[Severity, FloorLevel] = {
     "notable": "none",
     "attention": "clinician_review",
     "urgent": "urgent",
+}
+
+# The INVERSE projection — an escalation level back onto the observation-severity axis, so the two
+# escalation reads (the global queue + the per-member drill-in) can carry a `severity` field on the
+# SAME ranked scale observations use (SEVERITY_ORDER) and sort worst-first on it. Derived by
+# inverting SEVERITY_TO_FLOOR rather than written by hand: the non-'none' rows are unique
+# (attention→clinician_review, urgent→urgent), so this cannot drift from the forward table that
+# emitted the escalation in the first place (safety.severity_to_level).
+LEVEL_TO_SEVERITY: dict[EscalationLevel, Severity] = {
+    floor: severity  # type: ignore[misc]  # non-'none' FloorLevel == EscalationLevel by construction
+    for severity, floor in SEVERITY_TO_FLOOR.items()
+    if floor != "none"
 }
 
 
@@ -443,7 +455,23 @@ class Escalation(BaseModel):
     #: finding cleared (e.g. a /feedback override removed the flag) — off the active queue but KEPT for audit.
     #: Set by the scan's reconcile (db.reconcile_escalation_status), symmetric. An 'urgent' escalation is
     #: NEVER superseded (only 'clinician_review' auto-clears — safety). Defaults 'open' (freshly emitted).
-    status: Literal["open", "superseded"] = "open"
+    #: 'acknowledged' = a clinician confirmed it warranted attention (an ACTIVE `escalation_accept`
+    #: feedback row targets it) — still ON the queue, visibly triaged, never hidden. DERIVED AT READ by
+    #: the db.py escalation reads over the stored 'open' (never persisted — the stored column stays
+    #: open|superseded, so there is no CHECK migration and deactivating the accept row (`/reset`)
+    #: symmetrically reverts it to 'open'). A stored 'superseded' wins over the overlay (the finding is
+    #: gone from the data; the audit trail keeps both facts).
+    status: Literal["open", "acknowledged", "superseded"] = "open"
+
+    @computed_field
+    @property
+    def severity(self) -> Severity:
+        """The escalation's rank on the shared observation-severity axis — ``urgent`` → 'urgent',
+        ``clinician_review`` → 'attention' (``LEVEL_TO_SEVERITY``). DERIVED from ``level`` at read,
+        never stored (the ``member_explanation`` discipline: no column, no migration, nothing to go
+        stale), so it can't disagree with a level the dedup-conflict path upgraded in place. Both
+        escalation reads sort worst-first on this axis."""
+        return LEVEL_TO_SEVERITY[self.level]
 
 
 # --------------------------------------------------------------------------------------------------
@@ -457,13 +485,52 @@ class Feedback(BaseModel):
     escalation_accept|reject). ``target`` is a marker key (corrections) or a finding reference (signals);
     the operator UI sources both from dropdowns — markers from the member's trajectory, findings from the
     current observations — so a non-matching target (200-but-silently-inert) can't be stored. ``learn.py``
-    does not read a signal's target (it is audit/provenance only); only the correction kinds resolve their
-    target into the analysis (``db.resolve_overrides``)."""
+    does not read a signal's target; only the correction kinds resolve their target into the analysis
+    (``db.resolve_overrides``). One signal's target IS consumed elsewhere: an active clinician/system-sourced
+    ``escalation_accept``'s target (an escalation_id or its observation_id) drives the read-time
+    'acknowledged' overlay on the escalation queue (see :class:`Escalation`.status; a member-sourced
+    accept is stored but inert there — the overlay is source-filtered like ``resolve_overrides``); the
+    other signals' targets stay audit/provenance only."""
 
     kind: FeedbackKind
     target: str | None = None
     payload: dict[str, Any] | None = None
     source: FeedbackSource
+
+
+class FeedbackRecord(Feedback):
+    """A STORED feedback row — the input :class:`Feedback` plus the storage fields ``db.py`` assigns.
+    Returned by the read-only audit projection ``GET /members/{id}/feedback`` (``db.get_feedback``),
+    newest-first and INCLUDING ``active=False`` rows: a ``/reset`` deactivates rather than deletes
+    precisely so this trail survives, and the flag tells the reviewer which rows still feed the live
+    consumers. Never an input to anything — the live paths read active rows through their own seams
+    (``resolve_overrides`` / ``get_active_preferences`` / ``get_active_signals``), so this projection
+    cannot become a second consumption path."""
+
+    feedback_id: str
+    active: bool
+    created_at: str
+
+
+class PromptVersionRecord(BaseModel):
+    """One composer ``prompt_versions`` row — the read projection behind the operator's Prompt-history
+    readout (``GET /prompts``, ``db.get_prompt_versions``), newest version first. The learning loop it
+    exposes: prompts are LEARNT from feedback (`/learn` rule-assembles a candidate from the learnable
+    signals — an ``incorrect`` correction → a few-shot exemplar, a recurring ``escalation_reject`` → the
+    softer-tone clause) and VALIDATED before serving (the candidate is gated through the same eval
+    harness ``make eval`` runs; ``status`` records the verdict — only ``promoted`` rows ever serve, and a
+    ``/reset`` flips promotions to ``reverted``). ``active`` marks the single row the composer resolves
+    now (the latest ``promoted`` — ``db.get_active_prompt``); v0 is the seeded ``BASE_COMPOSE_SYSTEM``
+    baseline. ``eval_summary`` is a compact digest of the stored gate report, never the full
+    ``eval_report_json`` (it carries the whole raw case set); ``None`` when no report is attached yet
+    (v0 seeds report-less — the first ``/learn`` back-fills it as the regression baseline)."""
+
+    version: int
+    status: PromptStatus
+    active: bool
+    created_at: str
+    prompt_text: str
+    eval_summary: dict | None = None
 
 
 # --------------------------------------------------------------------------------------------------

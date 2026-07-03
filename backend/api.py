@@ -17,7 +17,7 @@ import logging
 import os
 import sqlite3
 from collections.abc import Iterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -30,9 +30,11 @@ from health_intelligence.models import (
     AskRequest,
     Escalation,
     Feedback,
+    FeedbackRecord,
     HealthIntelligenceResponse,
     MemberBundle,
     Observation,
+    PromptVersionRecord,
     ScanResult,
     SuggestedPrompt,
 )
@@ -77,64 +79,113 @@ async def lifespan(app: FastAPI):
             "in-memory DB each time). Use a file path; tests share one connection via db.connect directly."
         )
     # Ensure the schema exists before serving (idempotent; Phase 8 relies on startup-time init because
-    # Render's build step can't see the persistent disk). Single-instance deploy (architecture §15), so
-    # no cross-process init race.
+    # Render's build step can't see the persistent disk). BOTH uvicorn workers run this lifespan against
+    # the one shared DB (--workers 2), and init_db's fresh-DB executescript + seed_if_empty are
+    # check-then-act — so the whole init sequence is serialized under the cross-process "startup" lock
+    # (db.process_lock, BLOCKING: the loser waits out the winner's sub-second init, then sees tables
+    # present + members seeded and no-ops through every step). flock auto-releases if the holding worker
+    # dies mid-init, so a crashed winner can't wedge the other worker's boot.
     con = db.connect(_DB_PATH)
     try:
-        db.init_db(
-            con
-        )  # FATAL on failure: the app cannot serve a request without a schema
-        # Seed-if-empty: a fresh container/disk boots with an empty DB (the build can't see the runtime
-        # FS — the same reason init_db runs here). `seed_if_empty` is a no-op locally (make seed ran
-        # first) and on any restart where data persisted; on the free/ephemeral tier it self-heals the
-        # 15 training members on every cold start (active DATASET, matching `make seed`). It is NON-fatal
-        # and logged: a seed failure rolls back to empty (next restart retries) and leaves the
-        # deterministic spine (Mode 1, /health) up, rather than aborting the whole app on a bad dataset.
-        try:
-            outcome = seed_if_empty(con)
-        except Exception:
-            logger.exception(
-                "startup seed failed; serving with the current DB (the next restart retries)"
-            )
-        else:
-            if outcome["seeded"]:
-                logger.info(
-                    "startup: seeded %d members from the active dataset",
-                    outcome["members"],
-                )
-                # Every ingest path auto-scans what it loaded (startup seed here; reseed + upload in
-                # their routes), so persisted Observations are always consistent with the loaded data —
-                # a cold open (fresh deploy / ephemeral-tier restart) shows findings without a manual
-                # Scan. Best-effort like the seed itself: scan_members already absorbs per-member
-                # failures, and this envelope keeps a systemic scan bug from blocking serving (the
-                # deterministic spine still answers; observations lag until a manual scan).
-                try:
-                    sweep = pipeline.scan_members(con, outcome["member_ids"])
-                    logger.info(
-                        "startup: auto-scanned %d seeded members (%d new observations)",
-                        sweep.scanned,
-                        sweep.new_observations,
-                    )
-                except Exception:
-                    logger.exception(
-                        "startup auto-scan failed; observations lag until a manual scan"
-                    )
-        # Materialize the v0 composer baseline so prompt_versions is never empty (the operator UI shows
-        # the active baseline; /learn back-fills its eval report lazily). Idempotent — a no-op on a warm
-        # restart, and a one-time back-fill for DBs seeded before this landed. NON-fatal like the seed:
-        # a failure here leaves the pipeline's implicit BASE fallback intact, so the app still serves.
-        try:
-            learn.seed_baseline_prompt(con)
-        except Exception:
-            logger.exception(
-                "startup: failed to seed the v0 baseline prompt (composer falls back to BASE)"
-            )
+        with db.process_lock(con, "startup", blocking=True):
+            _init_and_seed(con)
     finally:
         con.close()
     yield
 
 
+def _init_and_seed(con: sqlite3.Connection) -> None:
+    """The lifespan's init → seed-if-empty → auto-scan → v0-baseline sequence. Runs under the
+    cross-process startup lock (see ``lifespan``), so exactly one worker performs the real work."""
+    db.init_db(con)  # FATAL on failure: the app cannot serve a request without a schema
+    # Seed-if-empty: a fresh container/disk boots with an empty DB (the build can't see the runtime
+    # FS — the same reason init_db runs here). `seed_if_empty` is a no-op locally (make seed ran
+    # first) and on any restart where data persisted; on a fresh durable disk (or the free/ephemeral
+    # downgrade's cold starts) it self-heals the 15 training members (active DATASET, matching
+    # `make seed`). It is NON-fatal and logged: a seed failure rolls back to empty (next restart
+    # retries) and leaves the deterministic spine (Mode 1, /health) up, rather than aborting the
+    # whole app on a bad dataset.
+    try:
+        outcome = seed_if_empty(con)
+    except Exception:
+        logger.exception(
+            "startup seed failed; serving with the current DB (the next restart retries)"
+        )
+    else:
+        if outcome["seeded"]:
+            logger.info(
+                "startup: seeded %d members from the active dataset",
+                outcome["members"],
+            )
+            # Every ingest path auto-scans what it loaded (startup seed here; reseed + upload in
+            # their routes), so persisted Observations are always consistent with the loaded data —
+            # a cold open (fresh deploy) shows findings without a manual Scan. Best-effort like the
+            # seed itself: scan_members already absorbs per-member failures, and this envelope keeps
+            # a systemic scan bug from blocking serving (the deterministic spine still answers;
+            # observations lag until a manual scan).
+            try:
+                sweep = pipeline.scan_members(con, outcome["member_ids"])
+                logger.info(
+                    "startup: auto-scanned %d seeded members (%d new observations)",
+                    sweep.scanned,
+                    sweep.new_observations,
+                )
+            except Exception:
+                logger.exception(
+                    "startup auto-scan failed; observations lag until a manual scan"
+                )
+    # Materialize the v0 composer baseline so prompt_versions is never empty (the operator UI shows
+    # the active baseline; /learn back-fills its eval report lazily). Idempotent — a no-op on a warm
+    # restart, and a one-time back-fill for DBs seeded before this landed. NON-fatal like the seed:
+    # a failure here leaves the pipeline's implicit BASE fallback intact, so the app still serves.
+    try:
+        learn.seed_baseline_prompt(con)
+    except Exception:
+        logger.exception(
+            "startup: failed to seed the v0 baseline prompt (composer falls back to BASE)"
+        )
+
+
 app = FastAPI(title="Health Intelligence Service", lifespan=lifespan)
+
+
+#: The dataset/member bulk-ingest exclusion domain (``db.process_lock`` name): shared by the two ingest
+#: routes (``POST /members/upload`` · ``POST /members``) and ``/admin/reseed``. Without it, a reseed's
+#: truncate + folder-rmtree interleaved with an in-flight upload's folder-create + per-member commits —
+#: leaving uploaded members inside a "factory" DB with their dataset folder deleted, or an upload's
+#: committed members silently erased under its own 200.
+_DATA_LOCK_NAME = "data"
+
+
+@contextmanager
+def _learning_state_lock(con: sqlite3.Connection) -> Iterator[None]:
+    """Acquire the shared LEARNING-STATE lock (``learn.LEARN_LOCK_NAME`` — the same flock ``/learn``'s
+    single-flight holds) non-blocking, or raise the routes' shared **409**. ONE home for the lock name,
+    mode, and user-facing detail, so ``/reset`` and ``/admin/reseed`` cannot drift apart on the exclusion
+    contract they co-hold. Lives in api.py because the 409 is an HTTP concern (db.py imports no fastapi)."""
+    with db.process_lock(con, learn.LEARN_LOCK_NAME, blocking=False) as acquired:
+        if not acquired:
+            raise HTTPException(
+                status_code=409,
+                detail="a /learn run (or another reset/reseed) is using the learning state — retry when it finishes",
+            )
+        yield
+
+
+@contextmanager
+def _dataset_lock(con: sqlite3.Connection) -> Iterator[None]:
+    """Acquire the shared DATASET/bulk-ingest lock (``_DATA_LOCK_NAME``) non-blocking, or raise the
+    ingest routes' shared **409** — the peer of :func:`_learning_state_lock` for the member/dataset
+    state. ``/admin/reseed`` holds it for its whole wipe+re-ingest (nested inside the learning-state
+    lock — a fixed order, and both non-blocking, so no deadlock is possible); the ingest routes hold it
+    for their folder-write + per-member ingest + auto-scan."""
+    with db.process_lock(con, _DATA_LOCK_NAME, blocking=False) as acquired:
+        if not acquired:
+            raise HTTPException(
+                status_code=409,
+                detail="a factory reseed (or another dataset ingest) is in progress — retry when it finishes",
+            )
+        yield
 
 
 @app.get("/health")
@@ -160,11 +211,13 @@ def post_member(
     unparseable reference-range, a marker/vital name collision, a missing vital unit, a divergent shared
     range — into a 422 too, so a malformed upload always lands a clear cause in the operator readout
     rather than an opaque 500. Re-POSTing an id refreshes that member's facts, preserves the audit/learning
-    rows, and bumps ``data_version`` (``ingest_bundle`` -> ``replace_member``)."""
-    try:
-        return ingest_bundle(con, bundle)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
+    rows, and bumps ``data_version`` (``ingest_bundle`` -> ``replace_member``). Holds the shared DATASET
+    lock so the ingest can't interleave with a mid-flight ``/admin/reseed`` (-> 409, retry)."""
+    with _dataset_lock(con):
+        try:
+            return ingest_bundle(con, bundle)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
 
 
 @app.post("/members/upload")
@@ -212,37 +265,45 @@ def upload_dataset(
     # `GET /health` Render polls. A plain `def` makes Starlette run it in the threadpool, like every other
     # route here; `file.file.read()` is the sync read of the SpooledTemporaryFile (no `await` needed).
     data = file.file.read()
-    try:
-        result = ingest_uploaded_dataset(
-            con, data=data, filename=file.filename, name=name
-        )
-    except FileExistsError as e:
-        # name collides with an existing dataset/file — caught BEFORE the generic OSError below (it is an
-        # OSError subclass); raised by create_dataset_dir's mkdir BEFORE any DB write, so no side effects.
-        raise HTTPException(status_code=409, detail=str(e)) from e
-    except BundleValidationError as e:
-        # Row-level format failures — matched BEFORE the generic ValueError below (it is a subclass) so the
-        # structured per-row failures ride the wire, not a flattened string. FastAPI serializes the dict.
-        raise HTTPException(
-            status_code=422, detail={"error": str(e), "failures": e.failures}
-        ) from e
-    except (ValueError, ValidationError) as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
-    except OSError as e:
-        # disk full / unwritable HEALTH_DATA_ROOT etc. — a genuine server/infra error (not bad input), but
-        # the folder write happens BEFORE the DB ingest, so no members were committed. Surface a clear 500.
-        raise HTTPException(
-            status_code=500, detail=f"failed to persist the uploaded dataset: {e}"
-        ) from e
+    # The whole folder-write + per-member ingest + auto-scan holds the shared DATASET lock: it is a
+    # multi-transaction sequence a concurrent /admin/reseed (truncate + folder-rmtree) would otherwise
+    # interleave with — uploaded members landing inside a "factory" DB whose folder cleanup just deleted
+    # their dataset, or the upload's committed members truncated away under this route's own 200.
+    with _dataset_lock(con):
+        try:
+            result = ingest_uploaded_dataset(
+                con, data=data, filename=file.filename, name=name
+            )
+        except FileExistsError as e:
+            # name collides with an existing dataset/file — caught BEFORE the generic OSError below (it is
+            # an OSError subclass); raised by create_dataset_dir's mkdir BEFORE any DB write, so no side
+            # effects.
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        except BundleValidationError as e:
+            # Row-level format failures — matched BEFORE the generic ValueError below (it is a subclass) so
+            # the structured per-row failures ride the wire, not a flattened string. FastAPI serializes the
+            # dict.
+            raise HTTPException(
+                status_code=422, detail={"error": str(e), "failures": e.failures}
+            ) from e
+        except (ValueError, ValidationError) as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+        except OSError as e:
+            # disk full / unwritable HEALTH_DATA_ROOT etc. — a genuine server/infra error (not bad input),
+            # but the folder write happens BEFORE the DB ingest, so no members were committed. Surface a
+            # clear 500.
+            raise HTTPException(
+                status_code=500, detail=f"failed to persist the uploaded dataset: {e}"
+            ) from e
 
-    # Auto-scan the just-ingested members so their stored Observations match their live Trajectory the
-    # moment the data source lands (best-effort, in the library; startup seed + reseed do the same).
-    sweep = pipeline.scan_members(con, result["member_ids"])
-    return {
-        **result,
-        "scanned": sweep.scanned,
-        "new_observations": sweep.new_observations,
-    }
+        # Auto-scan the just-ingested members so their stored Observations match their live Trajectory the
+        # moment the data source lands (best-effort, in the library; startup seed + reseed do the same).
+        sweep = pipeline.scan_members(con, result["member_ids"])
+        return {
+            **result,
+            "scanned": sweep.scanned,
+            "new_observations": sweep.new_observations,
+        }
 
 
 @app.delete("/members/{member_id}")
@@ -287,12 +348,16 @@ def get_observations(
 def get_all_escalations(
     con: sqlite3.Connection = Depends(get_con),
 ) -> list[Escalation]:
-    """The GLOBAL clinician-review queue across all members — the triage worklist, ranked worst-first
-    (urgent before clinician_review), then most recent. This is *the* hand-off surface: escalation means
-    "make sure a human sees this", which a per-member read can't guarantee (it requires already knowing
-    which patient to open). The per-member route below is the drill-in, not the queue. Scope: "all
-    members" is the whole tenant in this prototype (no clinician identity); production would scope it to a
-    clinician's panel (db.get_all_escalations · §15)."""
+    """The GLOBAL clinician-review queue across all members — the triage worklist, ranked highest
+    severity first (each item carries the derived ``severity`` field: urgent → 'urgent' before
+    clinician_review → 'attention'), un-acknowledged before 'acknowledged' within a tier, then most
+    recent. This is *the* hand-off surface: escalation means "make sure a human sees this", which a
+    per-member read can't guarantee (it requires already knowing which patient to open). An escalation a
+    clinician confirmed via ``escalation_accept`` shows ``status='acknowledged'`` (a read-time overlay —
+    §720) and STAYS listed, visibly triaged; only 'superseded' (data-cleared) leaves the queue. The
+    per-member route below is the drill-in, not the queue. Scope: "all members" is the whole tenant in
+    this prototype (no clinician identity); production would scope it to a clinician's panel
+    (db.get_all_escalations · §15)."""
     return db.get_all_escalations(con)
 
 
@@ -301,7 +366,9 @@ def get_escalations(
     member_id: str, con: sqlite3.Connection = Depends(get_con)
 ) -> list[Escalation]:
     """Per-member DRILL-IN: one member's standing escalation record, shown when already viewing that
-    member. NOT the triage queue — that is the global ``GET /escalations`` above."""
+    member. NOT the triage queue — that is the global ``GET /escalations`` above. Ranked highest
+    severity first like the queue (each item carries the derived ``severity`` field), chronological
+    within a tier (it doubles as the audit view)."""
     # Existence check so an unknown member 404s like /scan and /observations — db.get_escalations would
     # otherwise return [] for a typo'd id, and an empty review queue reads as 'all clear' on a safety
     # surface (it must not be confused with 'member not found').
@@ -361,7 +428,10 @@ def post_feedback(
     commits, so the persisted Observations + escalation worklist reflect the override when the call
     returns (overrides also re-resolve into every later scan/ask, both modes); only a LEARNABLE signal
     feeds ``/learn`` (``incorrect`` -> exemplar, recurring ``escalation_reject`` -> tone clause) —
-    ``helpful`` / ``escalation_accept`` are advisory. 404 if the member is absent. For an ``incorrect``
+    ``helpful`` / ``escalation_accept`` are advisory for learning, but an ``escalation_accept`` marks its
+    targeted escalation ``acknowledged`` on the queue (a read-time overlay off the active accept row —
+    §720; the response's ``acknowledged`` reports whether a live escalation matched, staying listed but
+    visibly triaged; ``/reset`` reverts it). 404 if the member is absent. For an ``incorrect``
     correction, the learning input bar (``learn.validate_feedback``) screens the corrected answer so junk
     never sits in the table as a future few-shot exemplar (the "learns too literally" fix): **422** if it
     is unfit (empty / oversized, or the Haiku judge finds a stated numeric cutoff / escalation-softening /
@@ -401,7 +471,38 @@ def post_feedback(
                 "post_feedback: auto-scan failed for member %s; observations lag until a manual scan",
                 member_id,
             )
-    return {"feedback_id": feedback_id, "rescanned": rescanned, **classification}
+    # An escalation_accept's queue effect is DERIVED AT READ (the 'acknowledged' overlay the escalation
+    # reads compute from the active accept row — §720), so there is nothing to write here; just report
+    # honestly whether the queue now shows the targeted escalation as acknowledged (db owns the matching
+    # predicate — routes stay thin). False means the target matched no live escalation (a non-escalated
+    # observation, one already superseded, or a member-sourced accept the overlay ignores) — the row is
+    # stored for audit but changed nothing visible.
+    acknowledged = False
+    if fb.kind == "escalation_accept" and fb.target:
+        acknowledged = db.escalation_acknowledged(con, member_id, fb.target)
+    return {
+        "feedback_id": feedback_id,
+        "rescanned": rescanned,
+        "acknowledged": acknowledged,
+        **classification,
+    }
+
+
+@app.get("/members/{member_id}/feedback", response_model=list[FeedbackRecord])
+def get_feedback(
+    member_id: str, con: sqlite3.Connection = Depends(get_con)
+) -> list[FeedbackRecord]:
+    """The member's full submitted-feedback trail, newest-first — the read-only AUDIT projection over the
+    ``feedback`` table (corrections and signals alike, each with its payload — e.g. an
+    ``escalation_reject``'s ``{reason}`` descriptor). Includes ``active=False`` rows: a ``/reset``
+    deactivates rather than deletes, and the flag shows which rows still feed the live consumers. A pure
+    read — it feeds nothing (the live paths consume active rows through their own seams)."""
+    # Existence check so an unknown member 404s like the other per-member reads — db.get_feedback would
+    # otherwise return [] for a typo'd id, and an empty trail reads as "no feedback filed", not "no such
+    # member".
+    if db.get_member(con, member_id) is None:
+        raise HTTPException(status_code=404, detail=f"member {member_id!r} not found")
+    return db.get_feedback(con, member_id)
 
 
 @app.get("/members/{member_id}/trajectory")
@@ -428,23 +529,49 @@ def post_reset(con: sqlite3.Connection = Depends(get_con)) -> dict:
     baseline. NOT a data wipe — the dataset, members, and the learning trail are preserved (that is
     ``/admin/reseed``).
 
-    RE-SCANS the members whose overrides it just deactivated (``db.members_with_active_overrides``, read
-    BEFORE the reset), so the persisted observations + clinician queue ACTIVELY revert — a superseded
-    escalation re-opens, a pruned observation returns — instead of lagging until someone re-scans by hand
-    (the symmetric counterpart to the feedback UI's 'Run Scan' nudge; the reconcile is reachable only from a
-    scan). Best-effort like the upload auto-scan: a member's scan failing is logged, not fatal to the reset."""
-    affected = db.members_with_active_overrides(con)  # BEFORE reset clears them
-    counts = db.reset_learning(con)
-    sweep = pipeline.scan_members(
-        con, affected
-    )  # re-open / restore the reverted artifacts
-    # new_observations counts the restored rows (a pruned observation returning on the revert re-scan).
-    return {
-        "learning_reset": True,
-        "rescanned": sweep.scanned,
-        "new_observations": sweep.new_observations,
-        **counts,
-    }
+    RE-SCANS the members whose core overrides it just deactivated, so the persisted observations +
+    clinician queue ACTIVELY revert — a superseded escalation re-opens, a pruned observation returns —
+    instead of lagging until someone re-scans by hand (the symmetric counterpart to the feedback UI's
+    'Run Scan' nudge; the reconcile is reachable only from a scan). The affected-member list is captured
+    by ``db.reset_learning``'s deactivating ``UPDATE ... RETURNING`` itself — one statement, so a core
+    ``/feedback`` committing in the other worker any time before the reset's write is both deactivated
+    AND revert-scanned (a separate read-before-reset left that gap). Best-effort like the upload
+    auto-scan: a member's scan failing is logged, not fatal to the reset.
+
+    Holds the cross-process LEARNING-STATE lock (shared with ``/learn`` + ``/admin/reseed``) for the
+    whole revert+re-scan: deactivating feedback / reverting prompts under a mid-flight ``/learn`` (which
+    reads that state for minutes, possibly in the OTHER worker) would corrupt the run's assumptions, so a
+    held lock -> **409** (retry when the current run finishes) rather than a silent interleave."""
+    with _learning_state_lock(con):
+        counts = db.reset_learning(con)
+        affected = counts.pop(
+            "affected_members"
+        )  # captured atomically with the deactivate
+        sweep = pipeline.scan_members(
+            con, affected
+        )  # re-open / restore the reverted artifacts
+        # new_observations counts the restored rows (a pruned observation returning on the revert re-scan).
+        return {
+            "learning_reset": True,
+            "rescanned": sweep.scanned,
+            "new_observations": sweep.new_observations,
+            **counts,
+        }
+
+
+@app.get("/prompts", response_model=list[PromptVersionRecord])
+def get_prompts(
+    con: sqlite3.Connection = Depends(get_con),
+) -> list[PromptVersionRecord]:
+    """The composer-prompt HISTORY — every ``prompt_versions`` row, newest first (the operator panel's
+    Prompt-history readout). The learning loop it documents: prompts are LEARNT from feedback and
+    VALIDATED by ``/learn`` — a candidate is rule-assembled from the learnable signals (an ``incorrect``
+    correction → a few-shot exemplar; a recurring ``escalation_reject`` → the softer-tone clause) and
+    gated through the same eval harness ``make eval`` runs before it may serve; ``status`` records each
+    verdict (``promoted``/``rejected``, ``reverted`` = a ``/reset`` rollback), ``active`` flags the
+    version the composer is serving now, and v0 is the seeded baseline. A pure read — the composer's
+    consumption path stays ``db.get_active_prompt`` (db.get_prompt_versions)."""
+    return db.get_prompt_versions(con)
 
 
 @app.post("/learn")
@@ -452,8 +579,9 @@ def post_learn(con: sqlite3.Connection = Depends(get_con)) -> dict:
     """Prompt-scan: rule-assemble a candidate composer prompt from the active feedback signals, gate it
     through the eval harness IN-PROCESS, and promote or reject (architecture §9). Guarded against credit
     drain (single-flight lock · feedback-set debounce · structural pre-check · daily cap). 409 if a run
-    is already in progress; 503 if no working LLM (it measures the candidate's real outputs, so it can't
-    meaningfully gate a degraded run)."""
+    is already in progress — in EITHER worker (the single-flight is a cross-process file lock), or while
+    a ``/reset``/``/admin/reseed`` briefly holds the shared learning-state lock; 503 if no working LLM
+    (it measures the candidate's real outputs, so it can't meaningfully gate a degraded run)."""
     try:
         return learn.run_learn(con)
     except learn.LearnBusy as e:
@@ -489,28 +617,39 @@ def post_reseed(con: sqlite3.Connection = Depends(get_con)) -> dict:
     a "run a scan" nudge). The scan runs AFTER the transaction commits, deliberately: ``pipeline.scan``
     persists via its own per-member commits, which inside the block would flush the half-done reseed.
     Best-effort like the upload's auto-scan (a member's scan failure is logged, not fatal); ``scanned``
-    rides the response like the upload's."""
-    with db.reseed_transaction(con):
-        db.clear_all_data(
-            con
-        )  # truncate every table (FK-off inside the transaction, so order is free)
-        summary = ingest_dataset(con, DEFAULT_DATASET, commit=False)
-        learn.seed_baseline_prompt(
-            con, commit=False
-        )  # v0 baseline, so the prompt store isn't empty
-    # Filesystem half of the factory reset: drop uploaded dataset FOLDERS (POST /members/upload writes
-    # <root>/<name>/) so the datasets root returns to just the shipped bundle — the DB truncate above only
-    # removed their MEMBERS, not their folders. AFTER the transaction commits (a filesystem op is not part
-    # of it), and best-effort (never fails the reseed) — same after-commit, non-fatal contract as the scan.
-    datasets_removed = remove_uploaded_datasets()
-    sweep = pipeline.scan_members(con, summary["member_ids"])
-    return {
-        "reseeded": True,
-        "scanned": sweep.scanned,
-        "new_observations": sweep.new_observations,
-        "datasets_removed": datasets_removed,
-        **summary,
-    }
+    rides the response like the upload's.
+
+    Holds the cross-process LEARNING-STATE lock (shared with ``/learn`` + ``/reset``) for the whole
+    wipe+re-ingest+re-scan: truncating ``feedback``/``prompt_versions`` under a mid-flight ``/learn``
+    (minutes long, possibly in the OTHER worker) would corrupt its version numbering and break the
+    "reseed -> one prompt row" invariant, so a held lock -> **409** rather than a silent interleave.
+    ALSO holds the shared DATASET lock (nested second, fixed order, both non-blocking — no deadlock):
+    the ingest routes (``/members/upload`` · ``POST /members``) are multi-transaction writers of the same
+    member/dataset state, and an upload interleaved with the truncate + folder-rmtree left uploaded
+    members inside the "factory" DB with their dataset folder deleted (or silently erased them under the
+    upload's own 200) — now the loser 409s instead."""
+    with _learning_state_lock(con), _dataset_lock(con):
+        with db.reseed_transaction(con):
+            db.clear_all_data(
+                con
+            )  # truncate every table (FK-off inside the transaction, so order is free)
+            summary = ingest_dataset(con, DEFAULT_DATASET, commit=False)
+            learn.seed_baseline_prompt(
+                con, commit=False
+            )  # v0 baseline, so the prompt store isn't empty
+        # Filesystem half of the factory reset: drop uploaded dataset FOLDERS (POST /members/upload writes
+        # <root>/<name>/) so the datasets root returns to just the shipped bundle — the DB truncate above only
+        # removed their MEMBERS, not their folders. AFTER the transaction commits (a filesystem op is not part
+        # of it), and best-effort (never fails the reseed) — same after-commit, non-fatal contract as the scan.
+        datasets_removed = remove_uploaded_datasets()
+        sweep = pipeline.scan_members(con, summary["member_ids"])
+        return {
+            "reseeded": True,
+            "scanned": sweep.scanned,
+            "new_observations": sweep.new_observations,
+            "datasets_removed": datasets_removed,
+            **summary,
+        }
 
 
 # Serve the static member surface on the same origin (Phase 6 ships frontend/index.html). Mounted LAST

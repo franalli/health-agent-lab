@@ -1005,21 +1005,23 @@ def seed_if_empty(con) -> dict:
     (``seeded=False``) when members already exist, so a warm restart or a prior ``make seed`` never
     re-ingests, and a deliberately ``DELETE``d member is never resurrected.
 
-    The guard fires only on a TRULY empty DB, which is what makes a clean rollback safe: ``ingest_dataset``
-    commits per member, so a mid-loop write failure would otherwise strand a partial set that the
-    empty-check then reads as 'seeded' — never re-healing. Instead, on failure we delete the partial
-    prefix (every member present is from this attempt, since the DB was empty) and re-raise, so the DB
-    returns to empty and the next boot retries cleanly. This rollback is startup-only policy;
-    ``ingest_dataset`` itself stays per-member-atomic for the CLI and ``/admin/reseed`` (force-ingest)."""
+    The seed runs as ONE transaction (``ingest_dataset(commit=False)`` + a single commit, the same shape
+    ``/admin/reseed`` uses), because the emptiness guard makes a partial set PERMANENT: with per-member
+    commits, a mid-seed failure would strand a prefix the empty-check then reads as 'seeded' — never
+    re-healing (and under ``--workers 2`` the sibling worker would boot clean over it in the same cycle,
+    masking the crash). A single transaction covers BOTH failure shapes: a Python exception rolls back
+    explicitly below, and a process death (SIGKILL / OOM-kill mid-seed) discards the uncommitted
+    transaction with the process — either way the DB returns to empty and the next boot retries cleanly.
+    (The old delete-the-partial-prefix rollback covered only the exception half.) ``ingest_dataset``
+    itself stays per-member-atomic by default for the CLI (force-ingest)."""
     if db.list_members(con):
         return {"seeded": False}
     try:
-        return {"seeded": True, **ingest_dataset(con)}
+        summary = ingest_dataset(con, commit=False)
+        con.commit()  # the single all-or-nothing commit for the whole seed
+        return {"seeded": True, **summary}
     except Exception:
-        for mid in db.list_members(
-            con
-        ):  # all from this failed attempt — the DB was empty before it
-            db.delete_member(con, mid)
+        con.rollback()  # back to empty — the next boot retries
         raise
 
 

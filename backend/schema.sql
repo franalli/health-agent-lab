@@ -145,6 +145,11 @@ CREATE TABLE escalations (
     -- an 'urgent' escalation is NEVER superseded (only the softer 'clinician_review' tier auto-clears): a
     -- deliberate range_override panic re-bound can clear the flag, but a fired urgent stays queued until a
     -- human resolves it (suppress itself is panic-inert). §720 lifecycle.
+    -- DELIBERATE Literal/CHECK asymmetry: the model's third status, 'acknowledged' (a clinician's active
+    -- escalation_accept feedback row targets the escalation), is a READ-TIME overlay over a stored 'open'
+    -- (db._ESCALATION_COLUMNS) and is NEVER stored — so this CHECK stays two-valued (no rebuild migration:
+    -- SQLite CHECKs are baked into the DDL of every existing DB), /reset reverts it by deactivating the
+    -- accept row, and the scan's reconcile needs no knowledge of acknowledgments.
     -- Appended LAST to match the ALTER TABLE ADD COLUMN migration's column order for pre-existing DBs.
     status         TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','superseded'))
 );
