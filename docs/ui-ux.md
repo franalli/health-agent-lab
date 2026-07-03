@@ -157,6 +157,7 @@ The safety-correct move — escalate, or admit "I can't be sure" — frequently 
 - Plain language by default; medical terms glossed inline on first use.
 - One clear primary action per card (the "next step"), so a worried member isn't hunting.
 - No dark patterns, no urgency manufactured for engagement; the only urgency shown is clinical and real. The system never thanks the member for "reaching out" or nudges them to keep chatting — it answers, surfaces what matters, and gets out of the way.
+- **System faults get their own calm surface.** Any failed request raises one amber banner under the header — *what* failed in the user's terms ("Answering your question didn't go through"), *why* in plain words (the server's own reason as a secondary line when it gave one), and the *action* ("try again in a few seconds" for transient faults; "adjust the input" for rejections; lock contention explained as expected multi-user behavior, not a fault). A Retry button rides along where the action can be safely re-run. Amber deliberately: coral is reserved for clinical urgency (rule above), so a network fault can never wear the colour of a health alert. The newest error replaces the previous, ✕ dismisses, and the next successful request auto-clears it — a stale "server unreachable" never outlives the recovery. In the chat itself, a failed ask leaves a member-toned card ("your results are unaffected; try sending it again") instead of a bare status code.
 
 ---
 

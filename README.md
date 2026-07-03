@@ -161,6 +161,7 @@ Technical equivalents: the same ingest runs as a CLI (`uv run python -m preproce
 
 | Symptom | What's happening |
 |---|---|
+| An amber banner appears under the header | A request failed — server unreachable, a busy maintenance lock (409), the LLM provider down (503), or rejected input (422). The banner states what failed, why, and the action to take (usually "try again in a few seconds"; a Retry button appears where the action can be safely re-run). It clears itself on the next successful request, or via ✕. |
 | Mode 2 answers look plain or terse | The deterministic fallback: the server has no `ANTHROPIC_API_KEY`, or the LLM call failed. By design — never an error. |
 | A follow-up question lost the thread | The tab was refreshed — conversation memory is in-browser only. |
 | `helpful` / `escalation_accept` didn't change learning | Advisory by design; only `incorrect` and a recurring `escalation_reject` feed **Run learn**. |

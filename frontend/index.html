@@ -173,6 +173,29 @@
     padding: 8px 16px; font-size: 13px; font-weight: 500; color: var(--ink); cursor: pointer;
   }
   .boot-retry:hover { border-color: var(--faint); background: var(--panel-2); }
+  /* system error banner — ONE shared strip under the header for any failed request (network / 409 lock
+     contention / 503 provider-down / 422 rejection / 5xx). Amber on purpose: coral is reserved for
+     CLINICAL urgency (§8), so a system fault must never wear the colour of a health alert. Every message
+     is title (what failed) + explanation (why, in plain words) + action (what to do — e.g. "try again in
+     a few seconds"); the newest error replaces the previous one, ✕ dismisses, and any later successful
+     request auto-clears it so a stale "server unreachable" can't outlive the recovery. */
+  .sys-banner {
+    display: flex; align-items: flex-start; gap: 10px;
+    background: var(--amber-bg); border-bottom: 1px solid var(--amber-line);
+    padding: 9px 22px; font-size: 13px; line-height: 1.45; color: var(--amber-ink);
+  }
+  .sys-banner[hidden] { display: none; }
+  .sys-banner-icon { flex: none; line-height: 1.45; }
+  .sys-banner-text { flex: 1; min-width: 0; }
+  .sys-banner-text strong { font-weight: 600; margin-right: 6px; }
+  .sys-banner-text .sys-banner-act { font-weight: 600; white-space: nowrap; }
+  .sys-banner-detail { display: block; margin-top: 2px; font-size: 12px; color: #96742E; word-break: break-word; }
+  .sys-banner button {
+    flex: none; border: 1px solid var(--amber-line); background: transparent; color: var(--amber-ink);
+    border-radius: 8px; padding: 3px 10px; font-size: 12px; font-weight: 600;
+  }
+  .sys-banner button:hover { background: rgba(217,165,62,.15); }
+  .sys-banner .sys-banner-x { border: none; padding: 3px 6px; font-size: 13px; }
   .cp-group { margin-bottom: 14px; }
   .cp-group h3 { font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--accent); font-weight: 600; margin-bottom: 7px; }
   .cp-btn {
@@ -457,6 +480,20 @@
       </div>
     </div>
   </header>
+
+  <!-- system error banner — filled by showSysBanner(); role=alert so a failure is announced. Sits in the
+       shared chrome (both audiences see it): copy is plain-language, the technical server detail is the
+       secondary line. Hidden until the first failed request; auto-cleared by the next successful one. -->
+  <div id="sys-banner" class="sys-banner" role="alert" hidden>
+    <span class="sys-banner-icon" aria-hidden="true">⚠</span>
+    <div class="sys-banner-text">
+      <strong id="sys-banner-title"></strong><span id="sys-banner-msg"></span>
+      <span class="sys-banner-act" id="sys-banner-act"></span>
+      <span class="sys-banner-detail" id="sys-banner-detail" hidden></span>
+    </div>
+    <button type="button" id="sys-banner-retry" hidden>Retry</button>
+    <button type="button" class="sys-banner-x" id="sys-banner-x" aria-label="Dismiss">✕</button>
+  </div>
 
   <main>
     <!-- LEFT · operator control panel (not member-facing) -->
@@ -798,15 +835,87 @@
     return out.join("");
   }
 
-  async function api(method, path, body) {
+  // ---- system error banner ------------------------------------------------------------------------
+  // Map a failed response to {title, msg, act}: WHAT failed in plain words, WHY (the server's own
+  // human-readable {detail} when it has one — the API writes good ones), and the ACTION the user should
+  // take. The action is the point of the banner: a 409 is "wait a moment and retry" (lock contention is
+  // the designed outcome of the cross-process flocks, not a fault), a 503 is "retry — nothing was saved"
+  // (the fail-closed judge / provider-down path), a 422 is "change the input" (retrying unchanged fails
+  // again), 5xx/network is "try again in a few seconds".
+  function explainError(status, data) {
+    let detail = data && data.detail;
+    // Pydantic body-validation 422s carry detail as an ARRAY of {loc, msg} — render legibly, never
+    // "[object Object]" (same concern as the feedback form's inline handler).
+    if (Array.isArray(detail)) detail = detail.map((d) => `${(d.loc || []).join(".")}: ${d.msg}`).join("; ");
+    else if (detail && typeof detail === "object") detail = detail.error || JSON.stringify(detail);
+    if (typeof detail !== "string") detail = (data && data.error) ? String(data.error) : null;
+    if (status === 0) return {
+      // no `detail`: on a network failure the server said nothing — echoing the browser's TypeError
+      // as "Server said: …" would be false attribution.
+      title: "Can't reach the server.", detail: null,
+      msg: "It may be restarting or briefly offline — nothing you sent was processed.",
+      act: "Try again in a few seconds." };
+    if (status === 409) return {
+      title: "The system is busy with another operation.", detail,
+      msg: "Only one maintenance run (learn / reset / reseed / upload) can hold the lock at a time — this is expected when several people use the app at once.",
+      act: /learn run/i.test(detail || "") ? "Try again when the current run finishes — a learn gate can take a minute or two."
+                                           : "Try again in a few seconds." };
+    if (status === 503) return {
+      title: "A required service is temporarily unavailable.", detail,
+      msg: "The language-model provider couldn't be reached, so the request was safely refused — nothing was saved.",
+      act: "Try again in a few seconds." };
+    if (status === 422) return {
+      title: "The input was rejected.", detail,
+      msg: "The server checked it and said no — retrying the same input will be rejected again.",
+      act: "Adjust the input and resubmit." };
+    if (status === 404) return {
+      title: "Not found.", detail,
+      msg: "The member or record may have been removed (e.g. by a reseed in another window).",
+      act: "Refresh the member list and try again." };
+    return {
+      title: "Something went wrong on the server.", detail: detail || `HTTP ${status}`,
+      msg: "The request failed unexpectedly.",
+      act: "Try again in a few seconds — if it keeps happening, check the server logs." };
+  }
+
+  // One banner, newest error wins; ✕ dismisses; any later SUCCESSFUL request auto-clears it (a stale
+  // "server unreachable" must not outlive the recovery). `what` names the action that failed in the
+  // user's terms ("Answering your question", "Factory reseed"); `retry` (optional) re-runs it in place.
+  function showSysBanner(what, r, retry) {
+    const e = explainError(r ? r.status : 0, r && r.data);
+    $("#sys-banner-title").textContent = `${what} didn't go through — ${e.title}`;
+    $("#sys-banner-msg").textContent = ` ${e.msg} `;
+    $("#sys-banner-act").textContent = e.act;
+    const det = $("#sys-banner-detail");
+    det.hidden = !e.detail;
+    det.textContent = e.detail ? `Server said: ${e.detail}` : "";
+    const btn = $("#sys-banner-retry");
+    btn.hidden = !retry;
+    btn.onclick = retry ? () => { hideSysBanner(); retry(); } : null;
+    $("#sys-banner").hidden = false;
+  }
+  function hideSysBanner() { $("#sys-banner").hidden = true; }
+  $("#sys-banner-x").addEventListener("click", hideSysBanner);
+
+  // `ui` controls how a failure is surfaced: default → the system banner with a generic label; pass
+  // {what, retry} for user-terms copy + an in-place Retry; pass `false` for the rare call site that
+  // aggregates its own failures (scanAll). Success always clears the banner — see showSysBanner.
+  async function api(method, path, body, ui) {
     const opts = { method, headers: {} };
     if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
     let res;
     try { res = await fetch(path, opts); }
-    catch (e) { return { ok: false, status: 0, data: { error: String(e) } }; }
+    catch (e) {
+      const r = { ok: false, status: 0, data: { error: String(e) } };
+      if (ui !== false) showSysBanner((ui && ui.what) || `${method} ${path}`, r, ui && ui.retry);
+      return r;
+    }
     const raw = await res.text();
     let data; try { data = raw ? JSON.parse(raw) : null; } catch { data = raw; }
-    return { ok: res.ok, status: res.status, data };
+    const r = { ok: res.ok, status: res.status, data };
+    if (r.ok) hideSysBanner();
+    else if (ui !== false) showSysBanner((ui && ui.what) || `${method} ${path}`, r, ui && ui.retry);
+    return r;
   }
 
   function flushMemberState() {
@@ -848,7 +957,7 @@
 
   // Load the member roster. Returns whether it succeeded so boot() can auto-retry a transient failure.
   async function loadMembers(selectId) {
-    const r = await api("GET", "/members");
+    const r = await api("GET", "/members", undefined, { what: "Loading members", retry: () => loadMembers(selectId) });
     if (!r.ok) { renderReadout(r.data); renderBootError(r); return false; }
     state.members = r.data;
     renderMemberPicker();
@@ -902,7 +1011,8 @@
 
   // GET the member's current observations (a READ of the last scan's output — never triggers a scan).
   async function loadObservations(id) {
-    const r = await api("GET", `/members/${enc(id)}/observations`);
+    const r = await api("GET", `/members/${enc(id)}/observations`, undefined,
+      { what: "Loading observations", retry: () => loadObservations(id) });
     if (r.ok && id === state.currentMember) { state.observations = r.data; renderObservations(); }
     return r;
   }
@@ -919,7 +1029,7 @@
     renderReadout(`Scanning ${members.length} members…`);
     const results = [];
     for (const m of members) {
-      const r = await api("POST", `/members/${enc(m.member_id)}/scan`);
+      const r = await api("POST", `/members/${enc(m.member_id)}/scan`, undefined, false);  // failures aggregated below
       results.push(r.ok ? { member_id: m.member_id, observations: r.data.observations.length,
                             new_observations: r.data.new_observations }
                         : { member_id: m.member_id, error: r.status });
@@ -933,10 +1043,17 @@
     const failed = results.filter((x) => x.error != null).length;
     const newObservations = results.reduce((n, x) => n + (x.new_observations || 0), 0);
     renderReadout({ scanned: results.length, failed, new_observations: newObservations, results });
+    // aggregate banner (the loop suppressed per-member ones): one clear notice + a Retry that re-runs
+    // the whole idempotent sweep — a re-scan of already-clean members writes nothing new.
+    if (failed) {
+      const worst = results.find((x) => x.error != null);
+      showSysBanner("Scanning", { status: worst.error, data: null }, scanAll);
+    }
   }
 
   async function refreshEscalations(id) {
-    const r = await api("GET", `/members/${enc(id)}/escalations`);
+    const r = await api("GET", `/members/${enc(id)}/escalations`, undefined,
+      { what: "Loading safety status", retry: () => refreshEscalations(id) });
     // Keep LIVE ('open' + 'acknowledged') escalations in client state: activeEscalations drives the
     // member-facing flag, the transition bubble, and auto-view-flagged — all "active" concerns. An
     // 'acknowledged' escalation is a clinician-CONFIRMED real finding (an escalation_accept), so it must
@@ -955,7 +1072,8 @@
     const q = new URLSearchParams();
     if (state.focus) q.set("focus", state.focus);
     state.asked.forEach((m) => q.append("asked", m));
-    const r = await api("GET", `/members/${enc(id)}/suggestions?${q.toString()}`);
+    const r = await api("GET", `/members/${enc(id)}/suggestions?${q.toString()}`, undefined,
+      { what: "Loading suggested questions", retry: () => refreshSuggestions(id) });
     if (r.ok && id === state.currentMember) { state.chips = r.data; renderChips(); }
     return r;
   }
@@ -1028,12 +1146,16 @@
 
     const token = state.reqToken;
     const before = new Map(state.activeEscalations.map((e) => [e.escalation_id, e.level]));
-    const r = await api("POST", `/members/${enc(id)}/ask`, { message, history: trimmedHistory });
+    const r = await api("POST", `/members/${enc(id)}/ask`, { message, history: trimmedHistory },
+      { what: "Answering your question" });
     if (token !== state.reqToken) return; // member switched mid-flight
 
     const idx = state.log.indexOf(pending);
     if (!r.ok) {
-      if (idx >= 0) state.log[idx] = { kind: "error", text: `Request failed (${r.status}).` };
+      // member-toned inline card (the banner above carries the specifics); the question is NOT lost —
+      // it stays in the log, so "send it again" is a one-line action, not a re-type.
+      if (idx >= 0) state.log[idx] = { kind: "error",
+        text: "That didn't go through — the answer couldn't be completed. Your results are unaffected; please try sending your question again in a few seconds." };
       renderReadout(r.data); renderConversation(); state.asking = false; updateAskDisabled(); return;
     }
     const turn = { kind: "assistant", resp: r.data, isTransition: false, takeoverLevel: null };
@@ -1073,7 +1195,7 @@
     if (pathFn.length && !state.currentMember) return renderReadout({ error: "No member selected." });
     const path = pathFn(state.currentMember);
     if (state.readoutKey === path) { renderReadout("—"); return; } // second click on the same route → back to default
-    const r = await api("GET", path);
+    const r = await api("GET", path, undefined, { what: `Loading ${path}` });
     renderReadout(r.data);
     state.readoutKey = path;
   }
@@ -1090,9 +1212,16 @@
     fd.append("file", file, file.name);
     let res, data;
     try { res = await fetch("/members/upload", { method: "POST", body: fd }); }
-    catch (e) { return renderReadout({ error: "Upload failed to reach the server", detail: String(e) }); }
+    catch (e) {
+      showSysBanner("Uploading the bundle", { status: 0, data: { error: String(e) } }, () => onUploadFile(file));
+      return renderReadout({ error: "Upload failed to reach the server", detail: String(e) });
+    }
     const raw = await res.text();
     try { data = raw ? JSON.parse(raw) : null; } catch { data = raw; }
+    // banner mirrors api()'s contract for this raw-fetch path: success clears, failure explains + acts
+    // (409 name collision/ingest lock → retry or rename; 422 → the per-row detail lands in the readout below).
+    if (res.ok) hideSysBanner();
+    else showSysBanner("Uploading the bundle", { status: res.status, data });
     // A 422 carries {detail: {error, failures:[{file,row,field,detail}]}} — surface each failure at the
     // file+row it occurred, most legibly, rather than as raw JSON. (A plain-string detail falls through.)
     const fails = data && data.detail && Array.isArray(data.detail.failures) ? data.detail.failures : null;
@@ -1123,8 +1252,8 @@
   // ---- Phase 7 control-panel handlers (Clinician feedback · Learning) ----------------------------
   async function runLearn() {
     renderReadout("Running /learn — rule-assembling a candidate prompt and gating it through the eval harness. This calls the real LLM and can take a minute…");
-    const r = await api("POST", "/learn");
-    renderReadout(r.data);  // {version, status, reason, report} — or a 409/503 detail
+    const r = await api("POST", "/learn", undefined, { what: "Learn run" });
+    renderReadout(r.data);  // {version, status, reason, report} — or a 409/503 detail (banner explains those)
   }
 
   // ---- /feedback form: the full Feedback surface (correction kinds + signal kinds), rendered into the
@@ -1154,7 +1283,7 @@
     // from the member's trajectory (available pre-scan), findings from the current observations (a scan
     // must have run). A typed-in target matching nothing returns 200 but is silently inert on scan
     // (db._apply_overrides) — the dropdown removes that whole failure mode.
-    const traj = await api("GET", `/members/${enc(m)}/trajectory`);
+    const traj = await api("GET", `/members/${enc(m)}/trajectory`, undefined, { what: "Loading the marker list" });
     if (!traj.ok) return renderReadout(traj.data);  // surface the error, don't show an empty dropdown
     const markerOpts = (traj.data || []).map((t) => ({ value: t.marker, text: t.marker }));
     const findingOpts = [
@@ -1299,7 +1428,7 @@
       }
       const fb = { kind: k.kind, target: k.target === "none" ? null : target, payload, source: "clinician" };
       submit.disabled = true; setStatus(status, "", "Submitting…");
-      const r = await api("POST", `/members/${enc(m)}/feedback`, fb);
+      const r = await api("POST", `/members/${enc(m)}/feedback`, fb, { what: "Submitting feedback" });
       submit.disabled = false;
       if (r.ok) {
         // Effect + call-to-action come from the backend's authoritative classification
@@ -1426,8 +1555,9 @@
     });
   }
   async function doResetLearning() {
-    const r = await api("POST", "/reset");
+    const r = await api("POST", "/reset", undefined, { what: "Reset learning" });
     renderReadout(r.data);
+    if (!r.ok) return;  // banner explains (e.g. 409: a /learn run holds the learning-state lock)
     // /reset now RE-SCANS (server-side) the members whose overrides it reverted, so the clinician queue,
     // observations, and Mode-1 chips actively revert. Reload the current member's view to reflect it.
     if (state.currentMember) {
@@ -1452,8 +1582,9 @@
     });
   }
   async function doReseed() {
-    const r = await api("POST", "/admin/reseed");
+    const r = await api("POST", "/admin/reseed", undefined, { what: "Factory reseed" });
     renderReadout(r.data);
+    if (!r.ok) return;  // banner explains; don't wipe the on-screen member state for a reseed that didn't run
     clearMemberView(); await loadMembers();  // picker repopulates with the restored 15
   }
 
@@ -1629,7 +1760,8 @@
     state.trajLoading = true; state.trajError = false;
     renderTrajectoryTab();  // loading indicator
     const token = state.trajToken;  // bumped by member switch AND scan-invalidation (#3)
-    const r = await api("GET", `/members/${enc(state.currentMember)}/trajectory`);
+    const r = await api("GET", `/members/${enc(state.currentMember)}/trajectory`, undefined,
+      { what: "Loading your trajectory", retry: () => ensureTrajectory() });
     if (token !== state.trajToken) return;  // member switched OR a scan invalidated mid-fetch → drop this stale result
     state.trajLoading = false;
     // sort once here at cache time (not on every paint, #12); flagged markers first, stable within tier.
