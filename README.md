@@ -15,7 +15,6 @@ The design in one sentence: **the LLM is a language layer over a deterministic a
 |---|---|
 | Anyone who wants to try it — nothing to install | [Using the app](#using-the-app) |
 | A developer running it on your own machine | [Run it locally](#run-it-locally) |
-| A developer deploying your own copy | [Deploy your own copy](#deploy-your-own-copy) |
 | A reviewer of the design | [How it works](#how-it-works) · [Evaluation](#evaluation) · [Failure modes](#failure-modes-walked) · [`architecture.md`](docs/architecture.md) |
 
 ---
@@ -32,7 +31,7 @@ Three things to know about how the deployment holds its data:
 - **Persistent.** That database lives on a persistent disk: everything survives page refreshes, browser restarts, service restarts, and redeploys. Nothing resets on its own — only **Reseed (factory)** restores the original state. (The one exception is conversation history, which deliberately lives only in your browser tab.)
 - **Safe to use concurrently.** Several people can use the app at the same time. Browsing, asking questions in both modes, scanning, uploading, and filing feedback from multiple browsers simultaneously is safe — concurrent requests queue against the database rather than corrupting it. The three heavyweight operations (**Run learn**, **Reset learning**, **Reseed**) additionally take a service-wide lock: if two users trigger one at the same moment, the second gets a 409 "already running" response and simply retries once the first finishes.
 
-One boundary to respect: concurrency is *safe*, but the app assumes a small, cooperative group — it is an operator tool, not a multi-tenant product with isolation. A destructive action like **Reseed** affects every user at once, which is why it demands the typed `delete` confirmation. How this is made safe under the hood is described in [Deploy your own copy](#deploy-your-own-copy).
+One boundary to respect: concurrency is *safe*, but the app assumes a small, cooperative group — it is an operator tool, not a multi-tenant product with isolation. A destructive action like **Reseed** affects every user at once, which is why it demands the typed `delete` confirmation. How this is made safe under the hood — one WAL-mode SQLite file, per-request connections, atomic transactions, and cross-process locks around the heavyweight operations — is described in [`architecture.md`](docs/architecture.md).
 
 ### The screen at a glance
 
@@ -177,70 +176,40 @@ Technical equivalents: the same ingest runs as a CLI (`uv run python -m preproce
 
 ## Run it locally
 
-Requires only [uv](https://docs.astral.sh/uv/), which manages the Python toolchain and dependencies — it installs the pinned Python version for you:
+The only tool you need is [uv](https://docs.astral.sh/uv/) — it installs the pinned Python version and every dependency for you. Three commands from zero to running:
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh   # or: brew install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh      # 1. install uv (or: brew install uv)
+git clone https://github.com/franalli/health-agent-lab.git && cd health-agent-lab/backend   # 2. clone
+make run                                             # 3. install deps + seed the DB + serve
 ```
 
-**1. Get a fresh Anthropic API key** — optional, but needed for Mode 2's LLM answers and for `make eval`:
+Then open **http://localhost:8000** — that's the whole setup. The first `make run` creates the database, seeds the 15 synthetic members, and scans them, so the page loads with findings already on screen. One process serves both the API and the UI (no Node, no second server, no CORS); the database persists between runs at `backend/data/health.db`; stop with `Ctrl-C`.
 
-- Create a key in the [Anthropic Console](https://console.anthropic.com/) → **API keys** → **Create Key**. Any fresh key works as-is; there is nothing to pre-configure — the app picks its own models.
-- You'll paste it into `backend/.env` in the next step. That file is git-ignored (and `gitleaks` checks every commit), so the key cannot leak into the repo.
-- Skipping this is fine: Mode 1 is fully functional without a key, and Mode 2 degrades to the same deterministic answers rather than erroring.
+**Optional — add an Anthropic API key** to unlock Mode 2's LLM-written answers and `make eval`. Without one the app still works: Mode 1 is fully functional, and Mode 2 falls back to the same deterministic answers instead of erroring.
 
-**2. Clone, configure, run:**
+1. Create a key in the [Anthropic Console](https://console.anthropic.com/) → **API keys** → **Create Key**. Any fresh key works as-is — nothing to pre-configure; the app picks its own models.
+2. Put it in `backend/.env` (from `backend/`, where you ran `make run`):
 
-```bash
-git clone https://github.com/franalli/health-agent-lab.git && cd health-agent-lab
-echo "ANTHROPIC_API_KEY=sk-ant-..." > backend/.env   # the key from step 1 — skip this line to run keyless
-cd backend && make hooks                              # install pre-commit hooks (ruff + gitleaks); once after clone
-make run                                              # uv-installs, builds + seeds the DB, serves on :8000
-```
+   ```bash
+   echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
+   ```
 
-**3. Open `http://localhost:8000`** — one process serves both the API and the UI; no Node, no second server, no CORS. The database is created and seeded with the 15 members automatically on first run, and persists between runs at `backend/data/health.db`. Stop the server with `Ctrl-C`.
+3. Restart `make run`. The `.env` file is git-ignored (and `gitleaks` checks every commit), so the key can't leak into the repo.
+
+**Optional — if you plan to commit changes:** run `make hooks` once to install the [pre-commit](https://pre-commit.com/) gate (`.pre-commit-config.yaml` at the repo root) — `ruff` lints and formats Python, `gitleaks` scans for secrets. `make lint` runs the same checks on demand.
 
 All `make` targets run from `backend/` (`make help` lists them):
 
 | Command | What it does |
 |---|---|
 | `make run` | Init + seed + serve on `:8000` with auto-reload (the dev command) |
-| `make serve` | Production-mode serve — no reload, binds `$PORT` or 8000 (the Render start command) |
+| `make serve` | Production-mode serve — no reload, two workers, binds `$PORT` or 8000 (what the hosted demo runs) |
 | `make test` | Unit tests |
 | `make lint` | `ruff` lint + format and a `gitleaks` secret scan over the whole tree |
 | `make eval` | Full evaluation harness → report in `backend/eval/reports/` (needs `ANTHROPIC_API_KEY`) |
 | `make eval-judge` | Feedback input-judge accuracy gate alone (SKIPs when the key is absent) |
 | `make init-db` / `make seed` | The individual steps `make run` wraps |
-
-**Code quality gates.** Commits are checked by [pre-commit](https://pre-commit.com/) (`.pre-commit-config.yaml` at the repo root): `ruff` lints and formats Python, and `gitleaks` scans for secrets. `make hooks` installs the git hook; `make lint` runs every check on demand.
-
-## Deploy your own copy
-
-A single [Render](https://render.com/) Web Service serves both the API and the static page same-origin, deployed straight from this repo via the committed **`render.yaml`** Blueprint. SQLite runs in development and production deliberately — one engine, so the evaluation harness certifies the stack that actually ships. The local one-command run stays primary.
-
-1. Push this repo to GitHub.
-2. Render → **New** → **Blueprint** → connect the repo; it reads `render.yaml` (a `web` service, `uv sync` build, `uvicorn api:app` on `$PORT`, health check `/health`).
-3. Set **`ANTHROPIC_API_KEY`** as a secret when prompted — create a fresh key in the [Anthropic Console](https://console.anthropic.com/) → **API keys**, same as for a local run (`render.yaml` marks the variable `sync: false`, so it lives only in the Render dashboard and is never committed). Mode 1 works without it; Mode 2 + the intent gate need it.
-4. **Create** → on first boot the app inits the schema, **seeds the 15 training members, and auto-scans them** (the build can't see the runtime filesystem, so all of it runs at startup — sub-second), so the first page load already shows findings. Hit `<url>/health`, then open `<url>/`.
-
-**The database is durable (the shipped default).** `render.yaml` sets `plan: starter` and mounts a 1 GB persistent disk at `/data`, with `HEALTH_DB_PATH=/data/health.db` pointing SQLite at it (~$8/mo). Uploaded members, feedback, and promoted prompts survive deploys and restarts, and the instance stays warm (no idle spin-down). The startup seed-if-empty still self-heals a fresh disk.
-
-Two footnotes:
-
-- The dataset *folders* `POST /members/upload` writes (the kept `eval_set.jsonl`/`lab_panels.csv`) live under the ephemeral app dir unless you also point `HEALTH_DATA_ROOT` at the disk — see the comment in `render.yaml`.
-- To run free/ephemeral instead: switch to `plan: free` and delete the `HEALTH_DB_PATH` env var + `disk` block. The SQLite file is then wiped on an idle spin-down and re-seeded automatically on the next cold start — uploads and feedback don't survive, a documented trade-off.
-
-**One database, two workers, many concurrent users.** The start command in `render.yaml` runs `uvicorn` with `--workers 2`: two server processes on the one instance, both reading and writing the **same WAL-mode SQLite file** on the persistent disk. That is the entire concurrency architecture — no separate database server — and it is what lets a single deployment serve several users at the same time:
-
-- Reads and `/ask` requests serialize safely under concurrent use: each request opens its own connection, and writes wait out contention with a 5-second busy-timeout instead of failing or corrupting.
-- The startup init+seed holds a cross-process lock, so exactly one worker seeds a fresh DB while the other waits and no-ops.
-- `/learn`, `/reset`, and Reseed share a cross-process learning-state lock — a conflicting call returns 409 (retry) rather than interleaving with a running multi-minute `/learn`.
-- Dataset ingest (the `.zip` upload / `POST /members`) and Reseed likewise share a cross-process dataset lock (409 on contention), and each member scan runs as one atomic transaction — so two workers can't interleave a bulk ingest with a factory wipe or clobber each other's scan findings.
-- Destructive operations (Reseed, dataset upload) are fully atomic transactions.
-
-The deliberate boundary: this supports a small cooperative group on one shared dataset, not multi-tenant isolation — out of scope per the brief. (This is the mechanism behind the plain-language [One database, many users](#one-database-many-users) section above.)
-
-Locally, `make serve` runs the exact production command — same `--workers 2` against your local DB — so the multi-worker setup can be rehearsed before deploying; `make run` stays the primary dev command (single process, auto-reload).
 
 ---
 
