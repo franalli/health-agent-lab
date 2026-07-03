@@ -596,26 +596,26 @@
     { group: "Data", label: "Reseed (factory)", verb: "POST", destructive: true, handler: reseed,
       tip: "POST /admin/reseed · Wipe all tables and re-ingest the original training_data members. Drops uploads and all learning/audit history — affects ALL current users of this instance. Double confirmation: a popup, then type \"delete\"." },
     { group: "Proactive", label: "Scan", verb: "POST", handler: scanAll,
-      tip: "POST /members/{id}/scan · Re-run the proactive drift scan across every member and summarise each result here, including how many NEW observations each scan found (0 on an unchanged re-run). Normally automatic (every ingest and every core feedback correction auto-scans) — this manual re-run is the retry after a failed auto-scan and the demo of the mechanism." },
+      tip: "POST /members/{id}/scan · Re-check every member's lab history for concerning changes and summarise each result here, including how many NEW observations each scan found (0 when nothing changed). Scans normally run automatically — after every data load and every flag-changing correction — so this button is the manual retry after a failed automatic scan, and a way to demonstrate the mechanism." },
     { group: "Proactive", label: "Member escalations", verb: "GET", handler: () => readoutRoute((m) => `/members/${enc(m)}/escalations`),
-      tip: "GET /members/{id}/escalations · The selected member's own escalation record across every lifecycle status (open · acknowledged · superseded — raw JSON), highest severity first (each item carries its severity), chronological within a tier — the drill-in detail, not the queue." },
+      tip: "GET /members/{id}/escalations · Every escalation ever raised for the selected member, in every lifecycle state (open · acknowledged · superseded), as raw JSON. Sorted most severe first, oldest first within a severity. This is the per-member detail view; the cross-member queue is the Clinician queue button." },
     // NOTE: the remaining per-member GET reads (observations · suggestions · trajectory) are intentionally NOT
     // surfaced as control-panel buttons — those endpoints still exist in the API and drive the member-facing
     // panels; only their operator-console buttons are hidden.
     // CLINICIAN — the human-in-the-loop surface: the global triage queue plus the per-finding corrections a
     // clinician files against it (read the queue, then act on a finding via feedback / a range override).
     { group: "Clinician", label: "Clinician queue", verb: "GET", handler: () => readoutRoute(() => `/escalations`),
-      tip: "GET /escalations · The global triage queue — every live escalation across all members, ranked highest severity first (each item carries its severity: urgent → clinician_review), un-acknowledged before acknowledged within a tier, then newest (raw JSON). An escalation_accept marks its target status:'acknowledged' — still listed, visibly triaged. No member need be selected." },
+      tip: "GET /escalations · The triage queue: every live escalation across ALL members, as raw JSON. Sorted most severe first (urgent, then clinician_review), un-acknowledged before acknowledged within a severity, then newest. Accepting an escalation via feedback (escalation_accept) marks it 'acknowledged' — it stays listed, visibly triaged. Works with no member selected." },
     { group: "Clinician", label: "Submit feedback", verb: "POST", handler: feedbackForm,
-      tip: "POST /members/{id}/feedback · Record a correction (range_override · suppress_marker · preference) or a signal (helpful · incorrect · escalation_accept|reject) on the selected member. A core correction auto-scans the member on submit, so Observations/escalations reflect it at once (and it re-resolves into every later scan/ask); only LEARNABLE signals (incorrect, recurring escalation_reject) feed Run learn — helpful/escalation_accept are advisory." },
+      tip: "POST /members/{id}/feedback · Record feedback on the selected member: either a correction that changes what gets flagged (range_override · suppress_marker · preference) or a signal about a past answer or escalation (helpful · incorrect · escalation_accept|reject). A range/suppress correction re-scans the member on submit, so Observations and escalations update at once. Only incorrect and repeated escalation_reject feed Run learn; helpful and escalation_accept are recorded for audit only." },
     { group: "Clinician", label: "Member feedback", verb: "GET", handler: () => readoutRoute((m) => `/members/${enc(m)}/feedback`),
-      tip: "GET /members/{id}/feedback · The selected member's full submitted-feedback trail, newest-first (raw JSON) — corrections and signals with their payloads (incl. each escalation_reject's reason). active:false rows are the /reset-deactivated audit history, kept, never deleted." },
+      tip: "GET /members/{id}/feedback · Everything ever submitted as feedback for the selected member, newest first (raw JSON) — each correction and signal with its details, including the reason given for any escalation_reject. Rows marked active:false were switched off by Reset learning; they are kept as audit history, never deleted." },
     { group: "Learning", label: "Run learn", verb: "POST", handler: runLearn,
-      tip: "POST /learn · Assemble a candidate composer prompt from the LEARNABLE feedback (incorrect → few-shot exemplar, recurring escalation_reject → tone clause) and gate it through the eval harness's critical composer subset (10 cases — only the surface a composer prompt can move; make eval still runs the full set); promote only if nothing regresses. No-ops if no learnable feedback is pending. Needs ANTHROPIC_API_KEY; can take a minute." },
+      tip: "POST /learn · Build an improved LLM prompt from the pending feedback: a corrected answer (incorrect) becomes a worked example, and repeated false-alarm reports (escalation_reject) soften the tone. The candidate prompt is then tested against 10 critical evaluation cases and adopted only if nothing gets worse — otherwise it is rejected. Does nothing if no usable feedback is pending. Needs ANTHROPIC_API_KEY; can take a minute." },
     { group: "Learning", label: "Prompt history", verb: "GET", handler: () => readoutRoute(() => `/prompts`),
-      tip: "GET /prompts · The composer-prompt version history, newest first (raw JSON). Prompts are LEARNT from feedback and VALIDATED by /learn: learnable feedback (incorrect → few-shot exemplar, recurring escalation_reject → tone clause) is folded into a candidate prompt, gated through the eval harness, and promoted only if nothing regresses — status records each verdict (promoted · rejected · reverted by Reset learning), `active` marks the version the composer serves now, v0 is the seeded baseline. No member need be selected." },
+      tip: "GET /prompts · The version history of the LLM's prompt (the standing instructions it answers with), newest first (raw JSON). Each Run learn produces one version, built from feedback and tested before adoption — status records the verdict (promoted · rejected · reverted by Reset learning), `active` marks the version in use right now, and v0 is the original baseline. Works with no member selected." },
     { group: "Learning", label: "Reset learning", verb: "POST", destructive: true, handler: resetLearning,
-      tip: "POST /reset · Deactivate all feedback overrides and revert the composer prompt to v0. Not a data wipe. Asks for confirmation before firing." },
+      tip: "POST /reset · Switch off all feedback corrections and return the LLM prompt to the original v0. Not a data wipe. Asks for confirmation before firing." },
     // NOTE: the GET /health liveness route is intentionally NOT surfaced as a control-panel button (it's the
     // deploy health check, not an operator action). The endpoint still exists in the API; only the UI hides it.
   ];
@@ -1251,7 +1251,7 @@
 
   // ---- Phase 7 control-panel handlers (Clinician feedback · Learning) ----------------------------
   async function runLearn() {
-    renderReadout("Running /learn — rule-assembling a candidate prompt and gating it through the eval harness. This calls the real LLM and can take a minute…");
+    renderReadout("Running /learn — building a candidate LLM prompt from the pending feedback and testing it against the evaluation cases. This calls the real LLM and can take a minute…");
     const r = await api("POST", "/learn", undefined, { what: "Learn run" });
     renderReadout(r.data);  // {version, status, reason, report} — or a 409/503 detail (banner explains those)
   }
@@ -1263,17 +1263,17 @@
   // payload are assembled deterministically, never free-form, so the POST can't no-op on a typo'd key.
   const FEEDBACK_KINDS = [
     { kind: "range_override", group: "Correction", target: "marker", payload: "range",
-      hint: "Re-bound a marker. Set ref_low and/or ref_high (one-sided OK). Auto-scans on submit, so the flag change lands at once." },
+      hint: "Replace a marker's reference range. Set ref_low and/or ref_high (one side is enough). The member is re-scanned on submit, so any flag change lands at once." },
     { kind: "suppress_marker", group: "Correction", target: "marker", payload: "none",
-      hint: "Drop a marker entirely so the core never analyzes it. Inert against a panic floor (db.py). Auto-scans on submit." },
+      hint: "Hide a marker from analysis entirely so it is never flagged. Exception: a marker at a panic-level value stays visible — suppression can never silence a safety alert. Re-scans on submit." },
     { kind: "preference", group: "Correction", target: "none", payload: "text",
-      hint: "A composer tone hint joined to the Mode-2 prompt — never a number or the escalation floor." },
-    { kind: "helpful", group: "Signal", target: "finding", payload: "none", hint: "Positive signal on a finding. Advisory — recorded for audit; changes no prompt and does NOT feed /learn." },
+      hint: "A tone/style preference the LLM follows when writing chat answers — it can never change a number, a flag, or an escalation decision." },
+    { kind: "helpful", group: "Signal", target: "finding", payload: "none", hint: "Mark a finding as helpful. Recorded for audit only — it changes nothing and does NOT feed Run learn." },
     { kind: "incorrect", group: "Signal", target: "answer", payload: "correction",
-      hint: "Correct a prior answer: pick the answered question, type the right answer. /learn folds {question, corrected_answer} in as a few-shot exemplar for the composer (architecture §58)." },
-    { kind: "escalation_accept", group: "Signal", target: "finding", payload: "none", hint: "Confirm an escalation was warranted — the queue marks it acknowledged (kept listed, visibly triaged; Reset learning reverts). Advisory for learning: changes no prompt and does NOT feed /learn." },
+      hint: "Correct a prior answer: pick the answered question and type the right answer. Run learn then uses the pair as a worked example that teaches the LLM how such questions should be answered." },
+    { kind: "escalation_accept", group: "Signal", target: "finding", payload: "none", hint: "Confirm an escalation was warranted — the queue marks it acknowledged (kept listed, visibly triaged; Reset learning reverts). Recorded for audit only: it does not change the LLM and does NOT feed Run learn." },
     { kind: "escalation_reject", group: "Signal", target: "finding", payload: "reason",
-      hint: "Mark an escalation as a false alarm and say why — the reason is stored on the audit trail (it never enters the composer prompt). Learnable: once it recurs, /learn toggles a softer-tone clause into the composer prompt." },
+      hint: "Mark an escalation as a false alarm and say why — the reason is kept on the audit trail (it is never shown to the LLM). If false alarms recur, Run learn adds a softer-tone instruction to the LLM prompt." },
   ];
 
   async function feedbackForm() {
@@ -1549,7 +1549,7 @@
   function resetLearning() {
     confirmDestructive({
       title: "Reset all learning?",
-      body: "Deactivates every feedback override and reverts the composer prompt to v0. Not a data wipe — feedback rows and prompt-version history are preserved — but it cannot be undone from the UI.",
+      body: "Switches off every feedback correction and returns the LLM prompt to the original v0. Not a data wipe — feedback rows and prompt-version history are preserved — but it cannot be undone from the UI.",
       confirmLabel: "Reset learning",
       run: doResetLearning,
     });
