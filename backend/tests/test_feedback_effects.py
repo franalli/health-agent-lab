@@ -69,7 +69,7 @@ def _oid(mid, marker, dv):
 
 
 def _scan_ids(mid):
-    return {o.observation_id for o in pipeline.scan(_CON, mid)}
+    return {o.observation_id for o in pipeline.scan(_CON, mid).observations}
 
 
 def _fb(mid, **kw):

@@ -33,6 +33,7 @@ from health_intelligence.models import (
     HealthIntelligenceResponse,
     MemberBundle,
     Observation,
+    ScanResult,
     SuggestedPrompt,
 )
 from preprocessing.datasets import DEFAULT_DATASET, remove_uploaded_datasets
@@ -108,8 +109,12 @@ async def lifespan(app: FastAPI):
                 # failures, and this envelope keeps a systemic scan bug from blocking serving (the
                 # deterministic spine still answers; observations lag until a manual scan).
                 try:
-                    scanned = pipeline.scan_members(con, outcome["member_ids"])
-                    logger.info("startup: auto-scanned %d seeded members", scanned)
+                    sweep = pipeline.scan_members(con, outcome["member_ids"])
+                    logger.info(
+                        "startup: auto-scanned %d seeded members (%d new observations)",
+                        sweep.scanned,
+                        sweep.new_observations,
+                    )
                 except Exception:
                     logger.exception(
                         "startup auto-scan failed; observations lag until a manual scan"
@@ -232,8 +237,12 @@ def upload_dataset(
 
     # Auto-scan the just-ingested members so their stored Observations match their live Trajectory the
     # moment the data source lands (best-effort, in the library; startup seed + reseed do the same).
-    scanned = pipeline.scan_members(con, result["member_ids"])
-    return {**result, "scanned": scanned}
+    sweep = pipeline.scan_members(con, result["member_ids"])
+    return {
+        **result,
+        "scanned": sweep.scanned,
+        "new_observations": sweep.new_observations,
+    }
 
 
 @app.delete("/members/{member_id}")
@@ -247,11 +256,11 @@ def delete_member(
     return {"deleted": True}
 
 
-@app.post("/members/{member_id}/scan", response_model=list[Observation])
-def post_scan(
-    member_id: str, con: sqlite3.Connection = Depends(get_con)
-) -> list[Observation]:
-    """Run the proactive scan now; returns the member's current observations (ranked by severity)."""
+@app.post("/members/{member_id}/scan", response_model=ScanResult)
+def post_scan(member_id: str, con: sqlite3.Connection = Depends(get_con)) -> ScanResult:
+    """Run the proactive scan now; returns ``{observations, new_observations}`` — the member's current
+    observations (ranked by severity) plus how many of them this run newly persisted (0 on an
+    idempotent re-scan; see ``models.ScanResult`` for the exact newness semantics)."""
     try:
         return pipeline.scan(con, member_id)
     except KeyError:
@@ -386,7 +395,7 @@ def post_feedback(
     rescanned = False
     if classification["channel"] == "core":
         try:
-            rescanned = pipeline.scan_members(con, [member_id]) == 1
+            rescanned = pipeline.scan_members(con, [member_id]).scanned == 1
         except Exception:
             logger.exception(
                 "post_feedback: auto-scan failed for member %s; observations lag until a manual scan",
@@ -426,10 +435,16 @@ def post_reset(con: sqlite3.Connection = Depends(get_con)) -> dict:
     scan). Best-effort like the upload auto-scan: a member's scan failing is logged, not fatal to the reset."""
     affected = db.members_with_active_overrides(con)  # BEFORE reset clears them
     counts = db.reset_learning(con)
-    rescanned = pipeline.scan_members(
+    sweep = pipeline.scan_members(
         con, affected
     )  # re-open / restore the reverted artifacts
-    return {"learning_reset": True, "rescanned": rescanned, **counts}
+    # new_observations counts the restored rows (a pruned observation returning on the revert re-scan).
+    return {
+        "learning_reset": True,
+        "rescanned": sweep.scanned,
+        "new_observations": sweep.new_observations,
+        **counts,
+    }
 
 
 @app.post("/learn")
@@ -488,10 +503,11 @@ def post_reseed(con: sqlite3.Connection = Depends(get_con)) -> dict:
     # removed their MEMBERS, not their folders. AFTER the transaction commits (a filesystem op is not part
     # of it), and best-effort (never fails the reseed) — same after-commit, non-fatal contract as the scan.
     datasets_removed = remove_uploaded_datasets()
-    scanned = pipeline.scan_members(con, summary["member_ids"])
+    sweep = pipeline.scan_members(con, summary["member_ids"])
     return {
         "reseeded": True,
-        "scanned": scanned,
+        "scanned": sweep.scanned,
+        "new_observations": sweep.new_observations,
         "datasets_removed": datasets_removed,
         **summary,
     }

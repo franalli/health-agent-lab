@@ -119,6 +119,18 @@ def test_global_escalations_queue_empty_before_any_scan(client):
     assert r.status_code == 200 and r.json() == []
 
 
+def test_scan_route_returns_envelope_with_new_observation_count(client):
+    """POST /scan serves the ScanResult envelope: the observations projection plus how many rows this
+    run newly persisted — the count the operator panel's scan-all readout sums. First scan: all new;
+    idempotent re-scan: 0 (rows refresh in place)."""
+    r = client.post("/members/C07/scan")
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"observations", "new_observations"}
+    assert body["new_observations"] == len(body["observations"]) > 0
+    assert client.post("/members/C07/scan").json()["new_observations"] == 0
+
+
 def test_per_member_escalations_is_the_drill_in_not_the_queue(client):
     """The per-member route is the drill-in: it returns ONLY that member's escalations, so it can't
     serve as the queue. C07 scanned (urgent), C01 not -> C07's drill-in has its row, C01's is empty,
@@ -293,6 +305,8 @@ def test_upload_auto_scans_new_members(upload_client):
     assert r.json()["scanned"] == 1
     obs = upload_client.get("/members/S01/observations").json()
     assert len(obs) >= 1  # auto-scan produced + stored the out-of-range observation
+    # the sweep's newly-persisted total rides the upload response (a fresh member: all rows are new)
+    assert r.json()["new_observations"] == len(obs)
     hba1c = next(o for o in obs if o["title"].startswith("HbA1c"))
     # the member-facing field rides the wire, states the numeric range, and leaks no clinician stats
     assert "above the normal range" in hba1c["member_explanation"]
@@ -1189,7 +1203,9 @@ def test_post_feedback_non_core_kinds_skip_the_auto_scan(client, monkeypatch):
     # kinds (learn/advisory) must not pay for — or imply — a rescan. Spy on the seam the route calls.
     calls = []
     monkeypatch.setattr(
-        api.pipeline, "scan_members", lambda con, ids: calls.append(list(ids)) or 1
+        api.pipeline,
+        "scan_members",
+        lambda con, ids: calls.append(list(ids)) or api.pipeline.ScanSweep(1, 0),
     )
     for body in (
         {
@@ -1326,6 +1342,9 @@ def test_reseed_restores_initial_members_and_drops_holdouts(client):
     r = client.post("/admin/reseed")
     assert r.status_code == 200 and r.json()["reseeded"] is True
     assert r.json()["scanned"] == 15  # every ingest path auto-scans what it loaded
+    assert (
+        r.json()["new_observations"] > 0
+    )  # the truncate emptied observations, so the reseed sweep re-creates them all as new
     ids = [m["member_id"] for m in client.get("/members").json()]
     assert "C01" in ids  # the deleted seeded member is back
     assert "T99" not in ids  # the uploaded holdout is dropped

@@ -678,9 +678,11 @@ def write_interaction(
     return m.response_id
 
 
-def write_observation(con: sqlite3.Connection, obs: Observation) -> None:
+def write_observation(con: sqlite3.Connection, obs: Observation) -> bool:
     """Write one observation as an OVERWRITE-on-conflict (UPSERT) on its deterministic
-    (data_version-keyed) ``observation_id``. This is the observation set's *replace* discipline
+    (data_version-keyed) ``observation_id``; return ``True`` iff the row was NEWLY created (its id was
+    not in the table before this write — the signal ``pipeline.scan`` aggregates into the
+    ``new_observations`` count). This is the observation set's *replace* discipline
     (architecture §48): a re-scan at the same ``data_version`` refreshes the derived projection
     (severity/title/trigger_reason/response_id) **in place** rather than keeping the
     first write — so a
@@ -695,7 +697,19 @@ def write_observation(con: sqlite3.Connection, obs: Observation) -> None:
     for audit/escalation-reference but are never shown. In-version refresh here + version-scoped read =
     the §48 "replace the set" semantics. Distinct from ``write_interaction``, which stays keep-first
     ``INSERT OR IGNORE`` (an append-only audit row, not a refreshable projection). Does NOT commit — the
-    scan's transaction owns it."""
+    scan's transaction owns it.
+
+    The created-check is a SELECT-then-UPSERT rather than a rowcount read because SQLite reports 1
+    changed row for BOTH arms of ``ON CONFLICT DO UPDATE`` — insert and overwrite are indistinguishable
+    after the fact. Safe un-atomically: writes serialize on the single connection inside the scan's
+    transaction."""
+    created = (
+        con.execute(
+            "SELECT 1 FROM observations WHERE observation_id = ?",
+            (obs.observation_id,),
+        ).fetchone()
+        is None
+    )
     con.execute(
         "INSERT INTO observations "
         "(observation_id, member_id, response_id, severity, title, trigger_reason, data_version) "
@@ -713,6 +727,7 @@ def write_observation(con: sqlite3.Connection, obs: Observation) -> None:
             obs.data_version,
         ),
     )
+    return created
 
 
 def prune_observations(

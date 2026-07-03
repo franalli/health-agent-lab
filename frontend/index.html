@@ -551,7 +551,7 @@
     { group: "Data", label: "Reseed (factory)", verb: "POST", destructive: true, handler: reseed,
       tip: "POST /admin/reseed · Wipe all tables and re-ingest the original training_data members. Drops uploads and all learning/audit history. Asks for confirmation before firing." },
     { group: "Proactive", label: "Scan", verb: "POST", handler: scanAll,
-      tip: "POST /members/{id}/scan · Re-run the proactive drift scan across every member and summarise each result here. Normally automatic (every ingest and every core feedback correction auto-scans) — this manual re-run is the retry after a failed auto-scan and the demo of the mechanism." },
+      tip: "POST /members/{id}/scan · Re-run the proactive drift scan across every member and summarise each result here, including how many NEW observations each scan found (0 on an unchanged re-run). Normally automatic (every ingest and every core feedback correction auto-scans) — this manual re-run is the retry after a failed auto-scan and the demo of the mechanism." },
     { group: "Proactive", label: "Member escalations", verb: "GET", handler: () => readoutRoute((m) => `/members/${enc(m)}/escalations`),
       tip: "GET /members/{id}/escalations · The selected member's own escalation record (raw JSON) — the drill-in detail, not the queue." },
     // NOTE: the remaining per-member GET reads (observations · suggestions · trajectory) are intentionally NOT
@@ -898,6 +898,9 @@
   // Operator "Scan all": fire the existing per-member scan route for every member in turn (the panel
   // adds no new route — it only drives ones the API already exposes), then summarise per-member in the
   // readout. The on-screen member's panel + escalation flag are refreshed from its own fresh scan.
+  // POST /scan serves a {observations, new_observations} envelope: `new_observations` is how many rows
+  // that run newly persisted (0 on an idempotent re-scan), summed here so the readout answers "did this
+  // scan actually find anything new?" at a glance.
   async function scanAll() {
     const members = state.members;
     if (!members.length) return renderReadout({ error: "No members to scan." });
@@ -905,9 +908,10 @@
     const results = [];
     for (const m of members) {
       const r = await api("POST", `/members/${enc(m.member_id)}/scan`);
-      results.push(r.ok ? { member_id: m.member_id, observations: r.data.length }
+      results.push(r.ok ? { member_id: m.member_id, observations: r.data.observations.length,
+                            new_observations: r.data.new_observations }
                         : { member_id: m.member_id, error: r.status });
-      if (r.ok && m.member_id === state.currentMember) { state.observations = r.data; renderObservations(); invalidateTrajectory(); }
+      if (r.ok && m.member_id === state.currentMember) { state.observations = r.data.observations; renderObservations(); invalidateTrajectory(); }
     }
     // Refresh BOTH the escalation queue AND the Mode-1 chips/answers for the on-screen member: /suggestions
     // is a LIVE re-analyze (already reflects overrides), it was just never re-fetched after a scan — so
@@ -915,7 +919,8 @@
     if (state.currentMember)
       await Promise.all([refreshEscalations(state.currentMember), refreshSuggestions(state.currentMember)]);
     const failed = results.filter((x) => x.error != null).length;
-    renderReadout({ scanned: results.length, failed, results });
+    const newObservations = results.reduce((n, x) => n + (x.new_observations || 0), 0);
+    renderReadout({ scanned: results.length, failed, new_observations: newObservations, results });
   }
 
   async function refreshEscalations(id) {

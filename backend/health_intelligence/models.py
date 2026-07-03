@@ -411,6 +411,20 @@ class Observation(BaseModel):
     data_version: str
 
 
+class ScanResult(BaseModel):
+    """The ``POST /members/{id}/scan`` envelope: the member's current observations (the same ranked,
+    ``member_explanation``-filled projection ``GET /observations`` serves) plus ``new_observations`` —
+    how many of this scan's rows were NEWLY persisted (their ``observation_id`` did not exist before
+    the write). "New" is ROW-identity newness on the deterministic ``(member, marker, data_version)``
+    id, not marker-lifetime newness (the row carries no marker column to key on): an idempotent re-scan
+    of unchanged data reports 0; a re-scan after a ``/feedback`` override counts exactly the newly
+    re-raised markers (overrides don't bump ``data_version``); a genuine data change mints new ids, so
+    re-confirmed findings count as new against the new data."""
+
+    observations: list[Observation]
+    new_observations: int
+
+
 class Escalation(BaseModel):
     """A clinician-review-queue artifact (read projection). ``observation_id`` is set for data findings,
     ``interaction_id`` for chat; ``dedup_key`` is the UNIQUE idempotency key that makes 'fire once' a

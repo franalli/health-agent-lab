@@ -1083,8 +1083,11 @@ def main(argv: list[str] | None = None) -> None:
         # skips a failing member), so a scan problem can never fail the seed it rides on.
         from health_intelligence import pipeline
 
-        scanned = pipeline.scan_members(con, summary["member_ids"])
-        print(f"scanned {scanned} members (observations up to date)")
+        sweep = pipeline.scan_members(con, summary["member_ids"])
+        print(
+            f"scanned {sweep.scanned} members "
+            f"({sweep.new_observations} new observations; observations up to date)"
+        )
         if args.verify:
             _verify(con)
     finally:

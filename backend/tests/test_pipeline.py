@@ -237,7 +237,9 @@ def test_scan_emits_ranked_finding_and_persists_one_interaction_each():
             ],
         ),
     )
-    obs = pipeline.scan(con, "M2")
+    result = pipeline.scan(con, "M2")
+    obs = result.observations
+    assert result.new_observations == len(obs)  # first scan: every persisted row is new
     assert [o.severity for o in obs] == sorted(
         (o.severity for o in obs), key=lambda s: -SEVERITY_ORDER[s]
     )
@@ -610,9 +612,9 @@ def test_scan_with_no_signal_writes_nothing():
             ],
         ),
     )
-    obs = pipeline.scan(con, "M3")
+    result = pipeline.scan(con, "M3")
     # per-finding: no raised marker -> no findings -> no interactions/observations/escalations
-    assert obs == []
+    assert result.observations == [] and result.new_observations == 0
     assert db.get_escalations(con, "M3") == []
     assert (
         con.execute(
@@ -628,7 +630,9 @@ def test_scan_with_no_signal_writes_nothing():
 def test_c07_potassium_forces_urgent_and_writes_exactly_one_escalation_idempotently():
     con = _con()
     ingest_dataset(con)
-    obs = pipeline.scan(con, "C07")
+    result = pipeline.scan(con, "C07")
+    obs = result.observations
+    assert result.new_observations == len(obs) > 0  # first scan: all rows newly created
     esc = db.get_escalations(con, "C07")
     assert any(o.severity == "urgent" and o.title.startswith("Potassium") for o in obs)
     assert len(esc) == 1
@@ -643,7 +647,10 @@ def test_c07_potassium_forces_urgent_and_writes_exactly_one_escalation_idempoten
     ).fetchone()[0]
 
     # a re-scan over identical data is idempotent: no new observation, interaction, or escalation rows
-    pipeline.scan(con, "C07")
+    rescan = pipeline.scan(con, "C07")
+    assert (
+        rescan.new_observations == 0
+    )  # every row refreshed in place, none newly created
     assert (
         con.execute(
             "SELECT COUNT(*) FROM observations WHERE member_id='C07'"
@@ -668,7 +675,7 @@ def test_rescan_overwrites_stale_observation_narration_without_fk_failure():
     # delete-then-insert breaks.
     con = _con()
     ingest_dataset(con)
-    obs = pipeline.scan(con, "C07")
+    obs = pipeline.scan(con, "C07").observations
     pot = next(o for o in obs if o.title.startswith("Potassium"))
 
     # simulate stale narration persisted by an earlier templating version (member_explanation is no
@@ -681,7 +688,7 @@ def test_rescan_overwrites_stale_observation_narration_without_fk_failure():
 
     # re-scan over identical data (same data_version → same observation_id, still escalation-referenced):
     # must not FK-fail, must restore current narration, must keep exactly one row for the marker.
-    refreshed = pipeline.scan(con, "C07")
+    refreshed = pipeline.scan(con, "C07").observations
     pot2 = next(o for o in refreshed if o.observation_id == pot.observation_id)
     assert pot2.title == pot.title != "STALE"  # overwrite, not keep-first
     assert pot2.trigger_reason == pot.trigger_reason != "STALE"
@@ -759,9 +766,45 @@ def test_scan_return_carries_member_explanation_like_the_read_projection():
             ],
         ),
     )  # 5.5 > 5.1 -> above range -> raised
-    scanned = pipeline.scan(con, "MS")
+    scanned = pipeline.scan(con, "MS").observations
     assert scanned and all(o.member_explanation for o in scanned)
     assert scanned == pipeline.observations(con, "MS")
+
+
+def test_scan_new_observations_counts_only_newly_persisted_rows():
+    """``new_observations`` is the "found N new" readout signal: the first scan counts every persisted
+    row, an idempotent re-scan counts 0 (rows refresh in place, §48), and a row re-created after its
+    prior row is gone (the override->prune->re-raise shape, same data_version) counts exactly itself —
+    ROW-identity newness on the deterministic observation_id, per models.ScanResult."""
+    con = _con()
+    ingest_bundle(
+        con,
+        _bundle(
+            "MN",
+            [
+                _panel(
+                    "MN-P1",
+                    "2024-01-15",
+                    [
+                        _r("Potassium", 5.5, "mmol/L", "3.5-5.1"),
+                        _r("LDL cholesterol", 180.0, "mg/dL", "0-100"),
+                    ],
+                )
+            ],
+        ),
+    )  # both above range, neither at panic -> two notable findings, no escalation pins
+    first = pipeline.scan(con, "MN")
+    assert first.new_observations == len(first.observations) == 2
+    assert pipeline.scan(con, "MN").new_observations == 0  # idempotent re-scan
+
+    # Drop one row out-of-band (stands in for the override→prune path; neither row is
+    # escalation-pinned here): the next scan re-creates exactly that row and counts exactly it.
+    with con:
+        con.execute(
+            "DELETE FROM observations WHERE observation_id=?",
+            (first.observations[0].observation_id,),
+        )
+    assert pipeline.scan(con, "MN").new_observations == 1
 
 
 def test_c02_negative_control_raises_no_escalation():
@@ -784,7 +827,8 @@ def test_genuine_data_change_supersedes_the_prior_observation_set():
     ingest_bundle(con, _bundle("M5", base))
     pipeline.scan(con, "M5")
     assert (
-        pipeline.scan(con, "M5") == [] or db.get_observations(con, "M5") == []
+        pipeline.scan(con, "M5").observations == []
+        or db.get_observations(con, "M5") == []
     )  # calm at baseline
 
     panic = base + [
@@ -793,7 +837,11 @@ def test_genuine_data_change_supersedes_the_prior_observation_set():
     ingest_bundle(
         con, _bundle("M5", panic)
     )  # data_version AND analysis_version both move
-    obs = pipeline.scan(con, "M5")
+    result = pipeline.scan(con, "M5")
+    obs = result.observations
+    assert (
+        result.new_observations == len(obs) > 0
+    )  # new data_version -> new ids -> counted new
 
     # the version-scoped read returns ONLY the new set — prior-version rows are hidden, not accumulated
     assert all(o.severity == "urgent" for o in obs) and obs

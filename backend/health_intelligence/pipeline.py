@@ -30,6 +30,7 @@ import sqlite3
 import time
 from datetime import UTC, date, datetime
 from statistics import median
+from typing import NamedTuple
 
 from health_intelligence import db, gate, llm, safety, templates
 
@@ -55,6 +56,7 @@ from health_intelligence.models import (
     Observation,
     ReferenceRange,
     ResponseMetadata,
+    ScanResult,
     SuggestedPrompt,
     TrajectoryAnalysis,
 )
@@ -106,9 +108,11 @@ def _det_metadata(response_id: str, data_version: str) -> ResponseMetadata:
     )
 
 
-def scan(con: sqlite3.Connection, member_id: str) -> list[Observation]:
-    """Run the proactive scan for one member and persist its artifacts; return the current observations
-    (ranked by severity). Raises ``KeyError`` if the member is absent.
+def scan(con: sqlite3.Connection, member_id: str) -> ScanResult:
+    """Run the proactive scan for one member and persist its artifacts; return a :class:`ScanResult` —
+    the current observations (ranked by severity) plus ``new_observations``, how many of them this run
+    NEWLY persisted (``db.write_observation``'s created signal; see ``ScanResult`` for the exact
+    newness semantics — 0 on an idempotent re-scan). Raises ``KeyError`` if the member is absent.
 
     Each raised marker becomes one finding persisted as its own ``interactions`` row (architecture §48),
     keyed by a deterministic data_version-scoped ``response_id`` so an identical re-scan is a no-op and a
@@ -132,6 +136,7 @@ def scan(con: sqlite3.Connection, member_id: str) -> list[Observation]:
     live_esc_ids: set[str] = (
         set()
     )  # the escalation rows this scan (re-)emitted — the live findings the reconcile keeps 'open'
+    new_count = 0  # rows write_observation newly created (vs refreshed in place) — the ScanResult count
     with con:  # atomic: interaction + observation + escalation per finding commit (or roll back) together
         for traj in raised:
             response_id = db._det_id("scan:", member_id, traj.marker, data_version)
@@ -156,7 +161,7 @@ def scan(con: sqlite3.Connection, member_id: str) -> list[Observation]:
             db.write_interaction(
                 con, resp, member_id=member_id, driver="scan", question=None
             )
-            db.write_observation(
+            new_count += db.write_observation(
                 con,
                 Observation(
                     observation_id=obs_id,
@@ -217,7 +222,10 @@ def scan(con: sqlite3.Connection, member_id: str) -> list[Observation]:
     # Return the same read projection GET /observations serves (member_explanation derived at read),
     # so a client that renders the scan response directly gets the member-facing prose too — the raw
     # stored rows carry only trigger_reason, and an empty member_explanation renders as a blank card.
-    return observations(con, member_id)
+    # Wrapped with the run's newly-created count (the UI's "found N new" signal; 0 on a re-scan).
+    return ScanResult(
+        observations=observations(con, member_id), new_observations=new_count
+    )
 
 
 def observations(con: sqlite3.Connection, member_id: str) -> list[Observation]:
@@ -271,21 +279,33 @@ def observations(con: sqlite3.Connection, member_id: str) -> list[Observation]:
     ]
 
 
-def scan_members(con: sqlite3.Connection, member_ids: list[str]) -> int:
-    """Scan several members BEST-EFFORT; return how many scanned cleanly. The orchestration behind the
+class ScanSweep(NamedTuple):
+    """``scan_members``' aggregate: how many members scanned cleanly, and how many observation rows the
+    sweep NEWLY persisted across all of them (the sum of each member's ``ScanResult.new_observations`` —
+    same row-identity newness semantics; a failed member contributes to neither count)."""
+
+    scanned: int
+    new_observations: int
+
+
+def scan_members(con: sqlite3.Connection, member_ids: list[str]) -> ScanSweep:
+    """Scan several members BEST-EFFORT; return a :class:`ScanSweep` — how many scanned cleanly plus how
+    many observation rows the sweep newly persisted (the count the ingest-path responses surface, so an
+    upload/reseed readout answers "did the sweep find anything new?"). The orchestration behind the
     auto-scan after ``POST /members/upload`` (so a freshly uploaded member's Observations match its live
     Trajectory at once) — kept in the library, not the route, per "logic lives in pipeline, routes stay
     thin". Best-effort by design: the upload's ingest has already committed, so one member's scan failing
     must not fail the others or the request — it's logged and skipped. (The natural home, too, for a
     future server-side 'scan all'.)"""
     scanned = 0
+    new_observations = 0
     for member_id in member_ids:
         try:
-            scan(con, member_id)
+            new_observations += scan(con, member_id).new_observations
             scanned += 1
         except Exception:
             logging.exception("scan_members: scan failed for member %s", member_id)
-    return scanned
+    return ScanSweep(scanned=scanned, new_observations=new_observations)
 
 
 def suggestions(

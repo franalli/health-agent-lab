@@ -253,7 +253,7 @@ def test_count_active_corrections_excludes_signals():
 
 
 def _scan_titles(con, member_id):
-    return [o.title for o in pipeline.scan(con, member_id)]
+    return [o.title for o in pipeline.scan(con, member_id).observations]
 
 
 def test_override_clearing_a_flag_prunes_the_observation_on_rescan():
