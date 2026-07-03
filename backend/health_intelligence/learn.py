@@ -348,6 +348,61 @@ def validate_feedback(
     )
 
 
+def classify_feedback(fb: Feedback) -> dict[str, str]:
+    """Which channel a submitted feedback feeds — the authoritative classification the ``POST /feedback``
+    response returns so the operator UI states each kind's effect correctly (never "feeds /learn" for a kind
+    that cannot). ``channel`` is one of ``core`` (deterministic inputs, via ``resolve_overrides``),
+    ``composer`` (runtime Mode-2 tone, via ``get_active_preferences``), ``learn`` (the promoted composer
+    prompt), or ``advisory`` (recorded for audit only). ``channel == "learn"`` IS "this can change the
+    composer prompt", so no separate ``learnable`` flag is stored (it would be redundant, derivable state).
+
+    ``effect`` is the self-contained sentence the UI shows; for a ``learn`` kind it carries the RIGHT
+    call-to-action — an ``incorrect`` (with both halves) is IMMEDIATELY foldable (press Run learn now),
+    whereas an ``escalation_reject`` only toggles its clause once it RECURS, so its effect states that
+    condition rather than a premature "press Run learn" the first submission wouldn't honor.
+
+    Learnability derives from the SAME primitives ``assemble_candidate`` folds on — ``_exemplar_halves`` for
+    ``incorrect`` and membership in ``_TOGGLE_CLAUSES`` for a recurring-toggle kind — so the TOGGLE-kind axis
+    cannot drift from the assembler when a clause is added. The one gap the shared primitives don't close:
+    ``assemble_candidate`` ALSO drops an oversized exemplar (``_screen_length``) while this checks only
+    halves-present, so they agree for ``incorrect`` by a SUBMISSION-ORDERING invariant, not derivation —
+    ``validate_feedback`` 422s an oversized ``incorrect`` before it can be stored, so such a row never
+    reaches here (a direct DB insert bypassing the route is the only way to diverge)."""
+    kind = fb.kind
+    if kind in ("range_override", "suppress_marker"):
+        return {
+            "channel": "core",
+            "effect": "Changes what the core flags on every scan/ask — not the composer prompt.",
+        }
+    if kind == "preference":
+        return {
+            "channel": "composer",
+            "effect": "Shapes Mode-2 tone on the next ask — a runtime hint, not the composer prompt.",
+        }
+    if kind == "incorrect":
+        if _exemplar_halves(fb) is not None:
+            return {
+                "channel": "learn",
+                "effect": "/learn will fold it in as a few-shot exemplar — press Run learn to gate it into the composer prompt.",
+            }
+        return {
+            "channel": "advisory",
+            "effect": "Recorded, but adds no exemplar without both a question and a corrected answer.",
+        }
+    if (
+        kind in _TOGGLE_CLAUSES
+    ):  # a recurring-toggle signal kind (escalation_reject) — derives from the assembler
+        return {
+            "channel": "learn",
+            "effect": f"Feeds /learn: once this recurs ({_RECURRING_THRESHOLD}×), Run learn toggles a softer-tone clause into the composer prompt.",
+        }
+    # helpful, escalation_accept
+    return {
+        "channel": "advisory",
+        "effect": "Advisory — recorded for audit; it changes no prompt and does not feed /learn.",
+    }
+
+
 # --------------------------------------------------------------------------------------------------
 # Pure assembly + checks (no DB, no eval, no model) — the deterministic candidate drafter.
 # --------------------------------------------------------------------------------------------------
@@ -447,10 +502,18 @@ def _gate(candidate, baseline) -> tuple[bool, list[str]]:
 # --------------------------------------------------------------------------------------------------
 
 
-def _eval_prompt(seed_prompt: str | None, provider):
+def _eval_prompt(seed_prompt: str | None, provider, *, label: str = "candidate"):
     """Run the full labeled set through the in-process harness with ``seed_prompt`` as the active prompt
     (``None`` -> the v0/BASE baseline). Returns the harness ``Report``. The eval runs on a throwaway
-    template seeded from the active dataset — it never touches the live DB."""
+    template seeded from the active dataset — it never touches the live DB.
+
+    The report is streamed to LangSmith via ``llm_eval.trace_report`` — the SAME sink the ``make eval`` CLI
+    uses, so a ``/learn`` run is observable in the same project (this is why the earlier "live path never
+    instrumented" note now excludes ``/learn``). ``label`` (``candidate`` / ``baseline``) names the runs
+    (``learn-<label>:<case>``) so a candidate run is distinguishable from the freshly-computed baseline and
+    from a CLI ``eval:*`` run. A no-op without ``LANGSMITH_API_KEY`` and best-effort (a trace failure is
+    swallowed, never failing the gate); the traced cases are the SYNTHETIC eval set (no member PHI)."""
+    from eval import llm_eval  # function-local: the eval bridge (see module docstring)
     from eval.adapter import load_cases
     from eval.harness import run_eval
     from eval.inprocess import InProcessClient
@@ -461,7 +524,13 @@ def _eval_prompt(seed_prompt: str | None, provider):
     with InProcessClient.build(
         None, seed_prompt=seed_prompt, provider=provider
     ) as client:
-        return run_eval(cases, client, cfg)
+        report = run_eval(cases, client, cfg)
+    llm_eval.trace_report(
+        report,
+        run_prefix=f"learn-{label}",
+        extra_metadata={"source": "learn", "phase": label},
+    )
+    return report
 
 
 def _report_from_json(report_json: str):
@@ -529,7 +598,7 @@ def _baseline_report(con, provider, active):
     # eval the prompt ACTUALLY IN FORCE (v0 == BASE via seed_prompt=None, or a learned vN's own text) and
     # (re)attach the report to THAT row, so the baseline always measures the active composer prompt under
     # the current config and never a different version or a stale config.
-    report = _eval_prompt(text if version > 0 else None, provider)
+    report = _eval_prompt(text if version > 0 else None, provider, label="baseline")
     db.set_prompt_report(con, version, report.to_json())
     return report
 
@@ -589,14 +658,15 @@ def _run_learn_locked(con, *, provider) -> dict:
     # 1. Assemble the candidate (pure). No signals -> nothing to learn from. The message is DIAGNOSTIC
     # (not just "no signals"): a clinician who applied a range_override/suppress_marker/preference and
     # then ran /learn would otherwise read this as "/learn picks up nothing", when in fact those are
-    # CORRECTIONS on the deterministic path (resolve_overrides -> the next Scan/Ask), a separate channel
-    # from the SIGNAL kinds /learn consumes. Naming the count + the other path resolves that confusion.
+    # CORRECTIONS on the deterministic path (resolve_overrides -> every Scan/Ask, applied at once by the
+    # /feedback auto-scan), a separate channel from the SIGNAL kinds /learn consumes. Naming the count +
+    # the other path resolves that confusion.
     signals = db.get_active_signals(con)
     if not signals:
         n_corrections = db.count_active_corrections(con)
         on_other_path = (
             f" ({n_corrections} active correction(s) exist — range_override / suppress_marker / "
-            "preference — but those feed the deterministic core on the next Scan/Ask, not /learn)"
+            "preference — but those feed the deterministic core on every Scan/Ask, not /learn)"
             if n_corrections
             else ""
         )

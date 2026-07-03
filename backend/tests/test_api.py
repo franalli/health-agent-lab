@@ -53,8 +53,22 @@ def _reset_and_seed() -> None:
     con.close()
 
 
+def _isolate_data_root(tmp_path, monkeypatch):
+    """Point ``HEALTH_DATA_ROOT`` at an isolated temp dir seeded with a copy of the shipped
+    ``training_data``, so NO client-based test mutates the repo's ``backend/data/``. This matters
+    specifically because ``POST /admin/reseed`` now removes uploaded dataset FOLDERS from ``data_root()``
+    (``datasets.remove_uploaded_datasets``) — against the real root a reseed test would delete a developer's
+    local uploads. Returns the temp root (``.data_root`` for tests that assert on the created folder)."""
+    root = tmp_path / "data"
+    root.mkdir()
+    shutil.copytree(_REAL_TRAINING, root / "training_data")
+    monkeypatch.setenv("HEALTH_DATA_ROOT", str(root))
+    return root
+
+
 @pytest.fixture
-def client():
+def client(tmp_path, monkeypatch):
+    _isolate_data_root(tmp_path, monkeypatch)
     _reset_and_seed()
     with TestClient(api.app) as c:
         yield c
@@ -174,14 +188,10 @@ _REAL_TRAINING = datasets._DEFAULT_DATA_ROOT / "training_data"
 
 @pytest.fixture
 def upload_client(tmp_path, monkeypatch):
-    """A client whose datasets root is an isolated temp dir (``HEALTH_DATA_ROOT``) seeded with a copy of
-    the shipped ``training_data`` — so an upload CREATES its dataset folder in the temp dir, never the
-    repo, and teardown is automatic. ``monkeypatch.setenv`` is per-test (no process-wide leak into the
-    other test modules that read the real root)."""
-    root = tmp_path / "data"
-    root.mkdir()
-    shutil.copytree(_REAL_TRAINING, root / "training_data")
-    monkeypatch.setenv("HEALTH_DATA_ROOT", str(root))
+    """A ``client`` that also exposes ``.data_root`` for tests that assert on the created dataset folder —
+    an upload CREATES its folder in the isolated temp root (see :func:`_isolate_data_root`), never the repo,
+    and teardown is automatic."""
+    root = _isolate_data_root(tmp_path, monkeypatch)
     _reset_and_seed()  # data_root() now resolves to `root`; seeds the 15 from the copied training_data
     with TestClient(api.app) as c:
         c.data_root = root  # let tests assert on the created folder
@@ -1051,6 +1061,21 @@ def test_post_feedback_records_an_override(client):
         },
     )
     assert r.status_code == 200 and r.json()["feedback_id"]
+    # A correction feeds the deterministic core, NOT /learn — the response says so authoritatively.
+    assert r.json()["channel"] == "core"
+
+
+def test_post_feedback_response_advertises_learn_only_for_learn_channel(client):
+    # The fix for the misleading "Feeds the next Run learn gate" copy: an advisory signal
+    # (escalation_accept) must report channel="advisory" (not "learn") so the UI won't advertise Run learn.
+    # (No Haiku judge on this path — validate_feedback only screens 'incorrect' — so it's keyless-safe.)
+    r = client.post(
+        "/members/C01/feedback",
+        json={"kind": "escalation_accept", "target": "f:x", "source": "clinician"},
+    )
+    assert r.status_code == 200
+    assert r.json()["channel"] == "advisory"
+    assert "does not feed /learn" in r.json()["effect"]
 
 
 def test_post_feedback_unknown_member_404(client):
@@ -1119,6 +1144,93 @@ def test_post_feedback_non_incorrect_correction_stores_without_a_judge(client):
         },
     )
     assert r.status_code == 200 and r.json()["feedback_id"]
+
+
+def test_post_feedback_core_correction_auto_scans_the_member(client):
+    # ingest_dataset alone never scans (the CLI's auto-scan lives in its main()), so this fixture starts
+    # with NO persisted observations — what populates them below is the feedback route's own auto-scan.
+    assert client.get("/members/C01/observations").json() == []
+    r = client.post(
+        "/members/C01/feedback",
+        json={
+            "kind": "range_override",
+            "target": "LDL cholesterol",
+            "payload": {"ref_high": 250.0},
+            "source": "clinician",
+        },
+    )
+    assert r.status_code == 200 and r.json()["rescanned"] is True
+    titles = [o["title"] for o in client.get("/members/C01/observations").json()]
+    assert titles  # the auto-scan persisted C01's findings — no manual /scan call anywhere in this test
+    # ...and the scan consumed the JUST-committed override (insert-then-scan ordering): un-overridden,
+    # C01's LDL scans as "LDL cholesterol above range"; the wide re-bound clears that flag, so the
+    # auto-scan raised no LDL finding.
+    assert not any(t.startswith("LDL cholesterol") for t in titles)
+
+
+def test_post_feedback_auto_scan_equals_a_manual_rescan(client):
+    # The auto-scan is the SAME idempotent scan the Scan button runs: a manual re-scan right after a core
+    # correction must change nothing — the feedback route already left the projection current. (Also pins
+    # suppress-through-auto-scan: the suppressed marker's observation is pruned without a manual scan.)
+    client.post(
+        "/members/C01/feedback",
+        json={"kind": "suppress_marker", "target": "HbA1c", "source": "clinician"},
+    )
+    after_feedback = client.get("/members/C01/observations").json()
+    assert after_feedback  # C01 still raises its other findings
+    assert not any(o["title"].startswith("HbA1c") for o in after_feedback)
+    client.post("/members/C01/scan")
+    after_manual = client.get("/members/C01/observations").json()
+    assert after_manual == after_feedback
+
+
+def test_post_feedback_non_core_kinds_skip_the_auto_scan(client, monkeypatch):
+    # Only a core correction changes analyze()'s inputs; a preference (composer channel) and the signal
+    # kinds (learn/advisory) must not pay for — or imply — a rescan. Spy on the seam the route calls.
+    calls = []
+    monkeypatch.setattr(
+        api.pipeline, "scan_members", lambda con, ids: calls.append(list(ids)) or 1
+    )
+    for body in (
+        {
+            "kind": "preference",
+            "payload": {"text": "keep it brief"},
+            "source": "member",
+        },
+        {"kind": "helpful", "target": "obs:x", "source": "clinician"},
+        {"kind": "escalation_accept", "target": "esc:x", "source": "clinician"},
+        {"kind": "escalation_reject", "target": "esc:x", "source": "clinician"},
+    ):
+        r = client.post("/members/C01/feedback", json=body)
+        assert r.status_code == 200 and r.json()["rescanned"] is False
+    assert calls == []
+
+
+def test_post_feedback_auto_scan_failure_never_fails_the_correction(
+    client, monkeypatch
+):
+    # Best-effort, same contract as every auto-scan path: the correction commits BEFORE the scan runs, so
+    # a scan blow-up must surface as rescanned=False on a 200 — never a 500 (the client would read failure
+    # for a recorded override) and never a lost row. scan_members itself absorbs per-member failures; this
+    # raises from the seam directly to pin the route's own envelope against a systemic crash.
+    def _boom(con, ids):
+        raise RuntimeError("scan exploded")
+
+    monkeypatch.setattr(api.pipeline, "scan_members", _boom)
+    r = client.post(
+        "/members/C01/feedback",
+        json={"kind": "suppress_marker", "target": "HbA1c", "source": "clinician"},
+    )
+    assert r.status_code == 200 and r.json()["feedback_id"]
+    assert r.json()["rescanned"] is False
+    con = db.connect(_DB_FILE)
+    try:
+        stored = con.execute(
+            "SELECT COUNT(*) FROM feedback WHERE kind='suppress_marker' AND active=1"
+        ).fetchone()[0]
+    finally:
+        con.close()
+    assert stored == 1
 
 
 # ---- GET /members/{id}/trajectory (Phase 7) -------------------------------------------------------
@@ -1247,6 +1359,98 @@ def test_reseed_restores_initial_members_and_drops_holdouts(client):
         con.close()
     assert [(r["version"], r["status"]) for r in rows] == [(0, "promoted")]
     assert rows[0]["eval_report_json"] is None
+
+
+def test_reseed_removes_uploaded_dataset_folders_keeping_training_data(upload_client):
+    # The bug: a DB-only reseed dropped an uploaded holdout's MEMBERS but left its <root>/<name>/ FOLDER
+    # stranded on disk — still discoverable and re-selectable via DATASET=<name>. A factory reset must
+    # return the datasets root to just the shipped bundle.
+    data = _dataset_zip(["U01", "U02"], top="holdout")
+    up = upload_client.post(
+        "/members/upload", files={"file": ("holdout.zip", data, "application/zip")}
+    )
+    assert up.status_code == 200, up.text
+    holdout = upload_client.data_root / "holdout"
+    assert holdout.is_dir()  # the upload created the folder
+
+    r = upload_client.post("/admin/reseed")
+    assert r.status_code == 200, r.text
+    assert r.json()["datasets_removed"] == ["holdout"]  # reported on the response
+    assert not holdout.exists()  # folder gone from disk
+    assert (upload_client.data_root / "training_data").is_dir()  # shipped bundle KEPT
+    ids = [m["member_id"] for m in upload_client.get("/members").json()]
+    assert (
+        "C01" in ids and "U01" not in ids
+    )  # DB back to the 15 shipped; uploaded members dropped
+
+
+def test_remove_uploaded_datasets_keeps_training_data_and_files(tmp_path, monkeypatch):
+    # Unit-level: only non-default SUB-DIRECTORIES go; the shipped bundle and any FILE (the DB, a README,
+    # a stray zip) are untouched.
+    monkeypatch.setenv("HEALTH_DATA_ROOT", str(tmp_path))
+    (tmp_path / "training_data").mkdir()
+    (tmp_path / "holdout_a").mkdir()
+    (tmp_path / "holdout_b").mkdir()
+    (tmp_path / "health.db").write_text("db")
+    (tmp_path / "README.md").write_text("readme")
+    (tmp_path / "upload_test.zip").write_text("zip")
+
+    assert datasets.remove_uploaded_datasets() == ["holdout_a", "holdout_b"]  # sorted
+    assert (tmp_path / "training_data").is_dir()  # shipped bundle kept
+    assert (
+        not (tmp_path / "holdout_a").exists() and not (tmp_path / "holdout_b").exists()
+    )
+    assert (tmp_path / "health.db").is_file()  # files never touched
+    assert (tmp_path / "README.md").is_file()
+    assert (tmp_path / "upload_test.zip").is_file()
+
+
+def test_remove_uploaded_datasets_skips_symlinks(tmp_path, monkeypatch):
+    # rmtree must never follow a symlink out of the root and delete external content.
+    monkeypatch.setenv("HEALTH_DATA_ROOT", str(tmp_path))
+    (tmp_path / "training_data").mkdir()
+    external = tmp_path.parent / "external_precious"
+    external.mkdir()
+    (external / "keep.txt").write_text("precious")
+    (tmp_path / "linked").symlink_to(external, target_is_directory=True)
+
+    assert "linked" not in datasets.remove_uploaded_datasets()  # symlink skipped
+    assert (external / "keep.txt").is_file()  # external content never followed/deleted
+
+
+def test_remove_uploaded_datasets_swallows_a_listing_error(tmp_path, monkeypatch):
+    # Best-effort AND TOTAL: a raising root.iterdir() (unreadable root / TOCTOU) is logged+swallowed, not
+    # propagated — else it 500s a reseed that already committed. The original guarded only rmtree.
+    monkeypatch.setenv("HEALTH_DATA_ROOT", str(tmp_path))
+    (tmp_path / "training_data").mkdir()
+
+    def boom_iterdir(self):
+        raise PermissionError("listing denied")
+
+    monkeypatch.setattr(pathlib.Path, "iterdir", boom_iterdir)
+    assert datasets.remove_uploaded_datasets() == []  # swallowed, not raised
+
+
+def test_remove_uploaded_datasets_swallows_a_per_child_stat_error(
+    tmp_path, monkeypatch
+):
+    # Best-effort: an OSError from a per-child stat (e.g. EACCES, which pathlib re-raises) is skipped, not
+    # raised. The original stat calls sat OUTSIDE the try that wrapped only rmtree, so this would have 500'd.
+    monkeypatch.setenv("HEALTH_DATA_ROOT", str(tmp_path))
+    (tmp_path / "training_data").mkdir()
+    (tmp_path / "boom").mkdir()
+    real_is_dir = pathlib.Path.is_dir
+
+    def flaky_is_dir(self):
+        if self.name == "boom":
+            raise PermissionError("stat denied")
+        return real_is_dir(self)
+
+    monkeypatch.setattr(pathlib.Path, "is_dir", flaky_is_dir)
+    assert (
+        datasets.remove_uploaded_datasets() == []
+    )  # 'boom' skipped on its stat error, not raised
+    assert (tmp_path / "boom").exists()  # never removed
 
 
 def test_cold_start_seeds_the_v0_baseline_prompt(client):

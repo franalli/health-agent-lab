@@ -11,11 +11,15 @@ battery, each case a run whose `fit_correct` feedback is 1.0 iff the verdict mat
 nothing in the local report is missing from LangSmith and there is no discrepancy to reconcile.
 
 It is **tracing-only**: it wraps the harness's ALREADY-MADE service calls (this module is the *only*
-importer of `langsmith` — the provider stays behind `llm.py`, no LangChain, and the live `/ask` path is
-never instrumented in v1). It is **off unless `LANGSMITH_API_KEY` is set**, and used only for the
-synthetic eval data here — traces go to a third-party SaaS, so real PHI would need self-hosted LangSmith
-or a BAA plus the §6 data controls. Every call is defensive: a LangSmith failure logs a warning and is
-swallowed, never breaking the (canonical) local run.
+importer of `langsmith` — the provider stays behind `llm.py`, no LangChain). Two callers drive the SAME
+sink via `trace_report`, so both instrument identically: the `make eval` CLI (`eval/__main__.py`, runs
+named `eval:*`) and `POST /learn`'s in-process gate (`learn._eval_prompt`, runs named `learn-candidate:*`
+/ `learn-baseline:*` so a `/learn` run is distinguishable in the shared project). The live **`/ask`** path
+is still never instrumented — the member chat path stays trace-free in v1; only the eval harness (CLI *or*
+`/learn`) traces. It is **off unless `LANGSMITH_API_KEY` is set**, and both callers run only the SYNTHETIC
+eval set (no member PHI) — traces go to a third-party SaaS, so real PHI would need self-hosted LangSmith or
+a BAA plus the §6 data controls. Every call is defensive: a LangSmith failure logs a warning and is
+swallowed, never breaking the (canonical) local run or the `/learn` gate.
 """
 
 from __future__ import annotations
@@ -61,15 +65,45 @@ def _open_sink():
         return None
 
 
+def trace_report(
+    report,
+    *,
+    run_prefix: str = "eval",
+    extra_metadata: dict | None = None,
+) -> int:
+    """Trace a whole harness ``Report`` — the report-shaped entry point shared by the ``make eval`` CLI
+    (``eval/__main__.py``) and ``POST /learn`` (``learn._eval_prompt``), so both instrument IDENTICALLY:
+    the per-case ``triples`` are built ONCE, here, from the report instead of at each call site. A no-op
+    without ``LANGSMITH_API_KEY``. ``run_prefix`` names the runs (``{run_prefix}:{case.id}``) so a ``/learn``
+    candidate/baseline run is distinguishable in the shared project from a CLI eval run (the ONE intentional
+    difference from `trace_run`'s default): CLI runs stay ``eval:*``, ``/learn`` runs are ``learn-*:*``."""
+    if not is_enabled():
+        return 0
+    triples = [
+        (rc.case, rc.responses, cr.mode2)
+        for rc, cr in zip(report.raw, report.cases, strict=True)
+    ]
+    return trace_run(
+        triples,
+        dataset=report.dataset,
+        model_version=report.model_version,
+        run_prefix=run_prefix,
+        extra_metadata=extra_metadata,
+    )
+
+
 def trace_run(
     triples: list[tuple[Case, CaseResponses, list[ScorerResult]]],
     *,
     dataset: str,
     model_version: str,
+    run_prefix: str = "eval",
+    extra_metadata: dict | None = None,
 ) -> int:
     """Stream each case to LangSmith as one run with the scorer verdicts as feedback. Returns the number
     of cases traced (0 when the sink is off or unavailable). Never raises — a trace failure must not fail
-    the canonical local run."""
+    the canonical local run. ``run_prefix`` names each run (``{run_prefix}:{case.id}``, default ``eval``);
+    ``extra_metadata`` is merged into each run's metadata (e.g. the ``/learn`` phase) — see `trace_report`."""
     if not is_enabled():
         return 0
     opened = _open_sink()
@@ -83,7 +117,7 @@ def trace_run(
         try:
             first = responses.mode2[0] if responses.mode2 else None
             rt = RunTree(
-                name=f"eval:{case.id}",
+                name=f"{run_prefix}:{case.id}",
                 run_type="chain",
                 project_name=project,
                 client=client,  # type: ignore[call-arg]  # alias of ls_client; synchronous → no bg thread
@@ -113,6 +147,7 @@ def trace_run(
                         "tokens": first.metadata.tokens if first else None,
                         "cost_usd": first.metadata.cost_usd if first else None,
                         "n_runs": len(responses.mode2),
+                        **(extra_metadata or {}),
                     }
                 },
             )

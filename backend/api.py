@@ -35,7 +35,7 @@ from health_intelligence.models import (
     Observation,
     SuggestedPrompt,
 )
-from preprocessing.datasets import DEFAULT_DATASET
+from preprocessing.datasets import DEFAULT_DATASET, remove_uploaded_datasets
 from preprocessing.ingest import (
     BundleValidationError,
     ingest_bundle,
@@ -346,14 +346,22 @@ def post_ask(
 @app.post("/members/{member_id}/feedback")
 def post_feedback(
     member_id: str, fb: Feedback, con: sqlite3.Connection = Depends(get_con)
-) -> dict[str, str]:
+) -> dict[str, object]:
     """Record a correction (range_override / suppress_marker / preference) or a signal (helpful /
-    incorrect / escalation_accept|reject). Overrides re-resolve into the core's inputs on the next
-    scan/ask (both modes); signals feed ``/learn``. 404 if the member is absent. For an ``incorrect``
+    incorrect / escalation_accept|reject). A core-channel correction AUTO-SCANS the member after its row
+    commits, so the persisted Observations + escalation worklist reflect the override when the call
+    returns (overrides also re-resolve into every later scan/ask, both modes); only a LEARNABLE signal
+    feeds ``/learn`` (``incorrect`` -> exemplar, recurring ``escalation_reject`` -> tone clause) —
+    ``helpful`` / ``escalation_accept`` are advisory. 404 if the member is absent. For an ``incorrect``
     correction, the learning input bar (``learn.validate_feedback``) screens the corrected answer so junk
     never sits in the table as a future few-shot exemplar (the "learns too literally" fix): **422** if it
     is unfit (empty / oversized, or the Haiku judge finds a stated numeric cutoff / escalation-softening /
-    incoherence), **503 fail-closed** if the judge can't run (retry — an unjudged answer is never stored)."""
+    incoherence), **503 fail-closed** if the judge can't run (retry — an unjudged answer is never stored).
+    The response carries ``learn.classify_feedback``'s ``{channel, effect}`` (so the UI states each kind's
+    effect correctly — a ``learn``-channel signal is the only one that advertises Run learn) plus
+    ``rescanned`` — True iff this submission's auto-scan ran cleanly. False means no scan was needed (a
+    non-core kind changes no analysis input) or the best-effort scan failed (the correction is still
+    recorded; the manual Scan button is the retry)."""
     if db.get_member(con, member_id) is None:
         raise HTTPException(status_code=404, detail=f"member {member_id!r} not found")
     try:
@@ -362,7 +370,29 @@ def post_feedback(
         raise HTTPException(status_code=503, detail=str(e)) from e
     if reason is not None:
         raise HTTPException(status_code=422, detail=reason)
-    return {"feedback_id": db.insert_feedback(con, member_id, fb)}
+    # The authoritative per-kind classification rides the response so the UI states each kind's effect
+    # correctly (only a learn-channel signal advertises Run learn) — see learn.classify_feedback.
+    classification = learn.classify_feedback(fb)
+    feedback_id = db.insert_feedback(
+        con, member_id, fb
+    )  # commits — durable before the scan reads it
+    # A core correction (range_override / suppress_marker) changes analyze()'s inputs, so refresh the
+    # persisted projection NOW rather than leaving the Observations panel + escalation worklist stale
+    # behind a manual Scan press (the apply-side twin of /reset's revert-side re-scan). Same contract as
+    # every other auto-scan path: after the row commits, and best-effort — a scan failure lags the
+    # projection behind the recorded correction, never fails the request (the envelope catches even a
+    # systemic scan_members crash, like the startup seed's). Non-core kinds (preference / the signals)
+    # change no analysis input, so they skip the scan rather than pay for it.
+    rescanned = False
+    if classification["channel"] == "core":
+        try:
+            rescanned = pipeline.scan_members(con, [member_id]) == 1
+        except Exception:
+            logger.exception(
+                "post_feedback: auto-scan failed for member %s; observations lag until a manual scan",
+                member_id,
+            )
+    return {"feedback_id": feedback_id, "rescanned": rescanned, **classification}
 
 
 @app.get("/members/{member_id}/trajectory")
@@ -428,6 +458,12 @@ def post_reseed(con: sqlite3.Connection = Depends(get_con)) -> dict:
     ``BASE_COMPOSE_SYSTEM`` (so the store is never empty; its eval report is attached lazily by the first
     ``/learn``). An operator op, not a member feature.
 
+    Drops the uploaded datasets on BOTH sides: the truncate removes their members from the DB, and
+    ``remove_uploaded_datasets`` removes their on-disk ``<data-root>/<name>/`` FOLDERS (all but the shipped
+    ``training_data``) — otherwise a "factory reset" left prior uploads stranded on disk, still discoverable
+    and re-selectable via ``DATASET=<name>``. The folder cleanup is best-effort and runs AFTER the
+    transaction commits (a filesystem op can't be part of it); ``datasets_removed`` rides the response.
+
     ATOMIC: the truncate + re-ingest + v0 seed run as ONE transaction (``db.reseed_transaction``, with the
     ingest/seed passing ``commit=False``), so a concurrent request on another threadpool connection reads
     the pre-reseed or post-reseed state, never a half-wiped DB, and any mid-reseed failure rolls back to
@@ -447,8 +483,18 @@ def post_reseed(con: sqlite3.Connection = Depends(get_con)) -> dict:
         learn.seed_baseline_prompt(
             con, commit=False
         )  # v0 baseline, so the prompt store isn't empty
+    # Filesystem half of the factory reset: drop uploaded dataset FOLDERS (POST /members/upload writes
+    # <root>/<name>/) so the datasets root returns to just the shipped bundle — the DB truncate above only
+    # removed their MEMBERS, not their folders. AFTER the transaction commits (a filesystem op is not part
+    # of it), and best-effort (never fails the reseed) — same after-commit, non-fatal contract as the scan.
+    datasets_removed = remove_uploaded_datasets()
     scanned = pipeline.scan_members(con, summary["member_ids"])
-    return {"reseeded": True, "scanned": scanned, **summary}
+    return {
+        "reseeded": True,
+        "scanned": scanned,
+        "datasets_removed": datasets_removed,
+        **summary,
+    }
 
 
 # Serve the static member surface on the same origin (Phase 6 ships frontend/index.html). Mounted LAST

@@ -23,9 +23,13 @@ module's concern; the firewall (``ingest.py``) owns parsing the uploaded archive
 
 from __future__ import annotations
 
+import logging
 import os
 import pathlib
 import re
+import shutil
+
+logger = logging.getLogger(__name__)
 
 #: ``backend/data`` — the default datasets root. Each sub-folder is one bundle. Overridable per-call
 #: via ``HEALTH_DATA_ROOT`` (see :func:`data_root`); kept as a constant for the override's fallback.
@@ -109,6 +113,49 @@ def derive_dataset_name(explicit: str | None, filename: str | None) -> str:
             stem = stem[: -len(suffix)]
             break
     return sanitize_dataset_name(stem)
+
+
+def remove_uploaded_datasets(keep: str = DEFAULT_DATASET) -> list[str]:
+    """Delete every dataset folder under :func:`data_root` EXCEPT ``keep`` (the shipped ``training_data``)
+    — the filesystem half of ``POST /admin/reseed``'s factory reset, whose contract is "remove ALL data
+    folders except training_data, then reload training_data" (the DB reload is the pinned
+    ``ingest_dataset(DEFAULT_DATASET)`` in ``db.reseed_transaction``). ``POST /members/upload`` creates
+    ``<root>/<name>/`` folders; a DB-only reseed truncated their members but stranded the folders on disk,
+    so a "factory reset" left prior uploads discoverable and re-selectable. This returns the root to just
+    the shipped bundle.
+
+    A FACTORY RESET, so the active ``DATASET`` is deliberately NOT spared: reseed always reverts to
+    training_data (the re-ingest is pinned to :data:`DEFAULT_DATASET`), so a deploy running ``DATASET=<name>``
+    that factory-resets is choosing to discard ``<name>`` — the DB is reloaded from training_data regardless.
+
+    Defensive by construction: only immediate SUB-DIRECTORIES are touched — never a file (``health.db``,
+    ``health.db.learn.lock``, ``README.md``, a stray ``.zip``) and never the shipped ``keep`` bundle — and a
+    symlink child is skipped (``rmtree`` must never follow a link out of the root). Best-effort AND TOTAL:
+    the listing itself AND every per-child stat/delete are guarded, so NO ``OSError`` — an unreadable/missing
+    root, a TOCTOU race, an ``EACCES`` on a child ``stat`` (``pathlib`` re-raises those; it swallows only
+    ENOENT/ENOTDIR/EBADF/ELOOP) — can escape. The DB reset has already committed by the time the caller runs
+    this, so nothing here may fail the reseed or pre-empt its auto-scan (the same after-commit, non-fatal
+    contract as ``pipeline.scan_members``). Returns the names removed (sorted)."""
+    root = data_root()
+    removed: list[str] = []
+    try:
+        children = list(
+            root.iterdir()
+        )  # also handles a missing/non-dir root -> OSError -> []
+    except OSError as e:
+        logger.warning("reseed: could not list the datasets root %s: %s", root, e)
+        return []  # nothing removed yet on the listing-failure branch
+    for child in children:
+        try:
+            if child.name == keep or child.is_symlink() or not child.is_dir():
+                continue
+            shutil.rmtree(child)
+            removed.append(child.name)
+        except (
+            OSError
+        ) as e:  # per-child stat/delete failure — log and skip, never fail the reseed
+            logger.warning("reseed: could not remove dataset folder %s: %s", child, e)
+    return sorted(removed)
 
 
 def create_dataset_dir(name: str) -> pathlib.Path:

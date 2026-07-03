@@ -90,6 +90,47 @@ def test_structural_precheck_accepts_base_and_rejects_malformed():
     assert learn.structural_precheck(llm.BASE_COMPOSE_SYSTEM + "x" * 20_000) is not None
 
 
+def test_classify_feedback_channels_only_learn_kinds_to_learn():
+    # The authoritative per-kind classification the /feedback response exposes, so the UI can't claim a kind
+    # "feeds /learn" when it doesn't. channel=="learn" IS "changes the composer prompt" (no redundant
+    # `learnable` field), and it must agree with assemble_candidate: incorrect-with-both-halves -> exemplar,
+    # a _TOGGLE_CLAUSES kind -> clause; everything else feeds the core/runtime or is advisory.
+    def cls(kind, payload=None):
+        return learn.classify_feedback(
+            Feedback(kind=kind, target="f:x", payload=payload, source="clinician")
+        )
+
+    # channel 'learn' — the only channel that changes the composer prompt; no `learnable` field is emitted.
+    inc = cls("incorrect", {"question": "q", "corrected_answer": "a valid one"})
+    assert inc["channel"] == "learn" and "learnable" not in inc
+    assert "Run learn" in inc["effect"]  # immediate call-to-action for incorrect
+    rej = cls("escalation_reject")
+    assert rej["channel"] == "learn"
+    # CONDITIONAL CTA (not a premature "press Run learn"): the effect states the recurrence requirement.
+    assert (
+        "recurs" in rej["effect"] and str(learn._RECURRING_THRESHOLD) in rej["effect"]
+    )
+
+    # Derives from _TOGGLE_CLAUSES, not a hardcoded literal — every toggle-clause kind classifies to 'learn',
+    # so a future 2nd toggle clause can't silently drift to 'advisory'.
+    for kind in learn._TOGGLE_CLAUSES:
+        assert cls(kind)["channel"] == "learn"
+
+    # Advisory signals — recorded, but NOT a learn channel (the bug the copy overstated).
+    assert cls("helpful")["channel"] == "advisory"
+    assert cls("escalation_accept")["channel"] == "advisory"
+    assert "does not feed /learn" in cls("escalation_accept")["effect"]
+
+    # Corrections — feed the deterministic core / runtime composer, never the promoted prompt.
+    assert cls("range_override", {"ref_high": 5})["channel"] == "core"
+    assert cls("suppress_marker")["channel"] == "core"
+    assert cls("preference", {"text": "be brief"})["channel"] == "composer"
+
+    # An 'incorrect' missing a half can't become an exemplar -> advisory (matches assemble_candidate).
+    assert cls("incorrect", {"question": "q"})["channel"] == "advisory"
+    assert cls("incorrect", None)["channel"] == "advisory"
+
+
 # --------------------------------------------------------------------------------------------------
 # Input bar — deterministic bounds + the Haiku input-judge (the "learns too literally" fix). A
 # deterministic-regex attempt at the cutoff/softening checks was abandoned (three review passes: it could
@@ -453,7 +494,9 @@ def test_run_learn_promotes_and_the_composer_loads_it_when_the_gate_passes(monke
     _seed_member_with_signal(con)
     clean = _report([_case(_ALL_PASS())])
     monkeypatch.setattr(learn, "_baseline_report", lambda con, provider, active: clean)
-    monkeypatch.setattr(learn, "_eval_prompt", lambda seed_prompt, provider: clean)
+    monkeypatch.setattr(
+        learn, "_eval_prompt", lambda seed_prompt, provider, **_kw: clean
+    )
 
     result = learn.run_learn(con, provider=_ConstFake())
 
@@ -518,7 +561,9 @@ def test_baseline_report_recomputes_when_the_stored_report_config_is_stale(monke
     fresh = _report([_case(_ALL_PASS())])
     calls: list = []
     monkeypatch.setattr(
-        learn, "_eval_prompt", lambda seed_prompt, provider: (calls.append(1), fresh)[1]
+        learn,
+        "_eval_prompt",
+        lambda seed_prompt, provider, **_kw: (calls.append(1), fresh)[1],
     )
     learn._baseline_report(con, _ConstFake(), db.get_active_prompt(con))
     assert (
@@ -539,7 +584,7 @@ def test_baseline_report_reuses_a_current_config_report(monkeypatch):
     monkeypatch.setattr(
         learn,
         "_eval_prompt",
-        lambda seed_prompt, provider: (_ for _ in ()).throw(
+        lambda seed_prompt, provider, **_kw: (_ for _ in ()).throw(
             AssertionError("must not recompute a current-config baseline")
         ),
     )
@@ -558,7 +603,9 @@ def test_learn_after_a_seeded_v0_does_not_collide_and_appends_a_candidate(monkey
     learn.seed_baseline_prompt(con)  # simulate the post-reseed / startup state
     _seed_member_with_signal(con)
     clean = _report([_case(_ALL_PASS())])
-    monkeypatch.setattr(learn, "_eval_prompt", lambda seed_prompt, provider: clean)
+    monkeypatch.setattr(
+        learn, "_eval_prompt", lambda seed_prompt, provider, **_kw: clean
+    )
 
     result = learn.run_learn(con, provider=_ConstFake())
 
@@ -574,6 +621,23 @@ def test_learn_after_a_seeded_v0_does_not_collide_and_appends_a_candidate(monkey
         "SELECT version FROM prompt_versions WHERE version = ?", (result["version"],)
     ).fetchone()
     assert candidate is not None  # the candidate landed as its own row
+
+
+def test_eval_prompt_traces_the_harness_run(monkeypatch):
+    # /learn's in-process gate streams each harness run to the SAME LangSmith sink the CLI uses (so a prod
+    # /learn is observable — "how do we know it ran"), tagged learn-<label> to distinguish it from a CLI
+    # eval:* run. Spy on the sink (no key/network needed); the harness itself runs offline via _ConstFake.
+    from eval import llm_eval
+
+    calls = []
+    monkeypatch.setattr(
+        llm_eval, "trace_report", lambda report, **kw: calls.append(kw) or 0
+    )
+    report = learn._eval_prompt(None, _ConstFake(), label="candidate")
+    assert report is not None
+    assert len(calls) == 1  # exactly one trace per harness run
+    assert calls[0]["run_prefix"] == "learn-candidate"
+    assert calls[0]["extra_metadata"] == {"source": "learn", "phase": "candidate"}
 
 
 def test_run_learn_debounces_an_unchanged_signal_set():

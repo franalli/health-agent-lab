@@ -332,20 +332,23 @@
   .trace-grid { margin-top: 7px; font-size: 11.5px; font-family: ui-monospace, Menlo, monospace; color: var(--muted); }
   .trace-grid div { padding: 1px 0; }
 
-  /* mode 1 chips + ask form (Ahead suggestion-pill style) */
-  .convo-foot { border-top: 1px solid var(--line); padding: 14px 18px 16px; background: var(--panel); }
+  /* mode 1 chips + ask form (Ahead suggestion-pill style) — no box of its own: it floats on the
+     conversation bg (no bleed-through risk: .center scrolls as a whole, the foot is in-flow, not sticky) */
+  .convo-foot { padding: 14px 18px 16px; }
   #chips { display: flex; flex-wrap: wrap; gap: 8px; }
   .suggest-chip {
-    border: 1px solid var(--line); color: var(--ink); background: var(--panel); border-radius: 999px;
-    padding: 9px 15px; font-size: 13px; font-weight: 500; max-width: 100%; text-align: left;
+    border: 1px solid var(--line); color: var(--accent); background: var(--panel); border-radius: 999px;
+    padding: 9px 15px; font-size: 13px; font-weight: 600; max-width: 100%; text-align: left;
     transition: border-color .15s, background .15s, color .15s;
   }
   .suggest-chip:hover { background: var(--accent-tint); border-color: var(--accent); color: var(--accent-press); }
-  .suggest-chip.handoff { border-style: dashed; color: var(--muted); border-color: var(--line); }
+  .suggest-chip.handoff { border-style: dashed; color: var(--muted); border-color: var(--line); font-weight: 500; }
   .suggest-chip.handoff:hover { background: var(--panel-2); color: var(--ink); border-color: var(--faint); }
   #ask-form { display: flex; gap: 9px; }
-  #ask-input { flex: 1; padding: 11px 15px; border: 1px solid var(--line); border-radius: 999px; font: inherit; font-size: 14px; background: var(--panel-2); transition: border-color .15s, background .15s; }
-  #ask-input:focus { outline: none; border-color: var(--accent); background: var(--panel); }
+  /* white pill on the bare conversation bg (like the chips) — --panel-2 would melt into --bg */
+  #ask-input { flex: 1; padding: 11px 15px; border: 1px solid var(--line); border-radius: 999px; font: inherit; font-size: 14px; background: var(--panel); transition: border-color .15s, box-shadow .15s; }
+  #ask-input:hover:not(:disabled) { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-tint); }
+  #ask-input:focus { outline: none; border-color: var(--accent); }
   #ask-form button { border: 0; background: var(--accent); color: #fff; border-radius: 999px; padding: 11px 22px; font-weight: 600; font-size: 14px; transition: background .15s; }
   #ask-form button:hover:not(:disabled) { background: var(--accent-press); }
   #ask-form button:disabled { opacity: .45; cursor: default; }
@@ -548,13 +551,7 @@
     { group: "Data", label: "Reseed (factory)", verb: "POST", destructive: true, handler: reseed,
       tip: "POST /admin/reseed · Wipe all tables and re-ingest the original training_data members. Drops uploads and all learning/audit history. Asks for confirmation before firing." },
     { group: "Proactive", label: "Scan", verb: "POST", handler: scanAll,
-      tip: "POST /members/{id}/scan · Run the proactive drift scan across every member and summarise each result here." },
-    // Sample override lives HERE, next to Scan — NOT under Learning. It is a CORRECTION (range_override):
-    // it feeds the deterministic core (db.resolve_overrides → the next Scan/Ask), a different mechanism
-    // from the signal kinds /learn consumes. Grouping it by Scan (its effect surface) keeps the panel's
-    // two-mechanism split self-evident, so an override never reads as a /learn input.
-    { group: "Proactive", label: "Sample override", verb: "POST", handler: sampleOverride,
-      tip: "POST /members/{id}/feedback · Demo correction (range_override): re-bounds the selected member's first flagged marker — press Scan to watch its out-of-range flag clear. Feeds the deterministic core, not /learn. Undo with Reset learning." },
+      tip: "POST /members/{id}/scan · Re-run the proactive drift scan across every member and summarise each result here. Normally automatic (every ingest and every core feedback correction auto-scans) — this manual re-run is the retry after a failed auto-scan and the demo of the mechanism." },
     { group: "Proactive", label: "Member escalations", verb: "GET", handler: () => readoutRoute((m) => `/members/${enc(m)}/escalations`),
       tip: "GET /members/{id}/escalations · The selected member's own escalation record (raw JSON) — the drill-in detail, not the queue." },
     // NOTE: the remaining per-member GET reads (observations · suggestions · trajectory) are intentionally NOT
@@ -565,9 +562,9 @@
     { group: "Clinician", label: "Clinician queue", verb: "GET", handler: () => readoutRoute(() => `/escalations`),
       tip: "GET /escalations · The global triage queue — every open escalation across all members, ranked worst-first (urgent → clinician_review) then newest (raw JSON). No member need be selected." },
     { group: "Clinician", label: "Submit feedback", verb: "POST", handler: feedbackForm,
-      tip: "POST /members/{id}/feedback · Record a correction (range_override · suppress_marker · preference) or a signal (helpful · incorrect · escalation_accept|reject) on the selected member. Corrections re-resolve into the core on the next scan/ask; signals feed Run learn." },
+      tip: "POST /members/{id}/feedback · Record a correction (range_override · suppress_marker · preference) or a signal (helpful · incorrect · escalation_accept|reject) on the selected member. A core correction auto-scans the member on submit, so Observations/escalations reflect it at once (and it re-resolves into every later scan/ask); only LEARNABLE signals (incorrect, recurring escalation_reject) feed Run learn — helpful/escalation_accept are advisory." },
     { group: "Learning", label: "Run learn", verb: "POST", handler: runLearn,
-      tip: "POST /learn · Assemble a candidate composer prompt from feedback signals and gate it through the eval harness; promote only if nothing regresses. Needs ANTHROPIC_API_KEY; can take a minute." },
+      tip: "POST /learn · Assemble a candidate composer prompt from the LEARNABLE feedback (incorrect → few-shot exemplar, recurring escalation_reject → tone clause) and gate it through the eval harness; promote only if nothing regresses. No-ops if no learnable feedback is pending. Needs ANTHROPIC_API_KEY; can take a minute." },
     { group: "Learning", label: "Reset learning", verb: "POST", destructive: true, handler: resetLearning,
       tip: "POST /reset · Deactivate all feedback overrides and revert the composer prompt to v0. Not a data wipe. Asks for confirmation before firing." },
     // NOTE: the GET /health liveness route is intentionally NOT surfaced as a control-panel button (it's the
@@ -866,8 +863,9 @@
 
   // member-load sequence: load EXISTING state only (observations + escalations + suggestions) — all
   // READS, never a scan. Selecting a member shows whatever the last scan left. Scans run automatically
-  // at every data load (seed / reseed / upload — proactive by default), so a freshly loaded member
-  // already has findings; the "Run scan" button is a manual re-run of the same idempotent scan.
+  // at every data load (seed / reseed / upload) AND on a core /feedback correction — proactive by
+  // default — so a freshly loaded member already has findings and a just-corrected one is already
+  // current; the "Run scan" button is a manual re-run of the same idempotent scan (the retry path).
   async function selectMember(id) {
     flushMemberState();
     state.currentMember = id;
@@ -1103,36 +1101,11 @@
     if (res.ok && ids && ids.length) await loadMembers(ids[ids.length - 1]);
   }
 
-  // ---- Phase 7 control-panel handlers (Proactive override · Clinician feedback · Learning) -------
+  // ---- Phase 7 control-panel handlers (Clinician feedback · Learning) ----------------------------
   async function runLearn() {
     renderReadout("Running /learn — rule-assembling a candidate prompt and gating it through the eval harness. This calls the real LLM and can take a minute…");
     const r = await api("POST", "/learn");
     renderReadout(r.data);  // {version, status, reason, report} — or a 409/503 detail
-  }
-
-  // Demonstrate a clinician range-override: widen a marker's range. Fires directly and always — it
-  // prefers a non-panic out-of-range marker (so a later scan visibly clears its flag), else just takes
-  // the first marker so the POST goes through regardless. Does NOT scan — press "Scan" to see the
-  // effect. Reverted by "Reset learning".
-  async function sampleOverride() {
-    if (!state.currentMember) return renderReadout({ error: "No member selected." });
-    const m = state.currentMember;
-    const traj = await api("GET", `/members/${enc(m)}/trajectory`);
-    if (!traj.ok) return renderReadout(traj.data);
-    const markers = traj.data || [];
-    if (!markers.length) return renderReadout({ note: `${m} has no markers to override.` });
-    const flagged = markers.find((t) =>
-      !t.flags.some((f) => f.startsWith("panic")) &&
-      (t.flags.includes("above_range") || t.flags.includes("below_range")));
-    const t = flagged || markers[0];
-    const latest = t.readings[t.readings.length - 1].value;
-    const payload = t.flags.includes("below_range")
-      ? { ref_low: Math.floor(latest * 0.5) }
-      : { ref_high: Math.ceil(latest * 1.5) };
-    const fb = { kind: "range_override", target: t.marker, payload, source: "clinician" };
-    const r = await api("POST", `/members/${enc(m)}/feedback`, fb);
-    renderReadout(r.ok ? { applied_override: fb, feedback_id: r.data.feedback_id,
-      note: `Override applied to ${t.marker} on ${m}. Run "Scan" to see its flag change; revert with "Reset learning".` } : r.data);
   }
 
   // ---- /feedback form: the full Feedback surface (correction kinds + signal kinds), rendered into the
@@ -1142,16 +1115,16 @@
   // payload are assembled deterministically, never free-form, so the POST can't no-op on a typo'd key.
   const FEEDBACK_KINDS = [
     { kind: "range_override", group: "Correction", target: "marker", payload: "range",
-      hint: "Re-bound a marker. Set ref_low and/or ref_high (one-sided OK). Re-resolves into analysis on the next scan." },
+      hint: "Re-bound a marker. Set ref_low and/or ref_high (one-sided OK). Auto-scans on submit, so the flag change lands at once." },
     { kind: "suppress_marker", group: "Correction", target: "marker", payload: "none",
-      hint: "Drop a marker entirely so the core never analyzes it. Inert against a panic floor (db.py)." },
+      hint: "Drop a marker entirely so the core never analyzes it. Inert against a panic floor (db.py). Auto-scans on submit." },
     { kind: "preference", group: "Correction", target: "none", payload: "text",
       hint: "A composer tone hint joined to the Mode-2 prompt — never a number or the escalation floor." },
-    { kind: "helpful", group: "Signal", target: "finding", payload: "none", hint: "Positive signal on a finding; feeds /learn (advisory — toggles no clause on its own)." },
+    { kind: "helpful", group: "Signal", target: "finding", payload: "none", hint: "Positive signal on a finding. Advisory — recorded for audit; changes no prompt and does NOT feed /learn." },
     { kind: "incorrect", group: "Signal", target: "answer", payload: "correction",
       hint: "Correct a prior answer: pick the answered question, type the right answer. /learn folds {question, corrected_answer} in as a few-shot exemplar for the composer (architecture §58)." },
-    { kind: "escalation_accept", group: "Signal", target: "finding", payload: "none", hint: "Confirm an escalation was warranted; feeds /learn." },
-    { kind: "escalation_reject", group: "Signal", target: "finding", payload: "none", hint: "Mark an escalation as a false alarm; feeds /learn." },
+    { kind: "escalation_accept", group: "Signal", target: "finding", payload: "none", hint: "Confirm an escalation was warranted. Advisory — recorded for audit; changes no prompt and does NOT feed /learn." },
+    { kind: "escalation_reject", group: "Signal", target: "finding", payload: "none", hint: "Mark an escalation as a false alarm. Learnable: once it recurs, /learn toggles a softer-tone clause into the composer prompt." },
   ];
 
   async function feedbackForm() {
@@ -1162,7 +1135,7 @@
     // must have run). A typed-in target matching nothing returns 200 but is silently inert on scan
     // (db._apply_overrides) — the dropdown removes that whole failure mode.
     const traj = await api("GET", `/members/${enc(m)}/trajectory`);
-    if (!traj.ok) return renderReadout(traj.data);  // surface the error (like sampleOverride), don't show an empty dropdown
+    if (!traj.ok) return renderReadout(traj.data);  // surface the error, don't show an empty dropdown
     const markerOpts = (traj.data || []).map((t) => ({ value: t.marker, text: t.marker }));
     const findingOpts = [
       ...(state.observations || []).map((o) => ({ value: o.observation_id, text: `${o.title} — ${o.severity}` })),
@@ -1298,12 +1271,29 @@
       const r = await api("POST", `/members/${enc(m)}/feedback`, fb);
       submit.disabled = false;
       if (r.ok) {
-        const note = k.payload === "range" || k.kind === "suppress_marker"
-          ? ' Run "Scan" to see the flag change; revert with "Reset learning".'
-          : k.payload === "correction"
-            ? ' Press "Run learn" to fold this correction into the composer prompt (gated by the eval harness).'
-            : ' Feeds the next "Run learn" gate.';
+        // Effect + call-to-action come from the backend's authoritative classification
+        // (learn.classify_feedback): `effect` is self-contained — a learn-channel signal's effect already
+        // carries the Run-learn CTA (immediate for `incorrect`, conditional on recurrence for
+        // `escalation_reject`), an advisory signal points at neither. A `core` correction is AUTO-SCANNED
+        // server-side (`rescanned` reports the outcome), so on success there is no "Run Scan" step to
+        // advertise — the member panels just refresh below; only a FAILED auto-scan points at the manual
+        // Scan button (the retry path).
+        const { channel, effect, rescanned } = r.data;
+        let note = ` ${effect || ""}`;
+        if (channel === "core") {
+          note += rescanned
+            ? ' Auto-scanned — the panels now reflect it; revert with "Reset learning".'
+            : ' Auto-scan failed — run "Scan" to see the flag change; revert with "Reset learning".';
+        }
         setStatus(status, "ok", `Recorded ${k.kind} (feedback_id ${r.data.feedback_id}).${note}`);
+        // A clean core auto-scan changed the persisted observations/escalations server-side — refresh the
+        // member surfaces the same way scanAll does (observations + escalation flag + Mode-1 chips, and
+        // invalidate the trajectory cache: /trajectory is a live re-analysis, so the override moves it too).
+        // Guard on the member still being on-screen (they may have switched while the POST was in flight).
+        if (channel === "core" && rescanned && m === state.currentMember) {
+          invalidateTrajectory();
+          await Promise.all([loadObservations(m), refreshEscalations(m), refreshSuggestions(m)]);
+        }
       } else {
         // Prefer FastAPI's {detail} STRING (the input bar's "rephrase this" reason on a 422); fall back to
         // readable JSON for the other shapes — notably Pydantic body-validation errors, whose `detail` is an

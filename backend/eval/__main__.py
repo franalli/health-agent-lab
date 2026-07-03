@@ -137,16 +137,10 @@ def main(argv: list[str] | None = None) -> int:
     _write_artifact(judge, failed=judge_failed)
 
     # LangSmith offline trace sink (Phase 5c) — gated on LANGSMITH_API_KEY, a no-op otherwise. It mirrors
-    # the canonical local report: the COMPOSER cases via trace_run, then the feedback-judge battery via
+    # the canonical local report: the COMPOSER cases via trace_report, then the feedback-judge battery via
     # trace_judge_run, so the two sinks carry the same per-case data (no discrepancy to reconcile). The
     # report is already durable, and both trace_* helpers swallow failures (architecture §8).
-    triples = [
-        (rc.case, rc.responses, cr.mode2)
-        for rc, cr in zip(report.raw, report.cases, strict=True)
-    ]
-    llm_eval.trace_run(
-        triples, dataset=report.dataset, model_version=report.model_version
-    )
+    llm_eval.trace_report(report)  # default run_prefix "eval" — the composer/gate cases
     llm_eval.trace_judge_run(judge)
 
     nes = report.never_events()

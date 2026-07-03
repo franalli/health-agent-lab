@@ -1175,7 +1175,7 @@ def count_active_corrections(con: sqlite3.Connection) -> int:
     members — the input the DETERMINISTIC correction path consumes (:func:`resolve_overrides` /
     :func:`get_active_preferences`), which is a separate path from the /learn SIGNALS read by
     :func:`get_active_signals`. Lets ``learn.run_learn``'s empty-signals no-op tell the operator that
-    feedback *exists* but is on the other path (it feeds the next Scan/Ask, not /learn) — so an applied
+    feedback *exists* but is on the other path (it feeds every Scan/Ask, not /learn) — so an applied
     override no longer reads as "/learn picks up nothing"."""
     return con.execute(
         "SELECT COUNT(*) FROM feedback WHERE active = 1 "
