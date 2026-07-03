@@ -131,7 +131,7 @@ def turn(member_id, message):
 
     match intent:                                # a branch, not a DAG — no framework
         case "none":          resp = compose(context(analysis), message)  # only open generation
-        case "out_of_scope":  resp = refuse_template()
+        case "out_of_scope":  resp = refuse_template(floor)  # FLOOR-AWARE copy: a refusal under a standing urgent/review floor restates that next step, never a flat brush-off
         case "acute_medical": resp = seek_care_template()
         case "crisis":        resp = crisis_template()
 

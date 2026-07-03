@@ -113,6 +113,41 @@ def test_urgent_templates_state_the_swiss_emergency_numbers():
     assert "144" not in benign and "112" not in benign
 
 
+def test_refuse_template_is_floor_aware_and_urgent_restates_the_emergency():
+    """The out-of-scope refusal renders the STANDING floor, never a flat brush-off mid-emergency (the
+    disposition half of the post-escalation over-refusal fix). Urgent leads with the emergency next step
+    and the Swiss numbers (the same single config source as ``seek_care_template``); clinician_review
+    names the review WITHOUT the ambulance numbers (a review-level flag never over-alarms into an
+    emergency instruction); the no-floor copy stays byte-identical to the pre-fix text. The template only
+    RENDERS the floor it is handed — the pipeline computes and sets the level regardless."""
+    flat = templates.refuse_template(_meta())
+    assert flat.escalation == "none" and flat.answer_disposition == "out_of_scope"
+    assert flat.answer == (
+        "That's outside what I can help with from your lab history. Your GP or care team is the "
+        "right place for this — I can help you make sense of your own results any time."
+    )
+
+    urgent = templates.refuse_template(_meta(), floor="urgent")
+    assert urgent.escalation == "urgent" and urgent.answer_disposition == "out_of_scope"
+    assert "144" in urgent.answer and "112" in urgent.answer
+    assert (
+        "urgent" in urgent.answer
+    )  # names the standing urgency, not just a phone number
+    assert (
+        "outside what I can help with" in urgent.answer
+    )  # the refusal itself survives
+
+    review = templates.refuse_template(_meta(), floor="clinician_review")
+    assert review.escalation == "clinician_review"
+    assert "review" in review.answer
+    assert "144" not in review.answer and "112" not in review.answer
+    assert "outside what I can help with" in review.answer
+
+    assert (
+        len({flat.answer, urgent.answer, review.answer}) == 3
+    )  # three distinct variants
+
+
 # ---- safety: floor projection + validator --------------------------------------------------------
 
 
@@ -1398,6 +1433,47 @@ def test_ask_out_of_scope_refuses_without_escalating_a_calm_member(fake_provider
         db.get_escalations(con, "C02") == []
     )  # out-of-scope on calm labs -> no clinician task
     assert resp.metadata.model_version == GATE_MODEL
+
+
+def test_ask_out_of_scope_under_urgent_data_floor_restates_the_emergency(
+    fake_provider,
+):
+    """The post-escalation over-refusal fix, disposition half: a genuinely out-of-scope ask from a
+    member whose DATA floor is urgent (C07, potassium 6.1 > panic 6.0) still refuses — but with the
+    floor-aware copy that restates the standing emergency next step, and the urgent floor survives the
+    refusal (refusing never drops the floor; the chat escalation still queues)."""
+    con = _con()
+    ingest_dataset(con)
+    prov = fake_provider(GateClassification(route="out_of_scope"))
+    resp = pipeline.ask(
+        con, "C07", "can you recommend a cream for this rash?", provider=prov
+    )
+    assert resp.answer_disposition == "out_of_scope"
+    assert resp.escalation == "urgent"  # the data floor holds THROUGH the refusal
+    assert resp.answer == templates.refuse_template(_meta(), floor="urgent").answer
+    assert "144" in resp.answer  # the emergency next step is restated in the refusal
+    assert any(
+        e.kind == "chat" for e in db.get_escalations(con, "C07")
+    )  # the clinician task still queues on the refused turn
+    assert resp.metadata.model_version == GATE_MODEL
+
+
+def test_ask_out_of_scope_under_review_floor_names_the_review_not_the_ambulance(
+    fake_provider,
+):
+    """The clinician_review-floored refusal names the standing review; it must NOT print the ambulance
+    numbers — a review-level flag never over-alarms into an emergency instruction."""
+    con = _con()
+    ingest_dataset(con)
+    prov = fake_provider(GateClassification(route="out_of_scope"))
+    resp = pipeline.ask(con, "C01", "what's a good dinner recipe?", provider=prov)
+    assert resp.answer_disposition == "out_of_scope"
+    assert resp.escalation == "clinician_review"  # C01's data floor
+    assert (
+        resp.answer
+        == templates.refuse_template(_meta(), floor="clinician_review").answer
+    )
+    assert "144" not in resp.answer and "112" not in resp.answer
 
 
 def test_ask_substance_is_identical_across_reruns(fake_provider):

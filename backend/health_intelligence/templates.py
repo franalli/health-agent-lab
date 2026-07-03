@@ -457,15 +457,44 @@ def crisis_template(metadata: ResponseMetadata) -> HealthIntelligenceResponse:
     )
 
 
-def refuse_template(metadata: ResponseMetadata) -> HealthIntelligenceResponse:
-    """Out-of-scope responder: a friendly redirect that names the limit and points to a clinician."""
-    return HealthIntelligenceResponse(
-        answer=(
+def refuse_template(
+    metadata: ResponseMetadata, *, floor: FloorLevel = "none"
+) -> HealthIntelligenceResponse:
+    """Out-of-scope responder: a friendly redirect that names the limit and points to a clinician.
+
+    FLOOR-AWARE: the refusal must never read flat while an escalation floor is standing — a member
+    refused mid-emergency still needs the urgent next step restated, or the brush-off falsely closes the
+    turn ("ask your GP any time" under a panic-value floor). ``floor`` is the ALREADY-COMPUTED
+    ``max(data, message)`` level the pipeline passes in; this template only renders it — it never
+    computes, raises, or lowers a floor (the pipeline sets ``response.escalation = floor`` regardless).
+    Deliberately a deterministic template, not the composer: a refusal under a hot floor is exactly the
+    moment not to free-compose, so the guaranteed copy leads with the standing next step
+    (``config.EMERGENCY_MEDICAL_CONTACT`` — the same single source ``seek_care_template`` reads) before
+    the redirect. The eval harness fingerprints ALL floor variants (``eval/scorers._FP_REFUSE``)."""
+    if floor == "urgent":
+        answer = (
+            "Before your question: your results are flagged as needing urgent medical attention, and "
+            "that still stands — please seek care now if you haven't already. "
+            f"{EMERGENCY_MEDICAL_CONTACT} As for what you asked: that's outside what I can help with "
+            "from your lab history — your GP or care team is the right place for it. I can help you "
+            "make sense of your own results any time."
+        )
+    elif floor == "clinician_review":
+        answer = (
+            "One thing first: your results are flagged for review, so please do arrange to discuss "
+            "them with your GP or care team. As for what you asked: that's outside what I can help "
+            "with from your lab history — your GP is the right place for it as well. I can help you "
+            "make sense of your own results any time."
+        )
+    else:
+        answer = (
             "That's outside what I can help with from your lab history. Your GP or care team is the "
             "right place for this — I can help you make sense of your own results any time."
-        ),
+        )
+    return HealthIntelligenceResponse(
+        answer=answer,
         answer_disposition="out_of_scope",
-        escalation="none",
+        escalation=floor,
         metadata=metadata,
     )
 

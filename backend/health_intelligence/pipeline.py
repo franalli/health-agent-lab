@@ -533,9 +533,11 @@ def _chat_trigger_reason(
 #: The non-``none`` routes -> their fixed responder (architecture §2 D4: you do not free-compose an
 #: emergency, a crisis reply over someone's labs, or a fail-closed clarification). The ONE place the
 #: gate's route set maps to templates, so adding/renaming a route is a single edit (the dispatch and the
-#: model-version rule both read from here).
+#: model-version rule both read from here). ``out_of_scope`` is NOT in this map: its responder
+#: (``templates.refuse_template``) is FLOOR-AWARE — it takes the turn's computed floor so a refusal
+#: under a standing urgent/review floor restates the next step instead of reading flat — and a uniform
+#: metadata-only dispatch would silently render the flat copy. It is dispatched explicitly in ``ask``.
 _SAFETY_TEMPLATES = {
-    "out_of_scope": templates.refuse_template,
     "acute_medical": templates.seek_care_template,
     "crisis": templates.crisis_template,
     "couldnt_route": templates.couldnt_route_template,
@@ -697,7 +699,14 @@ def ask(
             )
         )
     else:
-        resp = _SAFETY_TEMPLATES[g.route](metadata)
+        # out_of_scope renders FLOOR-AWARE: the refusal must restate a standing urgent/review next step,
+        # never read flat mid-emergency (the floor is already computed; the template only renders it).
+        # acute/crisis/couldnt_route stay floor-fixed templates.
+        resp = (
+            templates.refuse_template(metadata, floor=floor)
+            if g.route == "out_of_scope"
+            else _SAFETY_TEMPLATES[g.route](metadata)
+        )
 
     # Deterministic floor wins: code sets escalation = floor (the LLM cannot touch it under approach A),
     # then the validator confirms escalation >= floor. The validate -> retry -> template scaffold stays

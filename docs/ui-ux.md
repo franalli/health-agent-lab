@@ -89,7 +89,7 @@ The response carries **two axes** (see `architecture.md`): `answer_disposition` 
 | Value | Treatment | Microcopy stance |
 |---|---|---|
 | `answered` | Standard answer card, evidence chips. | Direct, plain, grounded. |
-| `out_of_scope` | Friendly redirect, no evidence chips. | "That's outside what I can help with — here's who can." |
+| `out_of_scope` | Friendly redirect, no evidence chips. **Floor-aware**: under a standing `urgent`/`clinician_review` floor the copy leads by restating that next step (urgent: seek care now + the emergency numbers; review: arrange the GP conversation) before the redirect — a refusal mid-emergency never reads as a flat brush-off. | "That's outside what I can help with — here's who can." / urgent: "Before your question: your results are flagged as needing urgent medical attention… As for what you asked: …" |
 | `refused` | Gentle, still useful. | Names the limit, points to a clinician / their note. |
 
 **Escalation chrome** (`escalation` — deterministic, set by the data floor or the message gate):

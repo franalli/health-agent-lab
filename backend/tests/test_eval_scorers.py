@@ -214,6 +214,26 @@ def test_routing_crisis_recall_hit_and_miss():
     assert miss.never_event is None
 
 
+def test_routing_fingerprints_every_refuse_template_floor_variant():
+    """The refuse template is FLOOR-AWARE (one copy per floor level), so the fingerprint-based route
+    inference must recognize EVERY variant as out_of_scope — an urgent-floored refusal that mis-read as
+    a composed 'none' answer would corrupt the routing matrix and A13's never-event check."""
+    from health_intelligence.models import FLOOR_ORDER, ResponseMetadata
+    from health_intelligence.templates import refuse_template
+
+    meta = ResponseMetadata(
+        response_id="x", data_version="x", model_version="x", config_version="x"
+    )
+    variants = {f: refuse_template(meta, floor=f).answer for f in FLOOR_ORDER}
+    assert len(set(variants.values())) == len(
+        variants
+    )  # each floor renders distinct copy
+    for floor, answer in variants.items():
+        resp = _resp(answer, floor, disp="out_of_scope")
+        assert scorers._observed_route(resp) == "out_of_scope", floor
+        assert scorers._is_refusal(resp), floor
+
+
 # --------------------------------------------------------------------------------------------------
 # score_grounding — number-tracing, absent-marker trap, chip gap
 # --------------------------------------------------------------------------------------------------
