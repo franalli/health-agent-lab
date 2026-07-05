@@ -221,6 +221,10 @@ def scan(con: sqlite3.Connection, member_id: str) -> ScanResult:
                     level=level,
                     observation_id=obs_id,
                     trigger_reason=trigger_reason,
+                    # a re-scan re-emits the same key at the same level; keep the kept-first row's reason
+                    # in sync with the observation's re-derived one (a wording change deployed over a
+                    # durable DB would otherwise leave the queue and the observation card disagreeing).
+                    refresh_reason=True,
                 )
 
         # Reconcile the set: drop observations at THIS data_version that are no longer raised. Normally
@@ -551,14 +555,34 @@ def _grounded_fallback(
     )
 
 
+def _floor_driver_markers(analysis: TrajectoryAnalysis) -> list[str]:
+    """Display names of the markers whose severity CARRIES the member's data floor — read off the pure
+    core's per-marker severities via the same ``severity_to_level`` projection the floor itself derives
+    from (never re-derived). Only markers AT the floor level are named: they are why the floor sits where
+    it does, and softer escalating markers already have their own ``data_finding`` rows on the queue.
+    Empty when the floor is ``none`` (``severity_to_level`` returns ``None`` then, matching nothing)."""
+    return [
+        templates.display_name(t.marker)
+        for t in analysis.markers
+        if severity_to_level(t.severity) == analysis.overall_floor
+    ]
+
+
 def _chat_trigger_reason(
-    route: str, floor: FloorLevel, emergency_floor: FloorLevel
+    route: str,
+    floor: FloorLevel,
+    emergency_floor: FloorLevel,
+    analysis: TrajectoryAnalysis,
 ) -> str:
     """A human-readable ``trigger_reason`` for the chat escalation — the queue reader disambiguates acute
     vs crisis vs phrase-floored vs data-driven from this free text (architecture §323, no structured
     sub-type in v1). The emergency-phrase check sits ABOVE the route label so a couldnt_route turn that a
     self-harm/acute phrase floored to ``urgent`` reports the urgency, never the lower 'held at clinician
-    review' — i.e. the reason can't contradict the structured ``level`` it accompanies."""
+    review' — i.e. the reason can't contradict the structured ``level`` it accompanies. The data-floor
+    branch NAMES the driving markers: a bare "data floor is clinician_review" is a queue entry the
+    clinician must go hunting to act on — the cause is already computed, so state it. Drivers are read off
+    ``analysis`` lazily, only in the data-floor branch that renders them (the emergency/route branches
+    return first, so a crisis/acute turn never walks the marker list to build a list it discards)."""
     if route == "crisis":
         return "crisis/self-harm language detected in chat"
     if route == "acute_medical":
@@ -567,7 +591,17 @@ def _chat_trigger_reason(
         return "emergency-phrase (self-harm/acute) language raised this chat turn"
     if route == "couldnt_route":
         return "message could not be classified; held at clinician review"
-    return f"member's data floor is {floor} at chat time"
+    drivers = _floor_driver_markers(analysis)
+    # This branch is reached only when the escalation fires (caller guards on floor >= clinician_review)
+    # and floor == overall_floor here, so >=1 marker sits at the floor — drivers is never empty. Assert
+    # the invariant rather than silently emitting a bare "(driven by: )" on a misuse (mirrors the
+    # observation_summary `assert t is not None`); a none-floor turn must not build a chat reason at all.
+    assert drivers, "chat data-floor reason built with no floor-carrying marker"
+    # Join on "; " not ", ": a marker's display name can itself contain a comma (an uploaded/hold-out
+    # panel may name an analyte "Cholesterol, LDL"), which a comma separator would misread as two drivers.
+    return (
+        f"member's data floor is {floor} at chat time (driven by: {'; '.join(drivers)})"
+    )
 
 
 #: The non-``none`` routes -> their fixed responder (architecture §2 D4: you do not free-compose an
@@ -780,7 +814,9 @@ def ask(
                 dedup_key=f"chat:{member_id}:{today}",  # one clinician task per member per day (§321)
                 level=floor,  # guarded >= clinician_review, so a valid EscalationLevel  # type: ignore[arg-type]
                 interaction_id=resp.metadata.response_id,
-                trigger_reason=_chat_trigger_reason(g.route, floor, g.emergency_floor),
+                trigger_reason=_chat_trigger_reason(
+                    g.route, floor, g.emergency_floor, analysis
+                ),
                 created_at=now_iso,
             )
     return resp

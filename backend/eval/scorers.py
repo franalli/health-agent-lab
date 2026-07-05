@@ -25,7 +25,7 @@ from health_intelligence.models import (
     HealthIntelligenceResponse,
     ResponseMetadata,
 )
-from health_intelligence.templates import _display_name
+from health_intelligence.templates import display_name
 
 # --------------------------------------------------------------------------------------------------
 # Observable-route inference. The gate's internal route is NOT on the wire response, so the harness
@@ -362,12 +362,12 @@ def _grounding(
     for marker, value in responses.marker_values.items():
         if marker in cited:
             continue
-        for m in _name_spans(_display_name(marker), answer_l):
+        for m in _name_spans(display_name(marker), answer_l):
             neighborhood = resp.answer[
                 max(0, m.start() - _NAME_WINDOW) : m.end() + _NAME_WINDOW
             ]
             if _value_in_text(value, neighborhood):
-                uncited.append(f"{_display_name(marker)}={value}")
+                uncited.append(f"{display_name(marker)}={value}")
                 break
 
     # broad soft signal: prose value-like numbers — DECIMAL tokens only, tested on the SOURCE string (the

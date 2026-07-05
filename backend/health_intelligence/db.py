@@ -697,6 +697,7 @@ def _insert_escalation(
     observation_id: str | None = None,
     interaction_id: str | None = None,
     created_at: str | None = None,
+    refresh_reason: bool = False,
 ) -> bool:
     """The escalation INSERT OR IGNORE without committing — so the scan can write it inside its own
     transaction (atomic with the interaction + observation). Returns ``True`` iff THIS call created the
@@ -708,9 +709,17 @@ def _insert_escalation(
     turn can land on a row that an earlier ``clinician_review`` turn created the same day. A bare INSERT
     OR IGNORE would drop the urgent one, leaving the clinician queue showing the lower level and masking
     the acute event — so an existing ``clinician_review`` row is UPGRADED to ``urgent`` (and repointed at
-    the urgent interaction/reason). Only that one direction upgrades; an equal or lower incoming level is
-    left untouched, so a re-emitted ``data_finding`` (deterministic, same level by construction) and the
-    fire-once guarantee are unaffected, and an escalation is never silently downgraded."""
+    the urgent interaction/reason). Only that one direction upgrades; the level of an equal or lower
+    incoming row is left untouched, so the fire-once guarantee (``created``) and the never-downgrade
+    guarantee both hold.
+
+    ``refresh_reason`` (scan-only) keeps a re-emitted row's ``trigger_reason`` in sync with the finding
+    it narrates. A ``data_finding``'s dedup_key pins the marker's raw data, so a re-scan re-emits the SAME
+    key at the SAME level — only the *format* of the reason can drift (a Theil-Sen/tau wording change
+    deployed over a durable DB). With ``refresh_reason`` the kept-first row's reason is UPDATEd to the
+    current wording, so it never diverges from the observation's own re-derived reason (both narrate one
+    finding off the same ``_classify`` signal). ``chat`` leaves it ``False`` — its day-scoped reason is
+    turn-specific audit, and keep-first is the intended record of what first opened the task."""
     if created_at is None:
         created_at = datetime.now(UTC).isoformat()
     escalation_id = _det_id("esc:", dedup_key)
@@ -737,6 +746,18 @@ def _insert_escalation(
             "WHERE dedup_key = ? AND level = 'clinician_review'",
             (trigger_reason, interaction_id, dedup_key),
         )
+    # A SEPARATE `if`, not an `elif`: an urgent-level re-emit (an urgent data_finding re-scan) hits the
+    # branch above, but that UPDATE's `level = 'clinician_review'` guard matches nothing on an already-
+    # urgent row — so the reason would never heal if this were chained off it. Both run at most one write
+    # and set the same trigger_reason, so ordering is immaterial; only the level guards differ.
+    if not created and refresh_reason:
+        # Same key, same level (a data_finding re-scan) — heal only the reason's wording, never the level.
+        # The `trigger_reason <> ?` guard makes a routine re-scan (wording unchanged — the common case) a
+        # true no-op instead of a redundant identical page write; only a genuine wording drift writes.
+        con.execute(
+            "UPDATE escalations SET trigger_reason = ? WHERE dedup_key = ? AND trigger_reason <> ?",
+            (trigger_reason, dedup_key, trigger_reason),
+        )
     return created
 
 
@@ -758,8 +779,9 @@ def emit_escalation(con: sqlite3.Connection, **kwargs) -> bool:
 # deterministic and keyed on data_version (the caller builds them via _det_id), but the TWO writers use
 # DELIBERATELY DIFFERENT disciplines (architecture §48):
 #   • write_interaction → KEEP-FIRST `INSERT OR IGNORE`: an identical re-scan hits the same response_id and
-#     is a no-op; the PRIOR audit row is RETAINED, not overwritten (an append-only trace, like the
-#     escalation dedup). A genuine data change bumps data_version → a new id → a new row.
+#     is a no-op; the PRIOR audit row is RETAINED, not overwritten (a fully append-only trace — unlike the
+#     escalation dedup, which keeps its ROW but refreshes a data_finding's trigger_reason in place). A
+#     genuine data change bumps data_version → a new id → a new row.
 #   • write_observation → OVERWRITE-on-conflict (`ON CONFLICT ... DO UPDATE`): a same-data_version re-scan
 #     REFRESHES the derived projection in place (severity/title/trigger_reason), so a templates/display-name
 #     edit self-heals on the next scan. NOT a blanket DELETE — the escalations.observation_id RESTRICT FK

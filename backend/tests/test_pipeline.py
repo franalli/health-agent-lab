@@ -366,6 +366,49 @@ def test_observation_summary_surfaces_status_on_a_flagged_trending_marker():
     assert "range" not in i_title and "threshold" not in i_title, i_title
 
 
+def test_trend_trigger_reason_carries_theil_sen_rate():
+    """The clinician queue triages a trend on HOW FAST, not just "is it real": a counted trend's
+    ``trigger_reason`` carries the Theil-Sen rate alongside the Mann-Kendall p/n (the same one-home
+    ``_trend_stat`` the Finding evidence uses — a hand-rolled p/n-only copy previously dropped it), and
+    honestly OMITS the rate when the core declined to sign one (``slope is None`` — the Theil-Sen CI
+    spans zero, so the magnitude is genuinely unasserted even though MK settled the direction)."""
+    from health_intelligence.models import (
+        ClinicalChange,
+        MarkerTrajectory,
+        Reading,
+        TrendResult,
+    )
+
+    def _traj(slope):
+        return MarkerTrajectory(
+            marker="Fasting glucose",
+            unit="mg/dL",
+            latest=Reading(value=104, date="2024-01-01"),
+            trend=TrendResult(
+                direction="increasing",
+                tau=1.0,
+                p_value=0.017,
+                slope=slope,
+                n=5,
+                significant=True,
+            ),
+            clinical_change=ClinicalChange(rcv=5.0, net_change=12.0, exceeds_rcv=True),
+            flags=["above_range"],
+            severity="attention",
+            n_readings=5,
+        )
+
+    _, trigger = templates.observation_summary(_traj(0.02553))
+    assert "Theil-Sen slope 0.02553/day" in trigger, trigger
+    assert "Mann-Kendall p=0.017" in trigger and "n=5" in trigger, trigger
+    assert "clears reference-change value" in trigger, trigger
+
+    # rate CI spans zero (monotone-with-ties shape): no rate is asserted, the rest of the stat stands
+    _, no_rate = templates.observation_summary(_traj(None))
+    assert "Theil-Sen" not in no_rate, no_rate
+    assert "Mann-Kendall p=0.017" in no_rate, no_rate
+
+
 def test_format_reference_range_renders_the_three_bound_shapes():
     """The member range formatter renders a band, an upper-only, and a lower-only bound, trims a
     trailing .0, and is empty for an unbounded (no_reference) range so the caller states no range."""
@@ -1585,6 +1628,123 @@ def test_ask_chat_escalation_is_one_per_member_per_day(fake_provider):
     assert (
         len(chat) == 1
     )  # INSERT OR IGNORE on chat:{member}:{day} — fire once per member per day
+
+
+def test_ask_chat_escalation_names_the_floor_driving_markers(fake_provider):
+    """A data-floored chat escalation's ``trigger_reason`` must NAME the markers carrying the floor —
+    "member's data floor is clinician_review at chat time" alone gives the triaging clinician nothing
+    actionable (they'd have to go hunting for WHY the floor is raised). The cause is read off the same
+    per-marker severities the floor projects from, never re-derived."""
+    con = _con()
+    ingest_dataset(con)
+    # C01's data floor is clinician_review, carried by its rising Fasting glucose + HbA1c trends; a
+    # benign chat during it fires the day-scoped chat escalation
+    pipeline.ask(
+        con,
+        "C01",
+        "how are things looking?",
+        provider=fake_provider(GateClassification(route="none"), _draft("ok")),
+    )
+    chat = [e for e in db.get_escalations(con, "C01") if e.kind == "chat"]
+    assert len(chat) == 1
+    assert chat[0].level == "clinician_review"  # the floor the drivers must explain
+    reason = chat[0].trigger_reason
+    assert "clinician_review" in reason, reason
+    # the drivers ride the structured "(driven by: ...)" clause, not incidental prose
+    assert "(driven by:" in reason, reason
+    assert "Fasting glucose" in reason and "HbA1c" in reason, reason
+
+
+def test_floor_driver_markers_names_only_markers_at_the_floor():
+    """``_floor_driver_markers`` names exactly the markers whose severity CARRIES the floor and EXCLUDES
+    the softer escalating ones (they have their own findings on the queue), read off the same
+    ``severity_to_level`` projection the floor derives from. Covers each floor level, including the
+    ``none`` floor (nothing escalates → no drivers to name) and the urgent tier the chat test can't reach."""
+    from health_intelligence.models import (
+        MarkerTrajectory,
+        Reading,
+        TrajectoryAnalysis,
+    )
+
+    def _m(marker, severity):
+        return MarkerTrajectory(
+            marker=marker,
+            unit="x",
+            latest=Reading(value=1, date="2024-01-01"),
+            severity=severity,
+        )
+
+    def _analysis(floor, markers):
+        return TrajectoryAnalysis(
+            member_id="M", data_version="v", overall_floor=floor, markers=markers
+        )
+
+    # clinician_review floor: name the `attention` marker, EXCLUDE the softer `notable` one alongside it
+    review = _analysis(
+        "clinician_review", [_m("HbA1c", "attention"), _m("LDL cholesterol", "notable")]
+    )
+    assert pipeline._floor_driver_markers(review) == ["HbA1c"]
+
+    # urgent floor: name ONLY the urgent marker, excluding the attention one sitting below it
+    urgent = _analysis("urgent", [_m("Potassium", "urgent"), _m("HbA1c", "attention")])
+    assert pipeline._floor_driver_markers(urgent) == ["Potassium"]
+
+    # none floor: nothing escalates, so there is nothing to name
+    calm = _analysis("none", [_m("LDL cholesterol", "notable"), _m("HbA1c", "info")])
+    assert pipeline._floor_driver_markers(calm) == []
+
+
+def test_scan_heals_a_stale_data_finding_trigger_reason_on_rescan():
+    """End-to-end through ``pipeline.scan`` (not a bare db call): a re-scan of unchanged data heals a
+    data_finding escalation's stored ``trigger_reason`` back to the current wording — guarding the
+    integration seam where ``scan`` passes ``refresh_reason=True``. A dropped flag would silently
+    reintroduce the durable-DB divergence (observation card heals, queue row stays stale) without failing
+    any db-level test."""
+    con = _con()
+    ingest_dataset(con)
+    pipeline.scan(con, "C01")
+    esc = [e for e in db.get_escalations(con, "C01") if e.kind == "data_finding"]
+    assert esc, "C01's rising trends should raise data_finding escalations"
+    target = esc[0]
+    fresh = target.trigger_reason
+
+    # simulate a reason left stale by a prior code version deployed over a durable DB
+    with con:
+        con.execute(
+            "UPDATE escalations SET trigger_reason = 'STALE p/n-only wording' WHERE escalation_id = ?",
+            (target.escalation_id,),
+        )
+
+    pipeline.scan(con, "C01")  # re-scan (same data) heals the reason in place
+    after = [e for e in db.get_escalations(con, "C01") if e.kind == "data_finding"]
+    assert len(after) == len(esc)  # no duplicate row minted
+    healed = next(e for e in after if e.escalation_id == target.escalation_id)
+    assert healed.trigger_reason == fresh and "STALE" not in healed.trigger_reason
+
+
+def test_ask_chat_escalation_suppresses_drivers_on_an_acute_route(fake_provider):
+    """A crisis/acute/emergency turn returns the FIXED emergency reason BEFORE ``_floor_driver_markers``
+    runs — even for a member who HAS floor-driving markers — so the queue never mislabels an acute event
+    with a data-floor '(driven by: ...)' cause. C01 carries a clinician_review data floor (rising
+    glucose/HbA1c), yet an acute-routed turn must read as acute, not data-driven (the early-return
+    ordering the docstring promises)."""
+    con = _con()
+    ingest_dataset(con)
+    pipeline.ask(
+        con,
+        "C01",
+        "my left arm went numb",
+        provider=fake_provider(GateClassification(route="acute_medical")),
+    )
+    chat = [e for e in db.get_escalations(con, "C01") if e.kind == "chat"]
+    assert len(chat) == 1
+    assert (
+        chat[0].level == "urgent"
+    )  # acute route floors urgent over the clinician_review data floor
+    assert chat[0].trigger_reason == "acute medical concern described in chat"
+    assert (
+        "driven by" not in chat[0].trigger_reason
+    )  # driver clause suppressed by the early return
 
 
 def test_ask_chat_escalation_upgrades_clinician_review_to_urgent_same_day(

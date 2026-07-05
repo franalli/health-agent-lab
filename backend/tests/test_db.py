@@ -73,6 +73,58 @@ def test_emit_escalation_is_idempotent():
     assert n == 1
 
 
+def test_insert_escalation_refresh_reason_heals_a_stale_data_finding_reason():
+    """A re-emitted ``data_finding`` (same dedup_key, same level) with ``refresh_reason`` UPDATEs the
+    kept-first row's ``trigger_reason`` to the current wording — so a Theil-Sen/tau format change
+    deployed over a durable DB heals on the next scan instead of leaving the queue's reason diverged from
+    the observation's re-derived one. Heals at BOTH data_finding levels: clinician_review AND urgent (the
+    urgent tier must not be shadowed by the day-scoped urgent-UPGRADE branch, whose WHERE matches nothing
+    on an already-urgent row). Without the flag the reason is kept-first (chat's behavior); neither path
+    creates a second row or changes the level."""
+    con = _con()
+    con.execute("INSERT INTO members (member_id, sex) VALUES ('C07', 'male')")
+    con.commit()
+
+    def _emit(key, level, reason, *, refresh):
+        return db._insert_escalation(
+            con,
+            member_id="C07",
+            kind="data_finding",
+            dedup_key=key,
+            level=level,
+            trigger_reason=reason,
+            refresh_reason=refresh,
+        )
+
+    def _reason(key):
+        return con.execute(
+            "SELECT trigger_reason FROM escalations WHERE dedup_key = ?", (key,)
+        ).fetchone()[0]
+
+    for level, key in [
+        ("clinician_review", "data:C07:HbA1c:v1"),
+        (
+            "urgent",
+            "data:C07:Potassium:v1",
+        ),  # the panic tier the shadowing bug silently skipped
+    ]:
+        new = "Mann-Kendall p=0.017, tau=1.00, n=5, Theil-Sen slope 0.03/day"
+        assert (
+            _emit(key, level, "old p/n-only wording", refresh=True) is True
+        )  # created
+        # a re-scan re-emits the same key at the same level with the new wording -> heals in place
+        assert _emit(key, level, new, refresh=True) is False
+        row = con.execute(
+            "SELECT level, trigger_reason FROM escalations WHERE dedup_key = ?", (key,)
+        ).fetchone()
+        assert row["level"] == level, level  # level never moved
+        assert "Theil-Sen slope 0.03/day" in row["trigger_reason"], level
+
+        # refresh_reason=False (the chat default) keeps the first reason: a no-op re-emit does not overwrite
+        assert _emit(key, level, "a different, later reason", refresh=False) is False
+        assert _reason(key) == new, level
+
+
 # ---- global queue ordering (GET /escalations) ----------------------------------------------------
 
 

@@ -400,8 +400,9 @@ class Observation(BaseModel):
 
     Two deterministic narrations, split by AUDIENCE: ``trigger_reason``
     is the clinician/operator explainability — the statistical signal that fired (e.g. "Mann-Kendall
-    p=0.017, n=5; clears reference-change value"), PERSISTED and surfaced only on the operator console /
-    clinician queue; ``member_explanation`` is the member-facing plain-language "what this means for
+    p=0.017, tau=1.00, n=5, Theil-Sen slope 0.03/day; clears reference-change value" — the full
+    ``_trend_stat``, rate included, so the queue can triage on HOW FAST), PERSISTED and surfaced only on
+    the operator console / clinician queue; ``member_explanation`` is the member-facing plain-language "what this means for
     you", never containing test statistics and stating the reference range for an out-of-range value.
     Both come from ``templates`` off the same ``_classify`` signal, so they always describe the same
     finding; the member panel renders ``member_explanation``, never ``trigger_reason``.

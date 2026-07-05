@@ -118,7 +118,9 @@ CREATE INDEX idx_obs_member ON observations(member_id, severity);
 -- Clinician-review queue: the subset of findings/events that crossed the escalation
 -- threshold, from BOTH owners. dedup_key is UNIQUE, so "fire once" is a DB guarantee, not
 -- application logic. Data-finding key = member·marker·marker_version (scan owns it, writes via
--- INSERT OR IGNORE), where marker_version hashes ONLY that marker's analyze() inputs (its readings,
+-- INSERT OR IGNORE — one row per finding; a re-scan is a no-op EXCEPT it refreshes the kept row's
+-- trigger_reason in place, so a wording change deployed over a durable DB heals: db._insert_escalation
+-- refresh_reason), where marker_version hashes ONLY that marker's analyze() inputs (its readings,
 -- its resolved range, sex, age) — not notes/profile, and not other markers — so a notes-only edit
 -- (or a /feedback override to a DIFFERENT marker) cannot re-fire a finding whose own analysis never
 -- moved (architecture §48; db.compute_marker_version); chat key = member·day

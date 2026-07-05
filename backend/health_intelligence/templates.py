@@ -55,7 +55,7 @@ _DISPLAY_NAME = {
 }
 
 
-def _display_name(marker: str) -> str:
+def display_name(marker: str) -> str:
     return _DISPLAY_NAME.get(marker, marker)
 
 
@@ -195,7 +195,7 @@ def _classify(traj: MarkerTrajectory) -> str:
 def observation_summary(traj: MarkerTrajectory) -> tuple[str, str]:
     """(title, trigger_reason) for the ``observations`` row and the Finding text — derived from
     ``_classify`` so the title and the evidence stat always describe the same signal."""
-    m, signal = _display_name(traj.marker), _classify(traj)
+    m, signal = display_name(traj.marker), _classify(traj)
     val = f"{traj.latest.value} {traj.unit}"
     if signal == "panic_high":
         return (
@@ -209,16 +209,20 @@ def observation_summary(traj: MarkerTrajectory) -> tuple[str, str]:
         )
     if signal == "trend":
         t = traj.trend
-        word = _DIRECTION_WORD.get(t.direction, "changing") if t else "changing"
+        assert t is not None  # _classify returns "trend" only when traj.trend is set
+        word = _DIRECTION_WORD.get(t.direction, "changing")
         rcv = "; clears reference-change value" if traj.severity == "attention" else ""
-        p = f"{t.p_value:.3f}" if t else "n/a"
-        n = t.n if t else 0
+        # The full one-home stat (`_trend_stat`), INCLUDING the Theil-Sen rate when the core signed one:
+        # the queue triages on HOW FAST ("recheck in 3 months" vs "recheck now"), so the trigger_reason
+        # carries the same evidence stat as the Finding — a hand-rolled p/n-only copy here previously
+        # dropped the rate the clinician needed. A None slope (rate CI spans zero) is honestly omitted.
+        stat = _trend_stat(t)
         # Surface the value's current standing alongside the trend: a marker that has already breached
         # its range / crossed a band must not be narrated as a future-tense trend alone (the value is
         # flagged NOW). CLAUDE.md "every narrator surfaces the core flags".
         status = _status_phrase(traj)
         title = f"{m} {word}, now {status}" if status else f"{m} {word}"
-        trigger = f"{m} {word} trend (Mann-Kendall p={p}, n={n}{rcv})"
+        trigger = f"{m} {word} trend ({stat}{rcv})"
         return title, (f"{trigger}; latest {status}" if status else trigger)
     if (
         signal == "sparse_trend"
@@ -296,7 +300,7 @@ def observation_member_explanation(
     prompts urgent attention, an attention-level (sparse-)trend suggests raising it with a doctor, and a
     bare range/band flag (at most 'notable' — Escalation ≠ out-of-range) carries no referral, mirroring
     the deterministic floor."""
-    m, signal = _display_name(traj.marker), _classify(traj)
+    m, signal = display_name(traj.marker), _classify(traj)
     val = f"{_fmt_num(traj.latest.value)} {traj.unit}".strip()
     low, high = (rng.ref_low, rng.ref_high) if rng else (None, None)
     rng_txt = _format_reference_range(low, high, traj.unit)
@@ -351,7 +355,7 @@ def qa_title(traj: MarkerTrajectory) -> str:
     The number is read off the verdict, never computed (the one law). Raised markers keep the
     signal-aware ``observation_summary`` title instead (so a flagged value is never narrated as calm)."""
     return (
-        f"{_display_name(traj.marker)}: latest {traj.latest.value} {traj.unit} "
+        f"{display_name(traj.marker)}: latest {traj.latest.value} {traj.unit} "
         f"(recorded {traj.latest.date})"
     )
 
@@ -547,7 +551,7 @@ def _change_narrative(traj: MarkerTrajectory) -> str:
     value — the same calm the deterministic core did not produce). Reads only off the trajectory."""
     latest = traj.latest
     parts = [
-        f"Your most recent {_display_name(traj.marker)} is {latest.value} {traj.unit} (recorded {latest.date})."
+        f"Your most recent {display_name(traj.marker)} is {latest.value} {traj.unit} (recorded {latest.date})."
     ]
     status = _status_clause(traj)
     if status:
@@ -766,7 +770,7 @@ def render_summary(
     else:
         # Name the flagged markers (this anchor stays orientation-only — the per-marker value-vs-range
         # detail lives in the overview and pivot chips — but naming them is a cheap, honest enrichment).
-        names = _join_markers([_display_name(t.marker) for t in raised])
+        names = _join_markers([display_name(t.marker) for t in raised])
         answer = (
             f"I looked at {n} markers from your panels. {m} {'is' if m == 1 else 'are'} worth a closer "
             f"look — {names} — shown on the right and in detail above; the rest are {rest}."
@@ -811,7 +815,7 @@ def suggest_prompts(
     (The linked-GP-note drill-down of §149 would add a ``notes`` argument; it is deferred to Phase 7, so
     the parameter is not carried until the behavior that reads it lands — CLAUDE.md "phantom fields cut".)
 
-    ``focus`` / ``asked`` are CANONICAL marker keys (the chip prompts show ``_display_name`` labels, but
+    ``focus`` / ``asked`` are CANONICAL marker keys (the chip prompts show ``display_name`` labels, but
     the loop state keys on the storage name). The chip order is the loop (§149): the opened finding's
     drill-down, then unexplored pivots, then the ever-present anchors — which are EXEMPT from the
     ``asked`` filter, so the loop never dead-ends (§153) and thins to anchors-only once every finding has
@@ -826,7 +830,7 @@ def suggest_prompts(
     if focus is not None and focus in by_marker:
         drilldowns.append(
             SuggestedPrompt(
-                prompt=f"How has my {_display_name(focus)} changed over time?",
+                prompt=f"How has my {display_name(focus)} changed over time?",
                 response=render_change(
                     by_marker[focus],
                     rng_for.get(focus),
@@ -865,7 +869,7 @@ def suggest_prompts(
     eligible = [t for t in raised if t.marker != focus and t.marker not in asked]
     pivots = [
         SuggestedPrompt(
-            prompt=f"Tell me about my {_display_name(t.marker)}.",
+            prompt=f"Tell me about my {display_name(t.marker)}.",
             response=render_pivot(
                 t,
                 rng_for.get(t.marker),
