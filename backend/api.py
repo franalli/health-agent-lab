@@ -79,8 +79,9 @@ async def lifespan(app: FastAPI):
             "in-memory DB each time). Use a file path; tests share one connection via db.connect directly."
         )
     # Ensure the schema exists before serving (idempotent; Phase 8 relies on startup-time init because
-    # Render's build step can't see the persistent disk). BOTH uvicorn workers run this lifespan against
-    # the one shared DB (--workers 2), and init_db's fresh-DB executescript + seed_if_empty are
+    # Render's build step can't see the runtime filesystem). EVERY uvicorn worker runs this lifespan
+    # against the one shared DB (the free-tier deploy runs one, `make serve` two), and init_db's
+    # fresh-DB executescript + seed_if_empty are
     # check-then-act — so the whole init sequence is serialized under the cross-process "startup" lock
     # (db.process_lock, BLOCKING: the loser waits out the winner's sub-second init, then sees tables
     # present + members seeded and no-ops through every step). flock auto-releases if the holding worker
@@ -100,8 +101,8 @@ def _init_and_seed(con: sqlite3.Connection) -> None:
     db.init_db(con)  # FATAL on failure: the app cannot serve a request without a schema
     # Seed-if-empty: a fresh container/disk boots with an empty DB (the build can't see the runtime
     # FS — the same reason init_db runs here). `seed_if_empty` is a no-op locally (make seed ran
-    # first) and on any restart where data persisted; on a fresh durable disk (or the free/ephemeral
-    # downgrade's cold starts) it self-heals the 15 training members (active DATASET, matching
+    # first) and on any restart where data persisted; on the free tier's every-cold-start empty DB (or
+    # a fresh paid disk) it self-heals the 15 training members (active DATASET, matching
     # `make seed`). It is NON-fatal and logged: a seed failure rolls back to empty (next restart
     # retries) and leaves the deterministic spine (Mode 1, /health) up, rather than aborting the
     # whole app on a bad dataset.

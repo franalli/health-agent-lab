@@ -28,7 +28,8 @@ The design in one sentence: **the LLM is a language layer over a deterministic a
 Three things to know about how the deployment holds its data:
 
 - **Shared.** The whole deployment runs on a single database. Everyone who opens the URL sees the same members and the same findings, and any change one user makes — an uploaded dataset, filed feedback, a promoted prompt, a reset — is immediately visible to every other user. There are no accounts and no per-user copies.
-- **Persistent.** That database lives on a persistent disk: everything survives page refreshes, browser restarts, service restarts, and redeploys. Nothing resets on its own — only **Reseed (factory)** restores the original state. (The one exception is conversation history, which deliberately lives only in your browser tab.)
+- **Stable while awake, reset on a cold start.** Everything survives page refreshes, browser restarts, and other people's sessions — but the demo runs on Render's free tier, which has no persistent disk and spins the service down after about 15 minutes with no traffic. The next visit rebuilds the database from scratch: the original 15 members and their findings come back automatically, and anything added since — an uploaded dataset, filed feedback, a promoted prompt — is gone. Within a working session nothing resets on its own; **Reseed (factory)** restores the original state on demand. (Conversation history is separate again: it lives only in your browser tab.)
+  - Practical consequence: the first request after an idle period is slow (roughly 30–60 seconds while the service wakes and re-seeds), and if you want to keep what a demo session produced, don't leave it idle. Running your own copy on a paid plan with a disk makes all of it durable — see [`render.yaml`](render.yaml).
 - **Safe to use concurrently.** Several people can use the app at the same time. Browsing, asking questions in both modes, scanning, uploading, and filing feedback from multiple browsers simultaneously is safe — concurrent requests queue against the database rather than corrupting it. The three heavyweight operations (**Run learn**, **Reset learning**, **Reseed**) additionally take a service-wide lock: if two users trigger one at the same moment, the second gets a 409 "already running" response and simply retries once the first finishes.
 
 One boundary to respect: concurrency is *safe*, but the app assumes a small, cooperative group — it is an operator tool, not a multi-tenant product with isolation. A destructive action like **Reseed** affects every user at once, which is why it demands the typed `delete` confirmation. How this is made safe under the hood — one WAL-mode SQLite file, per-request connections, atomic transactions, and cross-process locks around the heavyweight operations — is described in [`architecture.md`](docs/architecture.md).
@@ -204,7 +205,7 @@ All `make` targets run from `backend/` (`make help` lists them):
 | Command | What it does |
 |---|---|
 | `make run` | Init + seed + serve on `:8000` with auto-reload (the dev command) |
-| `make serve` | Production-mode serve — no reload, two workers, binds `$PORT` or 8000 (what the hosted demo runs) |
+| `make serve` | Production-mode serve — no reload, two workers, binds `$PORT` or 8000 (the hosted free-tier demo runs the same command with one worker) |
 | `make test` | Unit tests |
 | `make lint` | `ruff` lint + format and a `gitleaks` secret scan over the whole tree |
 | `make eval` | Full evaluation harness → report in `backend/eval/reports/` (needs `ANTHROPIC_API_KEY`) |

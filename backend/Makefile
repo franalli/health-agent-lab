@@ -19,7 +19,7 @@ seed:  ## ingest the active dataset (DATASET env; default training_data) — ini
 run: seed  ## init + seed + serve the API + UI on :8000 (--reload: backend edits restart automatically)
 	$(UVICORN) --port 8000 --reload
 
-serve:  ## production-mode serve (no reload; --workers 2; binds $PORT or 8000) — mirrors the Render start command
+serve:  ## production-mode serve (no reload; --workers 2; binds $PORT or 8000) — two workers exercise the cross-process locking (§15); the free-tier Render deploy runs the same command with one
 	$(UVICORN) --port $${PORT:-8000} --workers 2
 
 test:  ## unit tests

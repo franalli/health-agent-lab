@@ -141,8 +141,9 @@ def connect(db_path=None) -> sqlite3.Connection:
     con.execute("PRAGMA busy_timeout = 5000")
     # The one-time delete->WAL transition (the FIRST connection ever made to a fresh DB file) needs an
     # exclusive lock, and SQLite returns SQLITE_BUSY for it IMMEDIATELY — without consulting the busy
-    # handler (deadlock avoidance) — so the 5s busy_timeout above does NOT cover it. Under --workers 2
-    # both workers' first connect() races exactly this switch on a fresh disk. Steady-state is
+    # handler (deadlock avoidance) — so the 5s busy_timeout above does NOT cover it. Under multiple
+    # workers (`make serve` runs two) both workers' first connect() races exactly this switch on a
+    # fresh DB file. Steady-state is
     # unaffected (a DB already in WAL answers the pragma with no exclusive lock), so a short bounded
     # retry rides out the sibling's millisecond transition. Retried, never skipped: silently serving in
     # rollback-journal mode would forfeit the reader/writer concurrency the multi-worker deploy rests on.
@@ -190,8 +191,10 @@ def process_lock(con: sqlite3.Connection, name: str, *, blocking: bool):
     model calls, or ``executescript`` (startup init+seed, a ``/learn`` run, the learning-state resets)
     need a lock that holds across worker processes. flock auto-releases when its holder dies (no
     stale-lock TTL to manage, unlike a DB lease); two ``os.open`` fds contend even within one process, so
-    this also excludes threadpool peers. Scope is one HOST, which matches the single-instance deploy (a
-    Render persistent disk pins the service to one instance).
+    this also excludes threadpool peers — so the exclusion holds at ANY worker count, including the
+    free tier's single worker. Scope is one HOST, which matches the single-instance deploy (Render's
+    free plan does not scale horizontally; on a paid plan a persistent disk pins the service to one
+    instance). Multi-INSTANCE scaling is the bounded seam §11 names, not a silent hazard.
 
     Yields ``True`` when the lock is held; with ``blocking=False`` yields ``False`` on contention instead
     of waiting (the caller maps that to its own busy signal, e.g. 409). ``blocking=True`` waits with a
@@ -251,7 +254,7 @@ def init_db(con: sqlite3.Connection, schema_path: pathlib.Path = SCHEMA_PATH) ->
     NOT internally race-safe on a FRESH database: the presence check + ``executescript`` is check-then-act,
     so two processes first-initializing the same file can both run the script and the loser crashes on
     "table already exists". Concurrent callers must serialize via ``process_lock(con, "startup")`` — the
-    api.py lifespan (the one multi-process caller; --workers 2) does; the CLI (``make init-db``) and tests
+    api.py lifespan (the one potentially multi-process caller) does; the CLI (``make init-db``) and tests
     are single-process. On an ALREADY-initialized DB it is a pure read + guarded no-op migrations — safe."""
     existing = {
         r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
