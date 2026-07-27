@@ -1,6 +1,8 @@
 # Health Intelligence Service — UI/UX Intent
 
 > Companion to `architecture.md`. Describes the thin consumer surface and, above all, **how output lands with a member in a vulnerable moment**. The surface is deliberately rough; the *judgment* about what a member sees, when, and in what tone is the point.
+>
+> [`demo.gif`](demo.gif) is a thirty-second recording of the surface this document specifies (sped up ~2.4×), covering both member regions and the operator console.
 
 ---
 

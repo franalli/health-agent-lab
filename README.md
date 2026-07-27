@@ -9,6 +9,10 @@ A health assistant that watches a member's lab history over time. It does two th
 
 The design in one sentence: **the LLM is a language layer over a deterministic analytical core, never the core itself.** Every number, reference-range comparison, trend verdict, and escalation decision is computed by classical statistics and clinical thresholds in pure Python; the LLM only renders that ground truth into careful prose. That boundary is what makes the safety-critical behavior auditable and reproducible rather than a property of a prompt. Full design and rationale: [`architecture.md`](docs/architecture.md).
 
+![Thirty-second tour of the running app](docs/demo.gif)
+
+*Thirty seconds, sped up: proactive findings and why each one fired · per-marker trajectories with reference-range shading · Mode 1 (deterministic, instant, no model call) · Mode 2 (LLM prose over the same grounded facts and the same escalation floor) · the clinician queue · a reference-range correction that re-scans the member live · the composer-prompt version trail.*
+
 ## Where to start
 
 | You are… | Go to |
